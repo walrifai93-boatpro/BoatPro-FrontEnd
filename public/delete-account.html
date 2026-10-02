@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Account & Data Deletion Request - BoatPro</title>
+  <meta name="description" content="Request account and personal data deletion for BoatPro (Boat Pro Co.)" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Noto+Kufi+Arabic:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --navy-deep: #071526;
+      --navy: #0f2744;
+      --navy-light: #1b3b64;
+      --gold: #c9983a;
+      --gold-soft: #dfb35c;
+      --surface: #ffffff;
+      --surface-subtle: #f8fafc;
+      --border: #e2e8f0;
+      --text: #1e293b;
+      --text-muted: #64748b;
+      --danger: #ef4444;
+      --danger-bg: #fef2f2;
+      --danger-border: #fecaca;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      background: var(--surface-subtle);
+      color: var(--text);
+      line-height: 1.7;
+      padding: 0;
+      margin: 0;
+    }
+    body.lang-ar {
+      font-family: 'Noto+Kufi+Arabic', 'Inter', system-ui, sans-serif;
+      direction: rtl;
+    }
+    header {
+      background: var(--navy-deep);
+      color: #fff;
+      padding: 2rem 1.5rem;
+      border-bottom: 3px solid var(--gold);
+    }
+    .header-inner {
+      max-width: 860px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      flex-wrap: wrap;
+    }
+    .brand-title {
+      font-size: 1.35rem;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      color: #ffffff;
+    }
+    .brand-subtitle {
+      font-size: 0.82rem;
+      color: var(--gold-soft);
+      font-weight: 500;
+    }
+    .lang-btn {
+      background: rgba(255,255,255,0.1);
+      border: 1px solid rgba(255,255,255,0.25);
+      color: #fff;
+      padding: 0.45rem 1.1rem;
+      border-radius: 9999px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+    .lang-btn:hover {
+      background: var(--gold);
+      color: var(--navy-deep);
+      border-color: var(--gold);
+    }
+    main {
+      max-width: 860px;
+      margin: 2rem auto;
+      padding: 0 1.5rem 4rem 1.5rem;
+    }
+    .card {
+      background: var(--surface);
+      border-radius: 1rem;
+      padding: 2.25rem 2rem;
+      box-shadow: 0 4px 20px -4px rgba(7, 21, 38, 0.06);
+      border: 1px solid var(--border);
+      margin-bottom: 1.5rem;
+    }
+    h1 {
+      font-size: 1.75rem;
+      font-weight: 700;
+      color: var(--navy-deep);
+      margin-bottom: 0.5rem;
+    }
+    .meta-tag {
+      display: inline-block;
+      font-size: 0.82rem;
+      color: var(--text-muted);
+      margin-bottom: 1.5rem;
+    }
+    h2 {
+      font-size: 1.25rem;
+      color: var(--navy);
+      margin-top: 1.75rem;
+      margin-bottom: 0.75rem;
+      padding-bottom: 0.35rem;
+      border-bottom: 1px solid var(--border);
+    }
+    p, li {
+      font-size: 0.98rem;
+      color: #334155;
+    }
+    ul, ol {
+      padding-left: 1.5rem;
+      margin: 0.75rem 0 1.25rem 0;
+    }
+    body.lang-ar ul, body.lang-ar ol {
+      padding-left: 0;
+      padding-right: 1.5rem;
+    }
+    li {
+      margin-bottom: 0.6rem;
+    }
+    .alert-box {
+      background: var(--danger-bg);
+      border: 1px solid var(--danger-border);
+      color: #991b1b;
+      padding: 1.25rem 1.5rem;
+      border-radius: 0.75rem;
+      margin: 1.5rem 0;
+      font-size: 0.95rem;
+    }
+    .contact-box {
+      background: var(--surface-subtle);
+      border: 1px dashed var(--gold);
+      padding: 1.5rem;
+      border-radius: 0.75rem;
+      margin-top: 1.5rem;
+      font-size: 0.95rem;
+    }
+    .contact-box a {
+      color: var(--navy-light);
+      font-weight: 600;
+      text-decoration: underline;
+    }
+    footer {
+      text-align: center;
+      padding: 2rem;
+      color: var(--text-muted);
+      font-size: 0.85rem;
+      border-top: 1px solid var(--border);
+      background: #fff;
+    }
+  </style>
+</head>
+<body class="lang-en">
+  <header>
+    <div class="header-inner">
+      <div>
+        <div class="brand-title">BoatPro • بوت برو</div>
+        <div class="brand-subtitle" id="tagline">Boat Pro Co. • Account & Data Deletion</div>
+      </div>
+      <button class="lang-btn" id="toggleLang" onclick="toggleLanguage()">عربي / Switch to Arabic</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- ENGLISH VERSION -->
+    <article id="content-en" class="card">
+      <h1>Account & Data Deletion Policy</h1>
+      <span class="meta-tag">Application: <strong>BoatPro</strong> | Developer: <strong>Boat Pro Co. (شركة بوت برو)</strong></span>
+
+      <p>
+        At <strong>BoatPro</strong>, we respect your right to control your personal data. You have the right to request the permanent deletion of your BoatPro customer or provider account and all associated personal data at any time, in full compliance with Google Play Developer Policies and the Saudi Personal Data Protection Law (PDPL).
+      </p>
+
+      <h2>1. How to Request Account Deletion</h2>
+      <p>You can request account deletion without needing to reinstall the application. Simply choose one of the following steps:</p>
+      
+      <ol>
+        <li>
+          <strong>Via Email Request (Recommended):</strong>
+          Send an email to our Data Protection Support team at <a href="mailto:info@boatpro.club?subject=BoatPro%20Account%20Deletion%20Request"><strong>info@boatpro.club</strong></a> with the subject <em>"BoatPro Account Deletion Request"</em>.
+          <br />Please provide:
+          <ul>
+            <li>Your registered email address or phone number used for BoatPro.</li>
+            <li>Your full registered name.</li>
+          </ul>
+        </li>
+        <li>
+          <strong>In-App Request:</strong>
+          If you currently have the app installed, go to <strong>Profile / Settings &gt; Account &gt; Delete Account</strong> and confirm your request.
+        </li>
+      </ol>
+
+      <h2>2. What Data Is Deleted Permanently</h2>
+      <p>Upon verification and completion of your account deletion request, the following information will be permanently removed from our active databases:</p>
+      <ul>
+        <li><strong>Profile Data:</strong> Your name, username, email address, phone number, profile avatar, and authentication credentials.</li>
+        <li><strong>Identity Verification Documents:</strong> National ID/Iqama or passport copies submitted for boat charter permits.</li>
+        <li><strong>App Preferences:</strong> Saved bookmarks, searches, and device push notification tokens.</li>
+      </ul>
+
+      <h2>3. What Data Is Kept & Retention Periods</h2>
+      <p>In accordance with statutory legal, taxation, and maritime regulatory obligations in the Kingdom of Saudi Arabia, certain data cannot be deleted immediately:</p>
+      <ul>
+        <li><strong>Financial & Tax Records:</strong> Invoices, payment transaction receipts (processed via HyperPay), and tax records must be retained for the statutory period mandated by the Zakat, Tax and Customs Authority (ZATCA) and commercial regulations.</li>
+        <li><strong>Maritime Safety & Border Permits:</strong> Records of past completed voyages and sailing permits issued through official regulatory bodies (Saudi Border Guard and Saudi Red Sea Authority) are archived for official audit and maritime safety compliance.</li>
+      </ul>
+      <p><em>Note: Retained records are kept in secure, restricted archives and are never used for marketing or commercial profiling.</em></p>
+
+      <h2>4. Processing Timeframe</h2>
+      <p>
+        Once your request is received, our Data Protection team will verify your ownership of the account. The deletion of your account and purge of eligible personal data will be completed within <strong>30 days</strong> of verification. You will receive a final confirmation email once the process is complete.
+      </p>
+
+      <div class="contact-box">
+        <strong>Need Assistance?</strong><br />
+        Contact our Data Protection Officer at: <a href="mailto:info@boatpro.club">info@boatpro.club</a><br />
+        Company: Boat Pro Co. (شركة بوت برو) • Kingdom of Saudi Arabia
+      </div>
+    </article>
+
+    <!-- ARABIC VERSION -->
+    <article id="content-ar" class="card" style="display: none;">
+      <h1>سياسة طلب حذف الحساب والبيانات</h1>
+      <span class="meta-tag">التطبيق: <strong>بوت برو (BoatPro)</strong> | المطور: <strong>شركة بوت برو (Boat Pro Co.)</strong></span>
+
+      <p>
+        في <strong>بوت برو</strong>، نلتزم باحترام حقك في التحكم ببياناتك الشخصية. يحق لك طلب حذف حسابك وبياناتك المرتبطة بالتطبيق نهائياً في أي وقت، وذلك وفقاً لسياسات Google Play ونظام حماية البيانات الشخصية السعودي (PDPL).
+      </p>
+
+      <h2>١. خطوات تقديم طلب حذف الحساب</h2>
+      <p>يمكنك طلب حذف حسابك دون الحاجة لتثبيت التطبيق باتباع إحدى الخطوات التالية:</p>
+
+      <ol>
+        <li>
+          <strong>عبر البريد الإلكتروني (موصى به):</strong>
+          أرسل رسالة إلى فريق حماية البيانات عبر <a href="mailto:info@boatpro.club?subject=%D8%B7%D9%84%D8%A8%20%D8%AD%D8%B0%D9%81%20%D8%AD%D8%B3%D8%A7%D8%A8%20%D8%A8%D9%88%D8%AA%20%D8%A8%D8%B1%D9%88"><strong>info@boatpro.club</strong></a> بعنوان <em>"طلب حذف حساب بوت برو"</em>.
+          <br />يرجى تزويدنا بالتالي:
+          <ul>
+            <li>البريد الإلكتروني أو رقم الهاتف المسجل به الحساب.</li>
+            <li>الاسم المسجل في التطبيق.</li>
+          </ul>
+        </li>
+        <li>
+          <strong>من داخل التطبيق:</strong>
+          في حال كان التطبيق مثبتاً لديك، يمكنك التوجه إلى <strong>الملف الشخصي / الإعدادات &gt; الحساب &gt; حذف الحساب</strong> وتأكيد الطلب.
+        </li>
+      </ol>
+
+      <h2>٢. ما هي البيانات التي يتم حذفها نهائياً؟</h2>
+      <p>عند تأكيد وتنفيذ طلب الحذف، يتم مسح البيانات التالية بشكل نهائي من قواعد بياناتنا النشطة:</p>
+      <ul>
+        <li><strong>بيانات الملف الشخصي:</strong> الاسم، البريد الإلكتروني، رقم الجوال، كلمة المرور المشفرة، والصورة الشخصية.</li>
+        <li><strong>وثائق التحقق:</strong> صور الهوية الوطنية أو الإقامة أو الجواز المستخدمة لاستخراج تصاريح الإبحار.</li>
+        <li><strong>التفضيلات وبيانات الجهاز:</strong> عمليات البحث المحفوظة ومعرفات الإشعارات.</li>
+      </ul>
+
+      <h2>٣. ما هي البيانات التي يتم الاحتفاظ بها ومدد الاحتفاظ؟</h2>
+      <p>وفقاً للأنظمة واللوائح الحكومية والضريبية والأنظمة البحرية في المملكة العربية السعودية، قد يلزمنا النظام بالاحتفاظ ببعض البيانات لأغراض نظامية محددة:</p>
+      <ul>
+        <li><strong>السجلات المالية والضريبية:</strong> فواتير المعاملات وإيصالات الدفع وسجلات الضرائب وفقاً للمدد المحددة نظاماً من هيئة الزكاة والضريبة والجمارك (ZATCA).</li>
+        <li><strong>سجلات السلامة البحرية والتصاريح:</strong> سجلات الرحلات البحرية المنفذة الصادرة وفق تنظيمات حرس الحدود والهيئة السعودية للبحر الأحمر لأغراض السلامة والأمن والتدقيق الرسمي.</li>
+      </ul>
+      <p><em>ملاحظة: البيانات المحتفظ بها تُعزل في سجلات آمنة ولا تُستخدم في أي أنشطة تسويقية أو تشغيلية.</em></p>
+
+      <h2>٤. المدة الزمنية لتنفيذ الطلب</h2>
+      <p>
+        بمجرد استلام الطلب والتحقق من ملكية الحساب، يتم إتمام حذف الحساب والبيانات المشمولة خلال مدة أقصاها <strong>30 يوماً</strong>. ستتلقى تأكيداً إلكترونياً فور اكتمال عملية الحذف.
+      </p>
+
+      <div class="contact-box">
+        <strong>للتواصل والاستفسار:</strong><br />
+        مسؤول حماية البيانات: <a href="mailto:info@boatpro.club">info@boatpro.club</a><br />
+        شركة بوت برو (Boat Pro Co.) • المملكة العربية السعودية
+      </div>
+    </article>
+  </main>
+
+  <footer>
+    &copy; 2026 Boat Pro Co. (شركة بوت برو). All rights reserved.
+  </footer>
+
+  <script>
+    function toggleLanguage() {
+      const isArabic = document.body.classList.contains('lang-ar');
+      if (isArabic) {
+        document.body.classList.remove('lang-ar');
+        document.body.classList.add('lang-en');
+        document.getElementById('content-en').style.display = 'block';
+        document.getElementById('content-ar').style.display = 'none';
+        document.getElementById('toggleLang').textContent = 'عربي / Switch to Arabic';
+        document.getElementById('tagline').textContent = 'Boat Pro Co. • Account & Data Deletion';
+        document.title = 'Account & Data Deletion Request - BoatPro';
+      } else {
+        document.body.classList.remove('lang-en');
+        document.body.classList.add('lang-ar');
+        document.getElementById('content-en').style.display = 'none';
+        document.getElementById('content-ar').style.display = 'block';
+        document.getElementById('toggleLang').textContent = 'English / التبديل للإنجليزية';
+        document.getElementById('tagline').textContent = 'شركة بوت برو • طلب حذف الحساب والبيانات';
+        document.title = 'طلب حذف الحساب والبيانات - بوت برو';
+      }
+    }
+  </script>
+</body>
+</html>

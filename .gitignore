@@ -1,0 +1,14 @@
+node_modules/
+.expo/
+.metro-cache/
+dist/
+build/
+android/build/
+ios/build/
+.env
+.env.local
+*.log
+*.zip
+*.apk
+*.aab
+boatpro.zip

@@ -1,0 +1,738 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  @apply bg-sand text-deep-900 font-sans antialiased;
+  background-image:
+    radial-gradient(1000px 520px at 100% -10%, rgba(55, 184, 217, 0.12), transparent 55%),
+    radial-gradient(760px 420px at -8% 28%, rgba(25, 125, 161, 0.09), transparent 60%),
+    radial-gradient(680px 520px at 55% 118%, rgba(55, 184, 217, 0.08), transparent 60%);
+  background-attachment: fixed;
+}
+
+/* ── status ticker ── */
+@keyframes ticker {
+  0% { transform: translateX(0); }
+  100% { transform: translateX(-50%); }
+}
+.animate-ticker { animation: ticker 46s linear infinite; }
+.animate-ticker:hover { animation-play-state: paused; }
+
+/* ── button shine sweep ── */
+.btn-primary { position: relative; overflow: hidden; }
+.btn-primary::after {
+  content: '';
+  position: absolute; top: 0; left: -80%;
+  width: 45%; height: 100%;
+  background: linear-gradient(100deg, transparent, rgba(255, 255, 255, 0.35), transparent);
+  transform: skewX(-20deg);
+  animation: shine 4s ease-in-out infinite;
+  pointer-events: none;
+}
+@keyframes shine {
+  0%, 55% { left: -80%; }
+  100% { left: 130%; }
+}
+
+/* ── card sheen on hover ── */
+.card-hover:hover {
+  box-shadow: 0 18px 44px -14px rgba(8, 30, 56, 0.24), 0 0 0 1px rgba(55, 184, 217, 0.25);
+}
+
+/* ── button loading animations ── */
+@keyframes btnSpin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+.btn-spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: btnSpin 0.7s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+@keyframes shimmerSweep {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+.skeleton-shimmer {
+  position: relative;
+  overflow: hidden;
+}
+.skeleton-shimmer::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.45), transparent);
+  animation: shimmerSweep 1.5s ease-in-out infinite;
+}
+
+/* ── splash letters ── */
+@keyframes riseIn {
+  0% { opacity: 0; transform: translateY(22px) rotate(4deg); }
+  100% { opacity: 1; transform: translateY(0) rotate(0); }
+}
+.splash-letter { display: inline-block; animation: riseIn 0.6s cubic-bezier(0.2, 0.8, 0.2, 1) both; }
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(27, 101, 131, 0.25);
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(27, 101, 131, 0.45);
+}
+
+/* The harbour chart scrolls over deep navy water, so it needs a light thumb
+   rather than the app's default teal-on-white one. */
+.harbour-scroll { scrollbar-width: thin; scrollbar-color: rgba(255, 255, 255, 0.32) transparent; }
+.harbour-scroll::-webkit-scrollbar { height: 10px; }
+.harbour-scroll::-webkit-scrollbar-track { background: rgba(4, 26, 40, 0.35); }
+.harbour-scroll::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.28); }
+.harbour-scroll::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.45); }
+
+@layer components {
+  .card {
+    @apply rounded-2xl bg-white shadow-soft border border-slate-100;
+  }
+  .card-hover {
+    @apply transition-all duration-300 hover:shadow-lift hover:-translate-y-0.5;
+  }
+  .glass {
+    @apply bg-white/70 backdrop-blur-xl border border-white/40;
+  }
+  .btn-primary {
+    @apply inline-flex items-center gap-1.5 rounded-lg bg-gradient-to-r from-ocean-600 to-ocean-400 px-3.5 py-2 text-[13px] font-semibold text-white shadow-glow transition-all duration-300 hover:brightness-110 hover:shadow-lift active:scale-95;
+  }
+  .btn-ghost {
+    @apply inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-[13px] font-semibold text-deep-800 transition-all duration-200 hover:border-ocean-300 hover:bg-ocean-50 active:scale-95;
+  }
+  .chip {
+    @apply inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-semibold;
+  }
+  .input {
+    @apply w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-[13px] outline-none transition-all placeholder:text-slate-400 focus:border-ocean-400 focus:ring-4 focus:ring-ocean-100;
+  }
+  .label {
+    @apply mb-1.5 block text-xs font-bold uppercase tracking-wider text-slate-500;
+  }
+  .th {
+    @apply px-4 py-2.5 text-left text-[11px] font-bold uppercase tracking-wider text-slate-400;
+  }
+  .td {
+    @apply px-4 py-2.5 text-[13px] text-deep-800;
+  }
+}
+
+.bg-hero-gradient {
+  background:
+    radial-gradient(1200px 500px at 80% -10%, rgba(55, 184, 217, 0.25), transparent 60%),
+    radial-gradient(800px 400px at 10% 110%, rgba(25, 125, 161, 0.3), transparent 60%),
+    linear-gradient(160deg, #04142a 0%, #0d2b4b 55%, #1b6583 130%);
+}
+
+/* ── fuel portal theme ── */
+.bg-fuel-gradient {
+  background:
+    radial-gradient(1200px 500px at 80% -10%, rgba(251, 146, 60, 0.22), transparent 60%),
+    radial-gradient(800px 400px at 10% 110%, rgba(217, 119, 6, 0.25), transparent 60%),
+    linear-gradient(160deg, #120a04 0%, #2b1a0d 55%, #7c3f10 130%);
+}
+.btn-fuel {
+  @apply inline-flex items-center gap-1.5 rounded-lg bg-gradient-to-r from-amber-600 to-orange-400 px-3.5 py-2 text-[13px] font-semibold text-white transition-all duration-300 hover:brightness-110 hover:shadow-lift active:scale-95;
+  box-shadow: 0 0 24px rgba(251, 146, 60, 0.35);
+  position: relative;
+  overflow: hidden;
+}
+.btn-fuel::after {
+  content: '';
+  position: absolute; top: 0; left: -80%;
+  width: 45%; height: 100%;
+  background: linear-gradient(100deg, transparent, rgba(255, 255, 255, 0.35), transparent);
+  transform: skewX(-20deg);
+  animation: shine 4s ease-in-out infinite;
+  pointer-events: none;
+}
+.text-gradient-fuel {
+  @apply bg-gradient-to-r from-amber-500 to-orange-400 bg-clip-text text-transparent;
+}
+
+/* ── fuel gauge liquid ── */
+@keyframes liquidWave {
+  0% { transform: translateX(0); }
+  100% { transform: translateX(-50%); }
+}
+.liquid-wave { animation: liquidWave 3.4s linear infinite; }
+
+/* ══ maintenance portal theme — smart-tech violet/indigo ══ */
+.bg-maint-gradient {
+  background:
+    radial-gradient(1200px 500px at 80% -10%, rgba(139, 92, 246, 0.25), transparent 60%),
+    radial-gradient(800px 400px at 10% 110%, rgba(99, 102, 241, 0.28), transparent 60%),
+    linear-gradient(160deg, #0c0a1e 0%, #1e1b3a 55%, #4c1d95 130%);
+}
+.btn-maint {
+  @apply inline-flex items-center gap-1.5 rounded-lg bg-gradient-to-r from-violet-600 to-indigo-500 px-3.5 py-2 text-[13px] font-semibold text-white transition-all duration-300 hover:brightness-110 hover:shadow-lift active:scale-95;
+  box-shadow: 0 0 24px rgba(139, 92, 246, 0.4);
+  position: relative;
+  overflow: hidden;
+}
+.btn-maint::after {
+  content: '';
+  position: absolute; top: 0; left: -80%;
+  width: 45%; height: 100%;
+  background: linear-gradient(100deg, transparent, rgba(255, 255, 255, 0.35), transparent);
+  transform: skewX(-20deg);
+  animation: shine 4s ease-in-out infinite;
+  pointer-events: none;
+}
+.text-gradient-maint {
+  @apply bg-gradient-to-r from-violet-500 to-indigo-400 bg-clip-text text-transparent;
+}
+
+/* ── spinning gear / tools ── */
+@keyframes gearSpin { to { transform: rotate(360deg); } }
+.animate-gear { animation: gearSpin 8s linear infinite; }
+.animate-gear-rev { animation: gearSpin 6s linear infinite reverse; }
+
+/* ── wrench wiggle for emergency ── */
+@keyframes wrenchWiggle {
+  0%, 100% { transform: rotate(-8deg); }
+  50% { transform: rotate(8deg); }
+}
+.animate-wrench { animation: wrenchWiggle 1.4s ease-in-out infinite; transform-origin: center; }
+
+/* ── progress dash march (job timeline) ── */
+@keyframes dashPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+.animate-dash-pulse { animation: dashPulse 1.8s ease-in-out infinite; }
+
+/* ── conic health ring sweep ── */
+@keyframes ringSweep { from { transform: rotate(-90deg) scale(0.9); opacity: 0; } to { transform: rotate(-90deg) scale(1); opacity: 1; } }
+.ring-sweep { animation: ringSweep 0.9s ease-out both; }
+
+/* ══ super-admin portal theme — emerald command center ══ */
+.bg-admin-gradient {
+  background:
+    radial-gradient(1200px 500px at 80% -10%, rgba(16, 185, 129, 0.22), transparent 60%),
+    radial-gradient(800px 400px at 10% 110%, rgba(13, 148, 136, 0.26), transparent 60%),
+    linear-gradient(160deg, #041410 0%, #0a2a22 55%, #115e4b 130%);
+}
+.btn-admin {
+  @apply inline-flex items-center gap-1.5 rounded-lg bg-gradient-to-r from-emerald-600 to-teal-500 px-3.5 py-2 text-[13px] font-semibold text-white transition-all duration-300 hover:brightness-110 hover:shadow-lift active:scale-95;
+  box-shadow: 0 0 24px rgba(16, 185, 129, 0.4);
+  position: relative;
+  overflow: hidden;
+}
+.btn-admin::after {
+  content: '';
+  position: absolute; top: 0; left: -80%;
+  width: 45%; height: 100%;
+  background: linear-gradient(100deg, transparent, rgba(255, 255, 255, 0.35), transparent);
+  transform: skewX(-20deg);
+  animation: shine 4s ease-in-out infinite;
+  pointer-events: none;
+}
+.text-gradient-admin {
+  @apply bg-gradient-to-r from-emerald-500 to-teal-400 bg-clip-text text-transparent;
+}
+
+/* ── radar sweep for live monitoring ── */
+@keyframes radarSweep { to { transform: rotate(360deg); } }
+.animate-radar { animation: radarSweep 4s linear infinite; transform-origin: center; }
+
+/* ── heartbeat for system health ── */
+@keyframes heartbeat {
+  0%, 100% { transform: scale(1); }
+  14% { transform: scale(1.12); }
+  28% { transform: scale(1); }
+  42% { transform: scale(1.1); }
+  56% { transform: scale(1); }
+}
+.animate-heartbeat { animation: heartbeat 1.8s ease-in-out infinite; }
+
+/* ── live blip trail ── */
+@keyframes blipFade { 0% { opacity: 0.9; } 100% { opacity: 0; transform: scale(2.2); } }
+.animate-blip { animation: blipFade 1.8s ease-out infinite; }
+
+/* ── flame flicker for emergency chips ── */
+@keyframes flicker {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  45% { opacity: 0.75; transform: scale(0.97); }
+  70% { opacity: 0.9; transform: scale(1.03); }
+}
+.animate-flicker { animation: flicker 1.6s ease-in-out infinite; }
+
+/* ── delivery route dash march ── */
+@keyframes dashMarch {
+  to { stroke-dashoffset: -24; }
+}
+.route-dash { stroke-dasharray: 6 6; animation: dashMarch 1.2s linear infinite; }
+
+/* ── login page orbs ── */
+@keyframes orbDrift {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  33% { transform: translate(30px, -24px) scale(1.06); }
+  66% { transform: translate(-20px, 18px) scale(0.96); }
+}
+.animate-orb { animation: orbDrift 14s ease-in-out infinite; }
+
+.text-gradient {
+  @apply bg-gradient-to-r from-ocean-500 to-ocean-300 bg-clip-text text-transparent;
+}
+
+.shimmer {
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.35), transparent);
+  background-size: 500px 100%;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   DARK MODE — ocean-night theme
+   Surfaces: body #050b18 · card #0b1628 · inset #101d33 · raised #1a2942
+   ═══════════════════════════════════════════════════════════ */
+.dark { color-scheme: dark; }
+
+.dark body {
+  color: #dbe4f2;
+  background-color: #050b18;
+  background-image:
+    radial-gradient(1000px 520px at 100% -10%, rgba(55, 184, 217, 0.09), transparent 55%),
+    radial-gradient(760px 420px at -8% 28%, rgba(251, 146, 60, 0.05), transparent 60%),
+    radial-gradient(680px 520px at 55% 118%, rgba(27, 155, 191, 0.07), transparent 60%);
+}
+
+body, .card, .input, .btn-ghost { transition: background-color 0.3s ease, border-color 0.3s ease; }
+
+/* ── component shells ── */
+.dark .card {
+  background-color: #0b1628;
+  border-color: rgba(148, 163, 184, 0.1);
+  box-shadow: 0 8px 28px -10px rgba(0, 0, 0, 0.55);
+}
+.dark .card-hover:hover {
+  box-shadow: 0 18px 44px -14px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(55, 184, 217, 0.3);
+}
+.dark .glass {
+  background-color: rgba(7, 14, 28, 0.78);
+  border-color: rgba(148, 163, 184, 0.09);
+}
+.dark .btn-ghost {
+  background-color: #101d33;
+  border-color: rgba(148, 163, 184, 0.16);
+  color: #dbe4f2;
+}
+.dark .btn-ghost:hover { background-color: rgba(27, 155, 191, 0.14); border-color: rgba(55, 184, 217, 0.45); }
+.dark .input {
+  background-color: #101d33;
+  border-color: rgba(148, 163, 184, 0.16);
+  color: #e8eef8;
+}
+.dark .input::placeholder { color: #a8b6ca; }
+.dark .input:focus { border-color: #37b8d9; --tw-ring-color: rgba(55, 184, 217, 0.14); }
+.dark .label { color: #8b9bb4; }
+.dark .th { color: #93a3ba; }
+.dark .td { color: #c4d0e2; }
+.dark ::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, 0.22); }
+.dark ::-webkit-scrollbar-thumb:hover { background: rgba(148, 163, 184, 0.4); }
+
+/* ── neutral surfaces ── */
+.dark .bg-white { background-color: #0b1628; }
+.dark .bg-white\/95 { background-color: rgba(11, 22, 40, 0.95); }
+.dark .bg-white\/90 { background-color: rgba(11, 22, 40, 0.9); }
+.dark .bg-white\/85 { background-color: rgba(11, 22, 40, 0.85); }
+.dark .bg-white\/80 { background-color: rgba(11, 22, 40, 0.86); }
+.dark .bg-white\/70 { background-color: rgba(11, 22, 40, 0.72); }
+.dark .bg-white\/60 { background-color: rgba(11, 22, 40, 0.65); }
+.dark .hover\:bg-white:hover { background-color: #1a2942; }
+.dark .bg-sand { background-color: #101d33; }
+.dark .bg-sand\/20 { background-color: rgba(16, 29, 51, 0.2); }
+.dark .bg-sand\/30 { background-color: rgba(16, 29, 51, 0.3); }
+.dark .bg-sand\/40 { background-color: rgba(16, 29, 51, 0.4); }
+.dark .bg-sand\/50 { background-color: rgba(16, 29, 51, 0.5); }
+.dark .bg-sand\/60 { background-color: rgba(16, 29, 51, 0.6); }
+.dark .bg-sand\/70 { background-color: rgba(16, 29, 51, 0.7); }
+.dark .bg-sand\/80 { background-color: rgba(16, 29, 51, 0.8); }
+.dark .hover\:bg-sand:hover, .dark .hover\:bg-sand\/60:hover, .dark .hover\:bg-sand\/70:hover { background-color: #16233c; }
+.dark .bg-slate-50, .dark .bg-slate-50\/70, .dark .bg-slate-50\/80 { background-color: #101d33; }
+.dark .bg-slate-50\/40 { background-color: rgba(16, 29, 51, 0.4); }
+.dark .bg-slate-50\/50 { background-color: rgba(16, 29, 51, 0.5); }
+.dark .bg-slate-50\/60 { background-color: rgba(16, 29, 51, 0.6); }
+.dark .bg-slate-100 { background-color: #1a2942; }
+.dark .bg-slate-100\/70 { background-color: rgba(26, 41, 66, 0.7); }
+.dark .bg-slate-100\/90 { background-color: rgba(26, 41, 66, 0.9); }
+.dark .bg-slate-200 { background-color: #22304d; }
+.dark .bg-slate-300 { background-color: #2b3b5c; }
+.dark .hover\:bg-slate-100:hover { background-color: #22304d; }
+.dark .bg-deep-950\/\[0\.03\] { background-color: rgba(255, 255, 255, 0.04); }
+.dark .from-sand { --tw-gradient-from: #050b18 var(--tw-gradient-from-position); --tw-gradient-to: rgb(5 11 24 / 0) var(--tw-gradient-to-position); --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to); }
+
+/* ── tonal surfaces ── */
+.dark .bg-ocean-50 { background-color: rgba(27, 155, 191, 0.15); }
+.dark .bg-ocean-50\/40 { background-color: rgba(27, 155, 191, 0.08); }
+.dark .bg-ocean-50\/60 { background-color: rgba(27, 155, 191, 0.11); }
+.dark .hover\:bg-ocean-50:hover { background-color: rgba(27, 155, 191, 0.19); }
+.dark .hover\:bg-ocean-100:hover { background-color: rgba(27, 155, 191, 0.26); }
+.dark .bg-amber-50 { background-color: rgba(245, 158, 11, 0.14); }
+.dark .bg-amber-50\/20 { background-color: rgba(245, 158, 11, 0.035); }
+.dark .bg-amber-50\/30 { background-color: rgba(245, 158, 11, 0.05); }
+.dark .bg-amber-50\/40 { background-color: rgba(245, 158, 11, 0.07); }
+.dark .bg-amber-50\/50 { background-color: rgba(245, 158, 11, 0.08); }
+.dark .bg-amber-50\/60 { background-color: rgba(245, 158, 11, 0.09); }
+.dark .bg-amber-50\/70 { background-color: rgba(245, 158, 11, 0.105); }
+.dark .bg-amber-50\/80 { background-color: rgba(245, 158, 11, 0.12); }
+.dark .bg-amber-50\/90 { background-color: rgba(245, 158, 11, 0.14); }
+.dark .bg-amber-50\/95 { background-color: rgba(245, 158, 11, 0.15); }
+.dark .bg-amber-100\/10 { background-color: rgba(245, 158, 11, 0.035); }
+.dark .hover\:bg-amber-50:hover { background-color: rgba(245, 158, 11, 0.18); }
+.dark .hover\:bg-amber-50\/40:hover { background-color: rgba(245, 158, 11, 0.1); }
+.dark .hover\:bg-amber-100:hover { background-color: rgba(245, 158, 11, 0.24); }
+.dark .bg-rose-50 { background-color: rgba(244, 63, 94, 0.14); }
+.dark .bg-rose-50\/20 { background-color: rgba(244, 63, 94, 0.035); }
+.dark .bg-rose-50\/40 { background-color: rgba(244, 63, 94, 0.07); }
+.dark .bg-rose-50\/50 { background-color: rgba(244, 63, 94, 0.08); }
+.dark .bg-rose-50\/60 { background-color: rgba(244, 63, 94, 0.09); }
+.dark .bg-rose-50\/70 { background-color: rgba(244, 63, 94, 0.11); }
+.dark .bg-rose-50\/80 { background-color: rgba(244, 63, 94, 0.12); }
+.dark .bg-rose-50\/90 { background-color: rgba(244, 63, 94, 0.14); }
+.dark .hover\:bg-rose-50:hover { background-color: rgba(244, 63, 94, 0.18); }
+.dark .hover\:bg-rose-50\/60:hover { background-color: rgba(244, 63, 94, 0.1); }
+.dark .hover\:bg-rose-100:hover { background-color: rgba(244, 63, 94, 0.24); }
+.dark .bg-emerald-50 { background-color: rgba(16, 185, 129, 0.13); }
+.dark .bg-emerald-50\/40 { background-color: rgba(16, 185, 129, 0.07); }
+.dark .bg-emerald-50\/50 { background-color: rgba(16, 185, 129, 0.08); }
+.dark .bg-emerald-50\/60 { background-color: rgba(16, 185, 129, 0.09); }
+.dark .bg-emerald-50\/70 { background-color: rgba(16, 185, 129, 0.105); }
+.dark .bg-emerald-50\/80 { background-color: rgba(16, 185, 129, 0.12); }
+.dark .hover\:bg-emerald-100:hover { background-color: rgba(16, 185, 129, 0.22); }
+.dark .bg-violet-50 { background-color: rgba(139, 92, 246, 0.15); }
+.dark .bg-violet-50\/20 { background-color: rgba(139, 92, 246, 0.035); }
+.dark .bg-violet-50\/30 { background-color: rgba(139, 92, 246, 0.05); }
+.dark .bg-violet-50\/40 { background-color: rgba(139, 92, 246, 0.07); }
+.dark .bg-violet-50\/50 { background-color: rgba(139, 92, 246, 0.08); }
+.dark .bg-violet-50\/60 { background-color: rgba(139, 92, 246, 0.09); }
+.dark .bg-violet-50\/80 { background-color: rgba(139, 92, 246, 0.12); }
+.dark .hover\:bg-violet-100:hover { background-color: rgba(139, 92, 246, 0.24); }
+.dark .bg-violet-100 { background-color: rgba(139, 92, 246, 0.22); }
+.dark .bg-orange-50 { background-color: rgba(251, 146, 60, 0.13); }
+.dark .bg-orange-50\/30 { background-color: rgba(251, 146, 60, 0.05); }
+.dark .bg-fuchsia-50 { background-color: rgba(232, 121, 249, 0.14); }
+.dark .bg-indigo-50 { background-color: rgba(99, 102, 241, 0.15); }
+.dark .bg-indigo-100 { background-color: rgba(99, 102, 241, 0.22); }
+.dark .hover\:bg-indigo-50:hover { background-color: rgba(99, 102, 241, 0.19); }
+.dark .bg-sky-50 { background-color: rgba(14, 165, 233, 0.14); }
+.dark .bg-sky-50\/40 { background-color: rgba(14, 165, 233, 0.07); }
+.dark .bg-sky-50\/50 { background-color: rgba(14, 165, 233, 0.08); }
+.dark .bg-sky-50\/80 { background-color: rgba(14, 165, 233, 0.12); }
+.dark .bg-teal-50 { background-color: rgba(20, 184, 166, 0.14); }
+.dark .bg-teal-50\/60 { background-color: rgba(20, 184, 166, 0.09); }
+.dark .bg-teal-50\/70 { background-color: rgba(20, 184, 166, 0.105); }
+.dark .hover\:bg-teal-50:hover { background-color: rgba(20, 184, 166, 0.19); }
+.dark .bg-emerald-50\/40 { background-color: rgba(16, 185, 129, 0.07); }
+.dark .hover\:bg-emerald-50:hover { background-color: rgba(16, 185, 129, 0.18); }
+.dark .border-emerald-100 { border-color: rgba(16, 185, 129, 0.26); }
+.dark .border-emerald-200 { border-color: rgba(16, 185, 129, 0.36); }
+.dark .hover\:border-emerald-300:hover, .dark .hover\:border-teal-300:hover { border-color: rgba(16, 185, 129, 0.5); }
+.dark .ring-emerald-300 { --tw-ring-color: rgba(16, 185, 129, 0.5); }
+.dark .ring-teal-400 { --tw-ring-color: rgba(20, 184, 166, 0.6); }
+.dark .text-emerald-500 { color: #34d399; }
+.dark .text-teal-500 { color: #2dd4bf; }
+.dark .hover\:text-emerald-600:hover { color: #6ee7b7; }
+.dark .accent-emerald-500 { accent-color: #10b981; }
+
+/* ── text ── */
+.dark .text-deep-900 { color: #e8eef8; }
+.dark .text-deep-800 { color: #dbe4f2; }
+.dark .text-deep-800\/60 { color: rgba(232, 238, 248, 0.66); }
+.dark .hover\:text-deep-900:hover { color: #ffffff; }
+.dark .text-slate-600 { color: #b3c0d4; }
+.dark .text-slate-700 { color: #c4d0e2; }
+.dark .text-slate-800,
+.dark .text-slate-900:not(option),
+.dark .text-slate-950 { color: #e8eef8; }
+.dark .text-slate-500 { color: #93a3ba; }
+.dark .text-slate-400 { color: #a8b6ca; }
+.dark .text-slate-300 { color: #cbd5e1; }
+
+/* Neutral captions and icon controls must remain readable on light surfaces. */
+html:not(.dark) .text-slate-300 { color: #475569; }
+html:not(.dark) .text-slate-400 { color: #526176; }
+html:not(.dark) .text-slate-500 { color: #526176; }
+
+/* The default 400/500 accent shades are too pale for text on light surfaces. */
+html:not(.dark) .text-amber-600,
+html:not(.dark) .hover\:text-amber-600:hover { color: #b45309; }
+html:not(.dark) .text-cyan-600,
+html:not(.dark) .hover\:text-cyan-600:hover { color: #0e7490; }
+html:not(.dark) .text-emerald-600,
+html:not(.dark) .hover\:text-emerald-600:hover { color: #047857; }
+html:not(.dark) .text-ocean-600,
+html:not(.dark) .hover\:text-ocean-600:hover { color: #126b87; }
+html:not(.dark) .text-orange-600,
+html:not(.dark) .hover\:text-orange-600:hover { color: #c2410c; }
+html:not(.dark) .text-rose-600,
+html:not(.dark) .hover\:text-rose-600:hover { color: #be123c; }
+html:not(.dark) .text-sky-600,
+html:not(.dark) .hover\:text-sky-600:hover { color: #0369a1; }
+html:not(.dark) .text-teal-600,
+html:not(.dark) .hover\:text-teal-600:hover { color: #0f766e; }
+html:not(.dark) .text-amber-500 { color: #b45309; }
+html:not(.dark) .text-emerald-500 { color: #047857; }
+html:not(.dark) .text-indigo-500 { color: #4338ca; }
+html:not(.dark) .text-ocean-500 { color: #126b87; }
+html:not(.dark) .text-orange-500 { color: #c2410c; }
+html:not(.dark) .text-red-500 { color: #b91c1c; }
+html:not(.dark) .text-rose-500,
+html:not(.dark) .\!text-rose-500 { color: #be123c !important; }
+html:not(.dark) .text-sky-500 { color: #0369a1; }
+html:not(.dark) .text-teal-500 { color: #0f766e; }
+html:not(.dark) .text-violet-500 { color: #6d28d9; }
+html:not(.dark) .hover\:text-rose-500:hover { color: #be123c; }
+
+/* Give form fields and secondary buttons a visible boundary in both themes. */
+html:not(.dark) .input:not([class*='border-rose-']):not([class*='border-red-']),
+html:not(.dark) .btn-ghost,
+html:not(.dark) input[class*='border-slate-200'],
+html:not(.dark) select[class*='border-slate-200'],
+html:not(.dark) textarea[class*='border-slate-200'] {
+  border-color: #7b8ba3;
+}
+html:not(.dark) .input:not([class*='border-rose-']):not([class*='border-red-']):focus,
+html:not(.dark) input[class*='border-slate-200']:not([class*='border-rose-']):not([class*='border-red-']):focus-visible,
+html:not(.dark) select[class*='border-slate-200']:focus-visible,
+html:not(.dark) textarea[class*='border-slate-200']:not([class*='border-rose-']):not([class*='border-red-']):focus-visible {
+  border-color: #126b87;
+}
+html:not(.dark) button:focus-visible,
+html:not(.dark) a:focus-visible,
+html:not(.dark) [role='button']:focus-visible,
+html:not(.dark) input:focus-visible,
+html:not(.dark) select:focus-visible,
+html:not(.dark) textarea:focus-visible {
+  outline: 2px solid #126b87;
+  outline-offset: 2px;
+}
+html:not(.dark) .btn-ghost:hover { border-color: #126b87; }
+.dark .input:not([class*='border-rose-']):not([class*='border-red-']),
+.dark .btn-ghost,
+.dark input[class*='border-slate-200'],
+.dark select[class*='border-slate-200'],
+.dark textarea[class*='border-slate-200'] {
+  border-color: rgba(148, 163, 184, 0.6);
+}
+.dark button:focus-visible,
+.dark a:focus-visible,
+.dark [role='button']:focus-visible,
+.dark input:focus-visible,
+.dark select:focus-visible,
+.dark textarea:focus-visible { outline: 2px solid #37b8d9; outline-offset: 2px; }
+
+/* These previews and overlays intentionally stay dark in light mode. */
+html:not(.dark) .portal-dark-workspace .text-slate-600 { color: #b3c0d4; }
+html:not(.dark) .portal-dark-workspace .text-slate-500 { color: #93a3ba; }
+html:not(.dark) .portal-dark-workspace .text-slate-400 { color: #a8b6ca; }
+html:not(.dark) .portal-dark-workspace .text-slate-300 { color: #cbd5e1; }
+.dark .text-ocean-700 { color: #76d4ea; }
+.dark .text-ocean-600 { color: #4cc3e2; }
+.dark .text-ocean-500 { color: #37b8d9; }
+.dark .hover\:text-ocean-600:hover, .dark .hover\:text-ocean-700:hover { color: #76d4ea; }
+.dark .text-amber-800, .dark .text-amber-900, .dark .text-amber-950 { color: #fcd34d; }
+.dark .text-amber-700 { color: #fbbf24; }
+.dark .text-amber-600 { color: #fbbf24; }
+.dark .hover\:text-amber-600:hover { color: #fcd34d; }
+.dark .text-emerald-700, .dark .text-emerald-600 { color: #34d399; }
+.dark .text-rose-700, .dark .text-rose-600 { color: #fb7185; }
+.dark .hover\:text-rose-500:hover { color: #fb7185; }
+.dark .text-violet-700, .dark .text-violet-600 { color: #a78bfa; }
+.dark .text-violet-500 { color: #a78bfa; }
+.dark .text-orange-700, .dark .text-orange-600 { color: #fb923c; }
+.dark .text-fuchsia-700 { color: #e879f9; }
+.dark .text-indigo-700, .dark .text-indigo-600 { color: #818cf8; }
+.dark .text-indigo-500 { color: #818cf8; }
+.dark .hover\:text-indigo-600:hover, .dark .hover\:text-violet-600:hover { color: #a5b4fc; }
+.dark .text-sky-700, .dark .text-sky-600 { color: #38bdf8; }
+.dark .text-teal-700, .dark .text-teal-600 { color: #2dd4bf; }
+.dark .text-emerald-800, .dark .text-emerald-900, .dark .text-emerald-950 { color: #6ee7b7; }
+.dark .text-indigo-800, .dark .text-indigo-900, .dark .text-indigo-950 { color: #a5b4fc; }
+.dark .text-orange-800, .dark .text-orange-900, .dark .text-orange-950 { color: #fdba74; }
+.dark .text-red-800, .dark .text-red-900, .dark .text-red-950 { color: #fca5a5; }
+.dark .text-rose-800, .dark .text-rose-900, .dark .text-rose-950 { color: #fda4af; }
+.dark .text-sky-800, .dark .text-sky-900, .dark .text-sky-950 { color: #7dd3fc; }
+.dark .text-teal-800, .dark .text-teal-900, .dark .text-teal-950 { color: #5eead4; }
+.dark .text-violet-800, .dark .text-violet-900, .dark .text-violet-950 { color: #c4b5fd; }
+.dark .text-cyan-800, .dark .text-cyan-900, .dark .text-cyan-950 { color: #67e8f9; }
+.dark .text-blue-800, .dark .text-blue-900, .dark .text-blue-950 { color: #93c5fd; }
+.dark .text-purple-800, .dark .text-purple-900, .dark .text-purple-950 { color: #c4b5fd; }
+.dark .text-pink-800, .dark .text-pink-900, .dark .text-pink-950 { color: #f9a8d4; }
+.dark .text-fuchsia-800, .dark .text-fuchsia-900, .dark .text-fuchsia-950 { color: #f0abfc; }
+.dark .text-yellow-800, .dark .text-yellow-900, .dark .text-yellow-950 { color: #fde047; }
+.dark .text-lime-800, .dark .text-lime-900, .dark .text-lime-950 { color: #bef264; }
+.dark .bg-amber-400.text-amber-950 { color: #451a03; }
+
+/* ── borders ── */
+.dark .border-slate-50, .dark .border-slate-100, .dark .border-slate-200,
+.dark .border-slate-100\/60, .dark .border-slate-100\/70, .dark .border-slate-200\/70 { border-color: rgba(148, 163, 184, 0.13); }
+.dark .border-slate-300 { border-color: rgba(148, 163, 184, 0.3); }
+.dark .hover\:border-slate-200:hover { border-color: rgba(148, 163, 184, 0.32); }
+.dark .border-ocean-100 { border-color: rgba(55, 184, 217, 0.28); }
+.dark .border-ocean-400, .dark .hover\:border-ocean-200:hover, .dark .hover\:border-ocean-300:hover, .dark .hover\:border-ocean-400:hover { border-color: rgba(55, 184, 217, 0.5); }
+.dark .border-amber-100 { border-color: rgba(245, 158, 11, 0.26); }
+.dark .border-amber-200 { border-color: rgba(245, 158, 11, 0.36); }
+.dark .border-amber-300 { border-color: rgba(245, 158, 11, 0.46); }
+.dark .border-amber-400, .dark .hover\:border-amber-300:hover, .dark .hover\:border-amber-400:hover { border-color: rgba(245, 158, 11, 0.55); }
+.dark .border-rose-200 { border-color: rgba(244, 63, 94, 0.36); }
+.dark .hover\:border-violet-200:hover { border-color: rgba(139, 92, 246, 0.42); }
+
+/* ── rings ── */
+.dark .ring-slate-100 { --tw-ring-color: rgba(148, 163, 184, 0.16); }
+.dark .ring-slate-200 { --tw-ring-color: rgba(148, 163, 184, 0.24); }
+.dark .ring-ocean-50 { --tw-ring-color: rgba(55, 184, 217, 0.18); }
+.dark .ring-ocean-100 { --tw-ring-color: rgba(55, 184, 217, 0.26); }
+.dark .ring-ocean-200 { --tw-ring-color: rgba(55, 184, 217, 0.36); }
+.dark .hover\:ring-ocean-300:hover { --tw-ring-color: rgba(55, 184, 217, 0.52); }
+.dark .ring-amber-100 { --tw-ring-color: rgba(245, 158, 11, 0.26); }
+.dark .ring-amber-200 { --tw-ring-color: rgba(245, 158, 11, 0.36); }
+.dark .ring-amber-400 { --tw-ring-color: rgba(245, 158, 11, 0.6); }
+.dark .ring-emerald-100 { --tw-ring-color: rgba(16, 185, 129, 0.26); }
+.dark .ring-emerald-200 { --tw-ring-color: rgba(16, 185, 129, 0.36); }
+.dark .ring-rose-200 { --tw-ring-color: rgba(244, 63, 94, 0.36); }
+.dark .ring-rose-300 { --tw-ring-color: rgba(244, 63, 94, 0.5); }
+.dark .ring-violet-200 { --tw-ring-color: rgba(139, 92, 246, 0.36); }
+.dark .ring-violet-400 { --tw-ring-color: rgba(139, 92, 246, 0.6); }
+.dark .ring-orange-200 { --tw-ring-color: rgba(251, 146, 60, 0.36); }
+.dark .ring-fuchsia-200 { --tw-ring-color: rgba(232, 121, 249, 0.36); }
+.dark .ring-indigo-100 { --tw-ring-color: rgba(99, 102, 241, 0.26); }
+.dark .ring-indigo-200 { --tw-ring-color: rgba(99, 102, 241, 0.36); }
+.dark .ring-sky-200 { --tw-ring-color: rgba(14, 165, 233, 0.36); }
+.dark .ring-teal-200 { --tw-ring-color: rgba(20, 184, 166, 0.36); }
+
+/* ── maintenance borders ── */
+.dark .border-violet-100 { border-color: rgba(139, 92, 246, 0.26); }
+.dark .border-violet-200 { border-color: rgba(139, 92, 246, 0.36); }
+.dark .border-indigo-100 { border-color: rgba(99, 102, 241, 0.26); }
+.dark .border-indigo-200, .dark .hover\:border-indigo-300:hover { border-color: rgba(99, 102, 241, 0.4); }
+.dark .hover\:border-violet-300:hover { border-color: rgba(139, 92, 246, 0.5); }
+.dark .accent-violet-500 { accent-color: #8b5cf6; }
+
+/* ── charts (recharts) ── */
+.dark .recharts-cartesian-grid line { stroke: rgba(148, 163, 184, 0.12); }
+.dark .recharts-text { fill: #a8b6ca; }
+.dark .recharts-legend-item-text { color: #8b9bb4 !important; }
+.dark .recharts-tooltip-cursor { fill: rgba(148, 163, 184, 0.08); stroke: rgba(148, 163, 184, 0.2); }
+
+/* ── misc ── */
+.dark kbd { border-color: rgba(148, 163, 184, 0.2) !important; }
+.dark .accent-ocean-500 { accent-color: #37b8d9; }
+.dark .accent-amber-500 { accent-color: #f59e0b; }
+
+/* ── LoadingOverlay indicators (async/LoadingOverlay.tsx) ──
+   White glyphs on the overlay's dark chip. The five match the mobile apps'
+   set: arc, dots, "Thinking…", segmented spinner, bars. */
+.bp-loader i { display: block; background: currentColor; }
+
+.bp-arc {
+  display: block; width: 34px; height: 34px; border-radius: 9999px;
+  border: 4px solid currentColor; border-right-color: transparent;
+  animation: bpSpin 0.85s linear infinite;
+}
+@keyframes bpSpin { to { transform: rotate(360deg); } }
+
+.bp-dots { display: inline-flex; align-items: center; gap: 7px; }
+.bp-dots i { width: 10px; height: 10px; border-radius: 9999px; animation: bpPulse 0.9s ease-in-out infinite; }
+.bp-dots i:nth-child(2) { animation-delay: 0.3s; }
+.bp-dots i:nth-child(3) { animation-delay: 0.6s; }
+.bp-dots--small { gap: 3px; margin-left: 3px; align-self: flex-end; margin-bottom: 5px; }
+.bp-dots--small i { width: 5px; height: 5px; }
+@keyframes bpPulse { 0%, 100% { opacity: 0.3; } 33% { opacity: 1; } }
+
+.bp-thinking { display: inline-flex; align-items: flex-end; font-size: 17px; font-weight: 600; letter-spacing: -0.01em; }
+
+.bp-segments { position: relative; display: block; width: 36px; height: 36px; }
+.bp-segments i {
+  position: absolute; left: 16.5px; top: 0; width: 3px; height: 10px; border-radius: 2px;
+  transform-origin: 1.5px 18px; animation: bpFade 1s linear infinite;
+}
+@keyframes bpFade { 0% { opacity: 1; } 100% { opacity: 0.15; } }
+
+.bp-bars { display: inline-flex; align-items: center; gap: 7px; height: 30px; }
+.bp-bars i { width: 9px; height: 26px; border-radius: 2px; animation: bpBar 0.9s ease-in-out infinite; }
+.bp-bars i:nth-child(2) { animation-delay: 0.3s; }
+.bp-bars i:nth-child(3) { animation-delay: 0.6s; }
+@keyframes bpBar { 0%, 100% { opacity: 0.45; transform: scaleY(0.65); } 33% { opacity: 1; transform: scaleY(1); } }
+
+/* Slower rather than still: a frozen spinner reads as a hung page. */
+@media (prefers-reduced-motion: reduce) {
+  .bp-arc, .bp-dots i, .bp-segments i, .bp-bars i { animation-duration: 2.4s; }
+}
+
+/* ── Portal Arabic / right-to-left layout ── */
+html[dir="rtl"] body,
+html[dir="rtl"] button,
+html[dir="rtl"] input,
+html[dir="rtl"] textarea,
+html[dir="rtl"] select {
+  font-family: "Noto Sans Arabic", "Segoe UI", Tahoma, sans-serif;
+}
+
+html[dir="rtl"] .portal-sidebar {
+  right: 0 !important;
+  left: auto !important;
+}
+html[dir="rtl"] .portal-sidebar.-translate-x-full {
+  --tw-translate-x: 100%;
+}
+@media (min-width: 1024px) {
+  html[dir="rtl"] .portal-sidebar[class~="lg:translate-x-0"] {
+    --tw-translate-x: 0px !important;
+  }
+  html[dir="rtl"] .portal-sidebar[class~="lg:-translate-x-full"] {
+    --tw-translate-x: 100% !important;
+  }
+  html[dir="rtl"] .portal-main-offset[data-sidebar-open="true"] {
+    padding-right: 264px !important;
+    padding-left: 0 !important;
+  }
+  html[dir="rtl"] .portal-main-offset[data-sidebar-open="false"] {
+    padding-right: 0 !important;
+    padding-left: 0 !important;
+  }
+}
+
+html[dir="rtl"] .text-left { text-align: right !important; }
+html[dir="rtl"] .text-right { text-align: left !important; }
+html[dir="rtl"] .portal-language-floating {
+  right: auto;
+  left: 1rem;
+}
+.portal-language-floating {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  z-index: 95;
+  filter: drop-shadow(0 4px 14px rgba(4, 20, 42, 0.16));
+}
+
+/* Names and user-entered text can contain Latin, Arabic, or both. Keep each
+   value in its natural direction instead of letting adjacent punctuation jump. */
+bdi[dir="auto"] { unicode-bidi: isolate; }
