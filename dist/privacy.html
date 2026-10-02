@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Privacy Policy - BoatPro</title>
+  <meta name="description" content="Privacy Policy & Data Protection for BoatPro App (Boat Pro Co.)" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Noto+Kufi+Arabic:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --navy-deep: #071526;
+      --navy: #0f2744;
+      --navy-light: #1b3b64;
+      --gold: #c9983a;
+      --gold-soft: #dfb35c;
+      --surface: #ffffff;
+      --surface-subtle: #f8fafc;
+      --border: #e2e8f0;
+      --text: #1e293b;
+      --text-muted: #64748b;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      background: var(--surface-subtle);
+      color: var(--text);
+      line-height: 1.7;
+      padding: 0;
+      margin: 0;
+    }
+    body.lang-ar {
+      font-family: 'Noto+Kufi+Arabic', 'Inter', system-ui, sans-serif;
+      direction: rtl;
+    }
+    header {
+      background: var(--navy-deep);
+      color: #fff;
+      padding: 2.5rem 1.5rem;
+      border-bottom: 3px solid var(--gold);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    .header-inner {
+      max-width: 860px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      flex-wrap: wrap;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.85rem;
+    }
+    .brand-title {
+      font-size: 1.4rem;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      color: #ffffff;
+    }
+    .brand-subtitle {
+      font-size: 0.82rem;
+      color: var(--gold-soft);
+      font-weight: 500;
+    }
+    .lang-btn {
+      background: rgba(255,255,255,0.1);
+      border: 1px solid rgba(255,255,255,0.25);
+      color: #fff;
+      padding: 0.5rem 1.1rem;
+      border-radius: 9999px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+    .lang-btn:hover {
+      background: var(--gold);
+      color: var(--navy-deep);
+      border-color: var(--gold);
+    }
+    main {
+      max-width: 860px;
+      margin: 2rem auto;
+      padding: 0 1.5rem 4rem 1.5rem;
+    }
+    .card {
+      background: var(--surface);
+      border-radius: 1rem;
+      padding: 2.25rem 2rem;
+      box-shadow: 0 4px 20px -4px rgba(7, 21, 38, 0.06);
+      border: 1px solid var(--border);
+      margin-bottom: 1.5rem;
+    }
+    h1 {
+      font-size: 1.85rem;
+      font-weight: 700;
+      color: var(--navy-deep);
+      margin-bottom: 0.5rem;
+    }
+    .meta-tag {
+      display: inline-block;
+      font-size: 0.82rem;
+      color: var(--text-muted);
+      margin-bottom: 1.5rem;
+    }
+    h2 {
+      font-size: 1.25rem;
+      color: var(--navy);
+      margin-top: 1.75rem;
+      margin-bottom: 0.75rem;
+      padding-bottom: 0.35rem;
+      border-bottom: 1px solid var(--border);
+    }
+    p, li {
+      font-size: 0.98rem;
+      color: #334155;
+    }
+    ul {
+      padding-left: 1.5rem;
+      margin: 0.75rem 0 1.25rem 0;
+    }
+    body.lang-ar ul {
+      padding-left: 0;
+      padding-right: 1.5rem;
+    }
+    li {
+      margin-bottom: 0.5rem;
+    }
+    .lead {
+      font-size: 1.05rem;
+      color: var(--navy-light);
+      font-weight: 500;
+      margin-bottom: 1.5rem;
+    }
+    .contact-box {
+      background: var(--surface-subtle);
+      border: 1px dashed var(--gold);
+      padding: 1.25rem;
+      border-radius: 0.5rem;
+      margin-top: 1rem;
+    }
+    .contact-box a {
+      color: var(--navy-light);
+      font-weight: 600;
+    }
+    footer {
+      text-align: center;
+      padding: 2rem;
+      color: var(--text-muted);
+      font-size: 0.85rem;
+      border-top: 1px solid var(--border);
+      background: #fff;
+    }
+  </style>
+</head>
+<body class="lang-en">
+  <header>
+    <div class="header-inner">
+      <div class="brand">
+        <svg width="34" height="34" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M6 34L24 42L42 34L40 28L24 35L8 28L6 34Z" fill="#c9983a"/>
+          <path d="M24 6L8 24H40L24 6Z" fill="#dfb35c"/>
+        </svg>
+        <div>
+          <div class="brand-title">BoatPro • بوت برو</div>
+          <div class="brand-subtitle" id="tagline">Boat Pro Co. • Privacy & Data Protection</div>
+        </div>
+      </div>
+      <button class="lang-btn" id="toggleLang" onclick="toggleLanguage()">عربي / Switch to Arabic</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- ENGLISH VERSION -->
+    <article id="content-en" class="card">
+      <h1>Privacy Policy & Data Protection</h1>
+      <span class="meta-tag">Effective Date: September 2026 • Compliant with Saudi PDPL & Google Play Developer Policy</span>
+      <p class="lead">
+        Boat Pro Co. (شركة بوت برو) is dedicated to protecting your privacy and ensuring transparency in how your personal data is collected, processed, and safeguarded under the Kingdom of Saudi Arabia's Personal Data Protection Law (PDPL) and international data privacy regulations.
+      </p>
+
+      <h2>A. Information We Collect</h2>
+      <ul>
+        <li><strong>Account Information:</strong> Name, email address, mobile phone number, and encrypted credentials.</li>
+        <li><strong>Identity Verification:</strong> National ID / Iqama number or passport details, requested strictly when necessary for issuing mandatory sailing permits and Saudi Border Guard security clearances.</li>
+        <li><strong>Location Data:</strong> Real-time GPS location (collected only with explicit user permission) to assist users in locating embarkation points, marinas, nearby marine services, and emergency rescue assistance.</li>
+        <li><strong>Transaction & Booking Details:</strong> Trip bookings, transaction records, payments, and vessel details (for boat/marina owners).</li>
+        <li><strong>Camera & Media Files:</strong> Optional photo and document uploads necessary for vessel registration, permits, and profile pictures.</li>
+      </ul>
+
+      <h2>B. How We Use Your Data</h2>
+      <ul>
+        <li><strong>Service Fulfillment:</strong> Facilitating bookings, processing transactions via authorized payment gateways, and arranging required sailing permits.</li>
+        <li><strong>Communication:</strong> Sending booking confirmations, trip status notifications, safety announcements, and customer support.</li>
+        <li><strong>Safety & Compliance:</strong> Verifying identities to prevent fraudulent operations and ensuring maritime security compliance.</li>
+        <li><strong>Platform Improvement:</strong> Analyzing aggregated usage patterns to enhance application performance, stability, and user experience.</li>
+      </ul>
+
+      <h2>C. Data Sharing & Disclosure</h2>
+      <p style="margin-bottom: 0.75rem;">We do <strong>not</strong> sell your personal data to third parties. We disclose your data only in the following necessary contexts:</p>
+      <ul>
+        <li><strong>Service Providers & Guests:</strong> Sharing essential booking information (e.g. guest name, booking time, pick-up dock, vessel coordinates) to fulfill the maritime booking.</li>
+        <li><strong>Government & Maritime Authorities:</strong> Disclosing permits and identity information to the <strong>Saudi Border Guard</strong>, <strong>Saudi Red Sea Authority</strong>, or law enforcement entities when required by Saudi laws and maritime safety regulations.</li>
+        <li><strong>Authorized Service Providers:</strong> Trusted third-party payment gateways (e.g. HyperPay), cloud infrastructure providers, and SMS verification services operating under strict confidentiality and data protection standards.</li>
+      </ul>
+
+      <h2>D. Data Retention & Security</h2>
+      <p>
+        We implement administrative, technical, and physical safeguards designed to protect personal data against unauthorized access, loss, alteration, or misuse. Your personal data is retained only for as long as necessary to fulfill the purposes set forth in this policy or as mandated by applicable Saudi regulatory and financial record-keeping laws.
+      </p>
+
+      <section id="delete-account">
+        <h2>E. Account & Data Deletion Policy</h2>
+        <p>
+          In accordance with Google Play developer policies and the Saudi Personal Data Protection Law (PDPL), users have the right to request the permanent deletion of their account and associated personal data at any time without needing to retain the mobile app.
+        </p>
+        <p><strong>How to request deletion:</strong></p>
+        <ul>
+          <li><strong>Email Request:</strong> Send an email to our Data Protection team at <a href="mailto:info@boatpro.club?subject=BoatPro%20Account%20Deletion%20Request"><strong>info@boatpro.club</strong></a> with your registered email or phone number and full name.</li>
+          <li><strong>In-App:</strong> Under <em>Profile &gt; Settings &gt; Account &gt; Delete Account</em>.</li>
+        </ul>
+        <p><strong>Data Deleted:</strong> Your profile data (name, email, phone number, credentials, profile photo, and preferences) will be permanently purged within 30 days.</p>
+        <p><strong>Data Retained:</strong> Past financial invoices and completed voyage records are retained in an encrypted archive for the legally required retention periods mandated by Saudi tax (ZATCA) and maritime authorities.</p>
+        <div class="contact-box">
+          For data deletion or privacy inquiries, contact our Data Protection Officer at:
+          <br />
+          <strong>Email:</strong> <a href="mailto:info@boatpro.club">info@boatpro.club</a>
+          <br />
+          <strong>Entity:</strong> Boat Pro Co. (شركة بوت برو)
+        </div>
+      </section>
+    </article>
+
+    <!-- ARABIC VERSION -->
+    <article id="content-ar" class="card" style="display: none;">
+      <h1>سياسة الخصوصية وحماية البيانات</h1>
+      <span class="meta-tag">تاريخ السريان: سبتمبر 2026 • متوافقة مع نظام حماية البيانات الشخصية السعودي (PDPL)</span>
+      <p class="lead">
+        تلتزم <strong>شركة بوت برو (Boat Pro Co.)</strong> بحماية خصوصيتك وبياناتك الشخصية وفقاً لـ <strong>نظام حماية البيانات الشخصية (PDPL)</strong> الصادر في المملكة العربية السعودية والأنظمة والمعايير الدولية ذات العلاقة.
+      </p>
+
+      <h2>أ. البيانات التي نجمعها</h2>
+      <ul>
+        <li><strong>بيانات الحساب:</strong> الاسم، البريد الإلكتروني، رقم الجوال، وبيانات تسجيل الدخول.</li>
+        <li><strong>التحقق من الهوية:</strong> رقم الهوية الوطنية أو الإقامة أو جواز السفر (يُطلب حصراً لإصدار التصاريح البحرية وتصاريح حرس الحدود الإلزامية لرحلات الإبحار).</li>
+        <li><strong>بيانات الموقع الجغرافي:</strong> موقع GPS المباشر (بعد موافقتك الصريحة) لتسهيل الوصول لنقاط الانطلاق، والملاحة البحرية، وتوفير خدمات الطوارئ والدعم السريع.</li>
+        <li><strong>بيانات الحجز والمعاملات:</strong> سجل المدفوعات، تفاصيل الحجوزات، وبيانات وتراخيص الوسيلة البحرية (لملاك القوارب واليخوت ومقدمي الخدمة).</li>
+        <li><strong>الكاميرا والملفات:</strong> رفع صور المستندات الرسمية وتراخيص القوارب والصور الشخصية عند طلبك.</li>
+      </ul>
+
+      <h2>ب. كيف نستخدم بياناتك</h2>
+      <ul>
+        <li><strong>تقديم الخدمات:</strong> إتمام الحجوزات، معالجة المدفوعات بأمان، واستخراج تصاريح الإبحار المطلوبة نظاماً.</li>
+        <li><strong>التواصل:</strong> إرسال تأكيدات الحجز، التحديثات، تنبيهات الأمان، وتقديم الدعم الفني وخدمة العملاء.</li>
+        <li><strong>السلامة والأمان:</strong> التحقق من هوية المستخدمين، منع الاحتيال، ودعم معايير السلامة والأمن البحري.</li>
+        <li><strong>تحسين الخدمة:</strong> تحليل مؤشرات الاستخدام لتطوير أداء التطبيق وتحسين تجربة المستخدم.</li>
+      </ul>
+
+      <h2>ج. مشاركة البيانات</h2>
+      <p style="margin-bottom: 0.75rem;">نحن <strong>لا نبيع</strong> بياناتك الشخصية لأي طرف. ونشارك البيانات فقط في الحالات الآتية:</p>
+      <ul>
+        <li><strong>بين مقدم الخدمة والمستفيد:</strong> مشاركة البيانات الأساسية اللازمة لإتمام الرحلة (مثل اسم العميل، وقت الرحلة، وموقع القارب).</li>
+        <li><strong>الجهات الحكومية والرقابية:</strong> تقديم البيانات لـ <strong>حرس الحدود السعودي</strong>، و<strong>الهيئة السعودية للبحر الأحمر</strong>، أو الجهات الأمنية متى ما كان ذلك متطلباً نظامياً أو لسلامة الأرواح.</li>
+        <li><strong>مزودو الخدمات المعتمدون:</strong> بوابات الدفع الإلكتروني المعتمدة، شركات الاستضافة السحابية الآمنة، وخدمات إرسال الرسائل النصية الملتزمة باتفاقيات سرية البيانات.</li>
+      </ul>
+
+      <h2>د. حماية البيانات والحفظ</h2>
+      <p>
+        نطبق أعلى معايير الأمان التقنية والتنظيمية لحماية بياناتك من الوصول غير المصرح به أو التلف أو الضياع. ونحتفظ ببياناتك فقط للمدة اللازمة لتحقيق الأغراض المحددة في هذه السياسة أو وفقاً للمدد المحددة قانوناً بموجب الأنظمة السعودية واللوائح المحاسبية.
+      </p>
+
+      <section id="delete-account-ar">
+        <h2>هـ. سياسة طلب حذف الحساب والبيانات</h2>
+        <p>
+          وفقاً لسياسات Google Play ونظام حماية البيانات الشخصية السعودي (PDPL)، يحق لجميع المستخدمين طلب الحذف الدائم لحساباتهم وجميع بياناتهم الشخصية في أي وقت دون اشتراط الاحتفاظ بالتطبيق على أجهزتهم.
+        </p>
+        <p><strong>خطوات تقديم طلب الحذف:</strong></p>
+        <ul>
+          <li><strong>عبر البريد الإلكتروني:</strong> إرسال طلب إلى <a href="mailto:info@boatpro.club?subject=%D8%B7%D9%84%D8%A8%20%D8%AD%D8%B0%D9%81%20%D8%AD%D8%B3%D8%A7%D8%A8%20%D8%A8%D9%88%D8%AA%20%D8%A8%D8%B1%D9%88"><strong>info@boatpro.club</strong></a> يتضمن الاسم ورقم الهاتف أو البريد المسجل.</li>
+          <li><strong>من داخل التطبيق:</strong> عبر <em>الملف الشخصي &gt; الإعدادات &gt; الحساب &gt; حذف الحساب</em>.</li>
+        </ul>
+        <p><strong>البيانات المحذوفة:</strong> يتم مسح كافة بيانات الملف الشخصي والصور وبيانات الاعتماد نهائياً خلال 30 يوماً من التحقق.</p>
+        <p><strong>البيانات المحتفظ بها:</strong> يتم أرشفة سجلات الفواتير والمعاملات المالية وتصاريح الرحلات المنفذة للمدد الإلزامية نظاماً بموجب متطلبات هيئة الزكاة والضريبة والجمارك (ZATCA) والأنظمة البحرية.</p>
+        <div class="contact-box">
+          لأي استفسارات بخصوص الخصوصية أو تقديم طلبات حذف البيانات، يرجى التواصل معنا عبر:
+          <br />
+          <strong>البريد الإلكتروني:</strong> <a href="mailto:info@boatpro.club">info@boatpro.club</a>
+          <br />
+          <strong>الجهة:</strong> شركة بوت برو (Boat Pro Co.)
+        </div>
+      </section>
+    </article>
+  </main>
+
+  <footer>
+    &copy; 2026 Boat Pro Co. (شركة بوت برو). All rights reserved.
+  </footer>
+
+  <script>
+    function toggleLanguage() {
+      const isArabic = document.body.classList.contains('lang-ar');
+      if (isArabic) {
+        document.body.classList.remove('lang-ar');
+        document.body.classList.add('lang-en');
+        document.getElementById('content-en').style.display = 'block';
+        document.getElementById('content-ar').style.display = 'none';
+        document.getElementById('toggleLang').textContent = 'عربي / Switch to Arabic';
+        document.getElementById('tagline').textContent = 'Boat Pro Co. • Privacy & Data Protection';
+        document.title = 'Privacy Policy - BoatPro';
+      } else {
+        document.body.classList.remove('lang-en');
+        document.body.classList.add('lang-ar');
+        document.getElementById('content-en').style.display = 'none';
+        document.getElementById('content-ar').style.display = 'block';
+        document.getElementById('toggleLang').textContent = 'English / التبديل للإنجليزية';
+        document.getElementById('tagline').textContent = 'شركة بوت برو • سياسة الخصوصية وحماية البيانات';
+        document.title = 'سياسة الخصوصية - بوت برو';
+      }
+    }
+  </script>
+</body>
+</html>

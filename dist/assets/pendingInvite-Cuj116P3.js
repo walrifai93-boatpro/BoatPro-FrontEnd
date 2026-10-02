@@ -1,0 +1,1 @@
+const t="boatpro.pendingPlanInvite";function n(e){try{sessionStorage.setItem(t,e.trim().toUpperCase())}catch{}}function s(){try{return sessionStorage.getItem(t)}catch{return null}}function r(){try{sessionStorage.removeItem(t)}catch{}}export{r as c,s as g,n as s};

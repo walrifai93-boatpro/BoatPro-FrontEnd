@@ -1,8 +1,7 @@
 node_modules/
 .expo/
 .metro-cache/
-dist/
-build/
+
 android/build/
 ios/build/
 .env
