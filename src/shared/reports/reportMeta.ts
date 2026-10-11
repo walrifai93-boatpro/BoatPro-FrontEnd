@@ -55,7 +55,7 @@ const TOPIC_REPORTS: Record<TopicId, readonly string[]> = {
   money: [
     'revenue', 'finance-summary', 'commission', 'provider-earnings', 'payouts', 'refunds',
     'commission-statements', 'tax-summary', 'berth-revenue', 'dock-subscriptions',
-    'fuel-margin', 'maintenance-income', 'maintenance-unbilled', 'trip-profitability',
+    'fuel-margin', 'maintenance-income', 'maintenance-unbilled', 'trip-profitability', 'boat-profitability',
     'subscriptions', 'coupons',
   ],
   activity: [
@@ -126,6 +126,7 @@ const PLAIN: Record<string, string> = {
   'maintenance-income': 'Work billed, collected and still outstanding.',
   'maintenance-unbilled': 'Finished jobs that have not been invoiced yet.',
   'trip-profitability': 'What each trip earned after fuel, marina and repair costs.',
+  'boat-profitability': 'What each boat earned and cost, trip and general running costs together.',
   subscriptions: 'Active and expired plans, with monthly recurring revenue.',
   coupons: 'Discount codes used and the discount given.',
 

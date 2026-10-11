@@ -35,6 +35,35 @@ const BOOKING_TYPES = [
   { value: 'trip', label: 'Trips' },
 ]
 
+/**
+ * The status a billing row shows.
+ *
+ * This read `payment.status` and knew only `paid` and `refunded`, so a
+ * cancelled berth — refunded 96%, the gateway fee kept, its payment therefore
+ * `partially_refunded` — was listed as "Pending", as if the boater still owed
+ * it. The server now sends `displayStatus`, which counts partial refunds and
+ * credit notes; the fallback below covers an API that predates it.
+ */
+type BillingStatus = NonNullable<ApiInvoice['displayStatus']>
+const BILLING_STATUS_LABEL: Record<BillingStatus, string> = {
+  paid: 'Paid',
+  pending: 'Pending',
+  refunded: 'Refunded',
+  partially_refunded: 'Partially refunded',
+  credit_note: 'Credit note',
+}
+function billingStatus(inv: ApiInvoice): BillingStatus {
+  if (inv.displayStatus) return inv.displayStatus
+  if (inv.kind === 'credit_note') return 'credit_note'
+  const pay = typeof inv.payment === 'object' && inv.payment ? inv.payment : null
+  if (inv.status === 'refunded' || pay?.status === 'refunded') return 'refunded'
+  if (inv.status === 'partially_refunded' || pay?.status === 'partially_refunded') return 'partially_refunded'
+  return pay?.status === 'paid' ? 'paid' : 'pending'
+}
+const billingStatusLabel = (inv: ApiInvoice) => BILLING_STATUS_LABEL[billingStatus(inv)]
+/** A credit note gives money back, so its amounts read as negative in the list. */
+const signed = (inv: ApiInvoice) => (inv.kind === 'credit_note' ? '−' : '')
+
 export function Billing() {
   const { currency } = useMarina()
   const [bookingType, setBookingType] = useState('all')
@@ -63,12 +92,11 @@ export function Billing() {
         options: [
           { value: 'paid', label: 'Paid' },
           { value: 'pending', label: 'Pending' },
+          { value: 'partially_refunded', label: 'Partially refunded' },
           { value: 'refunded', label: 'Refunded' },
+          { value: 'credit_note', label: 'Credit note' },
         ],
-        get: (inv) => {
-          const pay = typeof inv.payment === 'object' && inv.payment ? inv.payment : null
-          return pay?.status === 'paid' ? 'paid' : pay?.status === 'refunded' ? 'refunded' : 'pending'
-        },
+        get: (inv) => billingStatus(inv),
       },
       { key: 'stream', label: 'Stream', get: (inv) => inv.bookingType },
       {
@@ -117,7 +145,8 @@ export function Billing() {
         [translatePortalText('VAT')]: inv.vatAmount,
         [translatePortalText('Total')]: inv.total,
         [translatePortalText('Currency')]: inv.currency,
-        [translatePortalText('Status')]: translatePortalText(humanize(pay?.status ?? 'unpaid')),
+        [translatePortalText('Status')]: translatePortalText(billingStatusLabel(inv)),
+        [translatePortalText('Original invoice')]: inv.originalInvoiceNumber ?? '',
         [translatePortalText('Method')]: translatePortalText(humanize(pay?.method)),
         [translatePortalText('Paid')]: pay?.paidAt ?? '',
         [translatePortalText('Raised')]: inv.createdAt,
@@ -191,13 +220,15 @@ export function Billing() {
                 <tbody>
                   {rows.map((inv, i) => {
                     const who = personOf(inv.customer)
-                    const pay = typeof inv.payment === 'object' && inv.payment ? inv.payment : null
                     return (
                       <motion.tr key={inv.id} layout initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: Math.min(i * 0.02, 0.35) }}
                         className="border-b border-slate-50 transition hover:bg-sand/60">
                         <td className="td">
                           <button onClick={() => setSel(inv)} className="text-left">
                             <p className="font-mono text-xs font-bold text-deep-900">{inv.invoiceNumber}</p>
+                            {inv.kind === 'credit_note' && inv.originalInvoiceNumber && (
+                              <p className="font-mono text-[10px] text-slate-400">{translatePortalText('Credit against')} {inv.originalInvoiceNumber}</p>
+                            )}
                             <p className="text-[11px] text-slate-400">{fmtDate(inv.createdAt)}</p>
                           </button>
                         </td>
@@ -210,10 +241,10 @@ export function Billing() {
                           ) : <span className="text-xs text-slate-400">—</span>}
                         </td>
                         <td className="td text-xs text-slate-500">{translatePortalText(humanize(inv.bookingType))}</td>
-                        <td className="td text-right text-slate-600">{asIssued(inv.subtotal, inv.currency)}</td>
-                        <td className="td text-right text-slate-500">{asIssued(inv.vatAmount, inv.currency)}</td>
-                        <td className="td text-right font-extrabold text-deep-900">{asIssued(inv.total, inv.currency)}</td>
-                        <td className="td"><Badge>{translatePortalText(pay?.status === 'paid' ? 'Paid' : pay?.status === 'refunded' ? 'Refunded' : 'Pending')}</Badge></td>
+                        <td className="td text-right text-slate-600">{signed(inv)}{asIssued(inv.subtotal, inv.currency)}</td>
+                        <td className="td text-right text-slate-500">{signed(inv)}{asIssued(inv.vatAmount, inv.currency)}</td>
+                        <td className="td text-right font-extrabold text-deep-900">{signed(inv)}{asIssued(inv.total, inv.currency)}</td>
+                        <td className="td"><Badge>{billingStatusLabel(inv)}</Badge></td>
                         <td className="td">
                           <div className="flex justify-end gap-1.5">
                             {inv.pdfUrl && (
@@ -241,8 +272,14 @@ export function Billing() {
                 <p className="text-sm font-bold text-deep-900">{personOf(sel.customer)?.name ?? translatePortalText('Customer')}</p>
                 <p className="text-xs text-slate-400">{personOf(sel.customer)?.email}</p>
               </div>
-              <Badge>{translatePortalText(typeof sel.payment === 'object' && sel.payment?.status === 'paid' ? 'Paid' : 'Pending')}</Badge>
+              <Badge>{billingStatusLabel(sel)}</Badge>
             </div>
+            {sel.kind === 'credit_note' && (
+              <div className="rounded-xl bg-slate-50 px-4 py-2.5 text-xs text-slate-600">
+                <p><span className="font-semibold">{translatePortalText('Credit against')}</span> <span className="font-mono">{sel.originalInvoiceNumber ?? '—'}</span></p>
+                {sel.reason && <p className="mt-0.5">{translatePortalText('Reason')}: {sel.reason}</p>}
+              </div>
+            )}
             <div className="rounded-2xl border border-slate-100">
               {sel.items.map((it, i) => (
                 <div key={i} className="flex items-start justify-between gap-3 border-b border-slate-50 px-4 py-2.5 last:border-0">
@@ -257,7 +294,10 @@ export function Billing() {
             <div className="space-y-1 text-sm">
               <p className="flex justify-between"><span className="text-slate-500">{translatePortalText("Subtotal")}</span><span className="font-semibold text-deep-900">{asIssued(sel.subtotal, sel.currency)}</span></p>
               <p className="flex justify-between"><span className="text-slate-500">{translatePortalText('VAT')} ({formatPortalNumber(sel.vatRate)}%)</span><span className="font-semibold text-deep-900">{asIssued(sel.vatAmount, sel.currency)}</span></p>
-              <p className="flex justify-between border-t border-slate-100 pt-1.5"><span className="font-bold text-deep-900">{translatePortalText("Total")}</span><span className="font-display text-lg font-extrabold text-deep-900">{asIssued(sel.total, sel.currency)}</span></p>
+              <p className="flex justify-between border-t border-slate-100 pt-1.5"><span className="font-bold text-deep-900">{translatePortalText("Total")}</span><span className="font-display text-lg font-extrabold text-deep-900">{signed(sel)}{asIssued(sel.total, sel.currency)}</span></p>
+              {sel.kind !== 'credit_note' && (sel.refundedTotal ?? 0) > 0 && (
+                <p className="flex justify-between"><span className="text-slate-500">{translatePortalText('Refunded so far')}</span><span className="font-semibold text-rose-600">−{asIssued(sel.refundedTotal, sel.currency)}</span></p>
+              )}
             </div>
             <p className="text-xs text-slate-400">{translatePortalText("Raised ")}{fmtDateTime(sel.createdAt)}</p>
             <div className="flex justify-end gap-2">

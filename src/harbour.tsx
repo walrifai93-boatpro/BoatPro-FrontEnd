@@ -17,7 +17,7 @@
 // space instead of spinning with the hull.
 // ---------------------------------------------------------------------------
 import React from 'react'
-import { formatPortalNumber, translatePortalText } from './i18n/runtime'
+import { formatPortalNumber, translatePortalText, meterUnit } from './i18n/runtime'
 
 /* ══════════════════════════ liveries ══════════════════════════ */
 
@@ -976,7 +976,7 @@ export function HarbourChart({
         <line x1="0" y1="-4" x2="0" y2="4" stroke="rgba(255,255,255,.75)" strokeWidth="1.8" />
         <line x1="43" y1="-3" x2="43" y2="3" stroke="rgba(255,255,255,.55)" strokeWidth="1.4" />
         <line x1="86" y1="-4" x2="86" y2="4" stroke="rgba(255,255,255,.75)" strokeWidth="1.8" />
-        <text x="43" y="-8" textAnchor="middle" fill="rgba(255,255,255,.8)" fontSize="8.5" fontWeight="700">{translatePortalText('Approx.')} {formatPortalNumber(30)} {translatePortalText('Meter abbreviation')}</text>
+        <text x="43" y="-8" textAnchor="middle" fill="rgba(255,255,255,.8)" fontSize="8.5" fontWeight="700">{translatePortalText('Approx.')} {formatPortalNumber(30)} {meterUnit()}</text>
       </g>
     </svg>
     </div>

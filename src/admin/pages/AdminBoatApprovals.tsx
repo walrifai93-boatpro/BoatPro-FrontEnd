@@ -217,7 +217,7 @@ export default function AdminBoatApprovals() {
                     <th className="py-3.5 px-4">{translatePortalText("Documents")}</th>
                     <th className="py-3.5 px-4">{translatePortalText("Submitted")}</th>
                     <th className="py-3.5 px-4">{translatePortalText("Status")}</th>
-                    <th className="py-3.5 px-4 text-right">{translatePortalText("Actions")}</th>
+                    <th className="sticky end-0 z-[1] bg-slate-50 py-3.5 px-4 text-right">{translatePortalText("Actions")}</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 bg-white">
@@ -358,7 +358,7 @@ export default function AdminBoatApprovals() {
                         </td>
 
                         {/* Actions */}
-                        <td className="py-3.5 px-4 text-right whitespace-nowrap">
+                        <td className="sticky end-0 z-[1] bg-white py-3.5 px-4 text-right whitespace-nowrap shadow-[-12px_0_12px_-12px_rgba(15,23,42,0.18)]">
                           <div className="flex items-center justify-end gap-1.5">
                             <button
                               onClick={() => openDetail(b)}

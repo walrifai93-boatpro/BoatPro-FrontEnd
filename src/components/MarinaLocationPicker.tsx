@@ -49,6 +49,9 @@ export default function MarinaLocationPicker({
   const [query, setQuery] = useState('')
   const [results, setResults] = useState<GeoResult[]>([])
   const [searching, setSearching] = useState(false)
+  // The query that last came back empty — without it a miss looked exactly like
+  // a search that never ran (the map just sat there).
+  const [missed, setMissed] = useState<string | null>(null)
   const [resolving, setResolving] = useState(false)
 
   const reverse = (lat: number, lng: number) => {
@@ -63,7 +66,11 @@ export default function MarinaLocationPicker({
     const q = query.trim()
     if (q.length < 2) return
     setSearching(true)
-    mapsApi.geocode(q).then((r) => setResults(r.data.results)).catch(() => setResults([])).finally(() => setSearching(false))
+    setMissed(null)
+    mapsApi.geocode(q)
+      .then((r) => { setResults(r.data.results); if (!r.data.results.length) setMissed(q) })
+      .catch(() => { setResults([]); setMissed(q) })
+      .finally(() => setSearching(false))
   }
 
   const pick = (r: GeoResult) => {
@@ -79,11 +86,16 @@ export default function MarinaLocationPicker({
           <Search size={15} className="pointer-events-none absolute start-3 top-1/2 -translate-y-1/2 text-slate-400" />
           <input
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => { setQuery(e.target.value); setMissed(null) }}
             onKeyDown={(e) => e.key === 'Enter' && runSearch()}
             placeholder={translatePortalText("Search a place, harbor or address…")}
             className="input ps-9"
           />
+          {missed && results.length === 0 && (
+            <p className="mt-1.5 text-[11px] font-semibold text-amber-700">
+              {translatePortalText('No places found for')} “{missed}”. {translatePortalText('Try one word (e.g. Obhur), or click the map to drop the pin.')}
+            </p>
+          )}
           {results.length > 0 && (
             <div className="card absolute start-0 end-0 top-full z-[1000] mt-1 max-h-60 overflow-y-auto !rounded-xl !p-1.5 shadow-lift">
               {results.map((r, i) => (

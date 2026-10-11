@@ -130,6 +130,16 @@ export default function DockModal({
     }
     fe.clear()
 
+    // Checked before anything is written: the dock used to be created first and
+    // then every berth bounced off the API ("must be ≥ 0"), leaving an empty
+    // dock behind a "created with 0 berths!" success toast.
+    if (generateBerths && berthCount > 0) {
+      const bad = ([[maxLength, 'Max length'], [maxBeam, 'Max beam'], [maxDraft, 'Max draft']] as const)
+        .find(([v]) => v !== undefined && Number(v) <= 0)
+      if (bad) { toast(translatePortalText(`${bad[1]} must be more than 0 m`), 'warn'); return }
+      if (monthlyPrice !== undefined && monthlyPrice < 0) { toast(translatePortalText('Monthly price cannot be negative'), 'warn'); return }
+    }
+
     const marinaId = marina?._id || marina?.id
     if (!marinaId) {
       toast(translatePortalText('Marina not loaded yet. Please try again.'), 'warn')
@@ -168,6 +178,7 @@ export default function DockModal({
         }
 
         let createdCount = 0
+        let firstSlotError: unknown = null
         for (let i = 1; i <= berthCount; i++) {
           const slotCode = `S${String(i).padStart(2, '0')}`
           try {
@@ -178,10 +189,18 @@ export default function DockModal({
             createdCount++
           } catch (slotErr) {
             console.error(`Failed to create slot ${slotCode}:`, slotErr)
+            firstSlotError ??= slotErr
           }
         }
         await usage.reload()
-        toast(translatePortalText(`✨ Dock ${cleanCode} created with ${createdCount} berths!`), 'success')
+        if (createdCount < berthCount) {
+          // Say so — the dock exists, the berths that failed do not, and the
+          // operator needs the reason (plan limit, a rejected value) to fix it.
+          const why = firstSlotError instanceof Error ? firstSlotError.message : ''
+          toast(translatePortalText(`Dock ${cleanCode} created, but ${berthCount - createdCount} of ${berthCount} berths could not be added${why ? `: ${why}` : ''}`), 'warn')
+        } else {
+          toast(translatePortalText(`✨ Dock ${cleanCode} created with ${createdCount} berths!`), 'success')
+        }
       } else {
         toast(translatePortalText(`✨ Dock ${cleanCode} created successfully!`), 'success')
       }

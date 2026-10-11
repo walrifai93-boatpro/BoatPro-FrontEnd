@@ -72,7 +72,7 @@ export function AdminTestingTools() {
       const ok = await confirm({
         title: 'Turn on Fake fill?',
         body:
-          'Everyone who opens a provider signup or registration form will see a "Fake fill" button until you switch it off — real providers included. Use it on test and staging platforms, or briefly for a test session.',
+          'Testers using a development or staging build will see a "Fake fill" button on provider signup and registration forms. Production builds of the apps and portal never show it, whatever this switch says.',
         confirmLabel: 'Turn on',
       })
       if (!ok) return
@@ -122,7 +122,7 @@ export function AdminTestingTools() {
         <div className="mb-4 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-[13px] text-amber-800 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-300">
           <AlertTriangle size={16} className="mt-0.5 shrink-0" />
           <p>
-            <b>{translatePortalText("Fake fill is on.")}</b> {translatePortalText(" Every provider signing up can see the button right now. Switch it off before the platform\n            goes live or when your test session is over.\n          ")}</p>
+            <b>{translatePortalText("Fake fill is on.")}</b> {translatePortalText(" Development and staging builds show the button on signup forms; production builds never do.")}</p>
         </div>
       )}
 

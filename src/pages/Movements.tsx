@@ -3,7 +3,7 @@ import { motion } from 'framer-motion'
 import { ArrowLeftRight, Megaphone, FileText, ArrowUpRight, ArrowDownLeft, Plus } from 'lucide-react'
 import { PageHeader, Badge, Section, Img, Modal, toast, Progress, SearchInput, ViewToggle, LoadingState, ErrorState } from '../ui'
 import { boatPhoto } from '../images'
-import {
+import { boatTypeLabel,
   useAsync, useMarina, useMarinaSettings, berthLabel, fmtDate, fmtTime, formatMoney, humanize, personOf, todayIso,
 } from '../live'
 import { useOps } from '../opsStore'
@@ -290,7 +290,7 @@ export default function Movements() {
                             </p>
                           </td>
                           <td className="py-3 px-4 whitespace-nowrap"><span className="inline-block rounded-xl bg-ocean-50 px-3 py-1 text-xs font-extrabold text-ocean-700 border border-ocean-200">{translatePortalText("Berth ")}{berthLabel(m.pontoon, m.slot)}</span></td>
-                          <td className="py-3 px-4 font-medium text-slate-600">{sub?.boatType ? translatePortalText(humanize(sub.boatType)) : (m.plate ?? '—')}</td>
+                          <td className="py-3 px-4 font-medium text-slate-600">{sub?.boatType ? translatePortalText(boatTypeLabel(sub.boatType)) : (m.plate ?? '—')}</td>
                           <td className="py-3 px-4 w-36">
                             <Progress pct={(steps / 2) * 100} tone={steps === 2 ? 'bg-emerald-500' : 'bg-ocean-500'} />
                             <p className="text-[10px] font-bold text-slate-400 mt-1">{steps} {translatePortalText("of 2 checks done")}</p>
@@ -326,7 +326,7 @@ export default function Movements() {
                       <Img src={boatPhoto(m.boatName)} className="h-12 w-12 shrink-0 rounded-2xl" />
                       <div className="min-w-0 flex-1">
                         <p className="truncate text-base font-extrabold text-deep-900">{m.boatName} <span className="font-medium text-slate-400">· {who?.name ?? m.plate ?? ''}</span></p>
-                        <p className="truncate text-xs text-slate-400">{sub?.boatType ? translatePortalText(humanize(sub.boatType)) : ''} {translatePortalText("· berth ")}<b className="text-deep-800">{berthLabel(m.pontoon, m.slot)}</b></p>
+                        <p className="truncate text-xs text-slate-400">{sub?.boatType ? translatePortalText(boatTypeLabel(sub.boatType)) : ''} {translatePortalText("· berth ")}<b className="text-deep-800">{berthLabel(m.pontoon, m.slot)}</b></p>
                       </div>
                       <div className="shrink-0 text-right"><p className="font-display text-lg font-extrabold text-ocean-600">{fmtTime(m.scheduledAt)}</p><p className="text-[10px] font-bold uppercase text-slate-400">{translatePortalText("ETA")}</p></div>
                     </div>

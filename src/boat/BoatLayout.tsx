@@ -171,11 +171,12 @@ export default function BoatLayout() {
         </header>
         <BoatStatusBanner boat={boats[0] || null} completeness={boats[0]?.completeness} onRefresh={loadBoats} />
         <main className="px-4 py-6 md:px-7 md:py-7 max-w-[1600px]">
-          <AnimatePresence mode="wait">
-            <motion.div key={loc.pathname} initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -12 }} transition={{ duration: 0.25 }}>
-              {useOutlet()}
-            </motion.div>
-          </AnimatePresence>
+          {/* Enter-only CSS fade keyed by route. The old framer-motion
+              AnimatePresence mode="wait" could finish the outgoing page's exit
+              and never mount the next one, leaving a blank white page. */}
+          <div key={loc.pathname} className="route-enter">
+            {useOutlet()}
+          </div>
         </main>
       </div>
       <NotifDrawer open={notif} onClose={() => setNotif(false)} notifs={notifs} loading={notifsLoading} onMarkAllRead={markAllRead} />

@@ -169,6 +169,13 @@ export interface MaintRequest {
   sourceTitle?: string; sourceDesc?: string
   priority: Priority; status: JobStatus; emergency?: boolean; photos: number; source: string
   location: string; est?: number; notes?: string
+  /** Short reference shown to staff, the same "REQ-xxxx" the boater sees — `id` is the DB id. */
+  ref?: string
+  /** When the request was sent, shown on hover; `date`/`time` are the appointment when one was booked. */
+  requested?: string
+  /** True when `date`/`time` are the appointment the customer booked rather than when they asked. */
+  booked?: boolean
+  quoteResponse?: 'accepted' | 'declined'
 }
 
 export interface WorkOrder {
@@ -184,6 +191,10 @@ export interface WorkOrder {
    * callers fall back to labour + parts rather than rendering NaN.
    */
   vat?: { subtotal: number; vatRate: number; vatAmount: number; total: number }
+  /** The quote the customer accepted, before VAT — the invoice never exceeds it. */
+  agreedQuote?: number
+  /** What the customer is actually asked to pay, VAT included, once the invoice exists. */
+  invoiceTotal?: number
   /** Human-readable code (e.g. MWO-000012) for display — `id` is the DB id used for API calls. */
   code?: string
   /** Raw backend status enum (e.g. 'in_progress') — `status` above is the Title Case display form. */
@@ -243,7 +254,9 @@ export const INSPECTION_TYPES = [
 ]
 
 export interface Part { id: string; name: string; sku: string; cat: string; stock: number; min: number; price: number; supplier: string; location: string; barcode: string }
-export interface MaintInvoice { id: string; woId: string; customer: string; avatar: string; boat: string; date: string; due: string; labor: number; parts: number; tax: number; discount: number; total: number; status: 'Paid' | 'Pending' | 'Overdue' | 'Refunded'; method: string
+export interface MaintInvoice { id: string; woId: string; customer: string; avatar: string; boat: string; date: string; due: string; labor: number; parts: number; tax: number; discount: number; total: number; status: 'Paid' | 'Pending' | 'Overdue' | 'Refunded' | 'Void'; method: string
+  /** Gross already returned to the customer. */
+  refunded?: number
   /** Taxable amount before VAT — `tax` is the VAT it produced, `total` the sum. */
   subtotal?: number
   /** The VAT percentage stamped on the invoice; absent on ones issued before VAT applied. */

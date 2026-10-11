@@ -384,6 +384,28 @@ export function humanize(value?: string | null): string {
   return translatePortalText(value.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()));
 }
 
+/**
+ * The hull form a berth booking was made for. New bookings carry power / sail /
+ * multihull / pwc; older ones the use-based keys the provider app sent before.
+ * Plain `humanize` turned "pwc" into "Pwc".
+ */
+const BOAT_TYPE_LABELS: Record<string, string> = {
+  power: 'Powerboat',
+  sail: 'Sailboat',
+  multihull: 'Catamaran / multihull',
+  pwc: 'Jet ski / PWC',
+  jetski: 'Jet Ski',
+  cruiser: 'Cruiser',
+  diving: 'Diving Boat',
+  transport: 'Transport Boat',
+  fishing: 'Fishing Boat',
+  yacht: 'Yacht',
+};
+export function boatTypeLabel(value?: string | null): string {
+  if (!value) return '—';
+  return BOAT_TYPE_LABELS[value] ? translatePortalText(BOAT_TYPE_LABELS[value]) : humanize(value);
+}
+
 // ── status label + tone maps shared across pages ────────────
 export const RESERVATION_LABELS: Record<string, string> = {
   pending_approval: 'Awaiting review',

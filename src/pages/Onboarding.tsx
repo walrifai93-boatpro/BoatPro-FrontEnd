@@ -4,7 +4,7 @@ import { motion } from 'framer-motion'
 import {
   Anchor, Fuel, Wrench, Building2, Phone, MapPin, Check, Loader2, Hourglass, ArrowRight, ArrowLeft,
   RefreshCw, Plus, Trash2, ShieldCheck, ImageIcon, AlertTriangle, CreditCard, Sparkles,
-  ScanLine, CalendarClock, BellRing, FileWarning, UploadCloud, Receipt,
+  ScanLine, CalendarClock, BellRing, FileWarning, UploadCloud, Receipt, Info,
 } from 'lucide-react'
 import { useAuth, backendRoleForPortal, type PortalRole } from '../auth'
 import {
@@ -52,6 +52,10 @@ const EMAIL_RX = /^\S+@\S+\.\S+$/
 const PHONE_RX = /^[+\d][\d\s-]{6,}$/
 const emailError = (v: string) => (v.trim() && !EMAIL_RX.test(v.trim()) ? 'Enter a valid email address' : undefined)
 const phoneError = (v: string) => (v.trim() && !PHONE_RX.test(v.trim()) ? 'Enter a valid phone number' : undefined)
+// Saudi formats. Neither the form nor the API checked them, so "12AB" went
+// through as a CR and "123" as a VAT number and only surfaced at document review.
+const crError = (v: string) => (v.trim() && !/^\d{10}$/.test(v.trim()) ? 'A CR number is 10 digits' : undefined)
+const vatError = (v: string) => (v.trim() && !/^3\d{13}3$/.test(v.trim()) ? 'A VAT number is 15 digits, starting and ending with 3' : undefined)
 
 const IDENTITY_TYPES = [
   { key: 'saudi_citizen', label: 'Saudi citizen' },
@@ -709,8 +713,8 @@ export default function Onboarding() {
       )}
 
       {key === 'business' && (
-        <StepBody onBack={goBack} onNext={async () => goNext(await save('business', { category, businessNameEn, businessNameAr, crNumber, vatNumber, businessEmail: businessEmail.trim() || undefined, businessPhone, website }))} busy={busy}
-          disabled={!category || !businessNameEn || !businessPhone || !!emailError(businessEmail) || !!phoneError(businessPhone)}>
+        <StepBody onBack={goBack} onNext={async () => goNext(await save('business', { category, businessNameEn, businessNameAr: businessNameAr.trim() || undefined, crNumber: crNumber.trim() || undefined, vatNumber: vatNumber.trim() || undefined, businessEmail: businessEmail.trim() || undefined, businessPhone, website: website.trim() || undefined }))} busy={busy}
+          disabled={!category || !businessNameEn || !businessPhone || !!emailError(businessEmail) || !!phoneError(businessPhone) || !!crError(crNumber) || !!vatError(vatNumber)}>
           <FieldLabel>{translatePortalText("Business type")}</FieldLabel>
           <div className="flex flex-wrap gap-1.5">
             {BUSINESS_CATEGORIES[providerType].map((o) => (
@@ -721,8 +725,8 @@ export default function Onboarding() {
           <div className="grid gap-4 md:grid-cols-2">
             <TextField label="Business name (English)" value={businessNameEn} onChange={setBusinessNameEn} placeholder={translatePortalText("Al Waha Marine Co.")} />
             <TextField label="Business name (Arabic)" value={businessNameAr} onChange={setBusinessNameAr} placeholder="شركة الواحة البحرية" dir="rtl" />
-            <TextField label="Commercial Registration (CR) number" value={crNumber} onChange={setCrNumber} placeholder={translatePortalText("1010xxxxxx")} />
-            <TextField label="VAT registration number (if registered)" value={vatNumber} onChange={setVatNumber} placeholder={translatePortalText("3xxxxxxxxxxxxx")} />
+            <TextField label="Commercial Registration (CR) number" value={crNumber} onChange={setCrNumber} placeholder={translatePortalText("1010xxxxxx")} error={crError(crNumber)} />
+            <TextField label="VAT registration number (if registered)" value={vatNumber} onChange={setVatNumber} placeholder={translatePortalText("3xxxxxxxxxxxxx")} error={vatError(vatNumber)} />
             <TextField label="Business email" type="email" value={businessEmail} onChange={setBusinessEmail} placeholder={translatePortalText("info@business.sa")} error={emailError(businessEmail)} />
             <TextField label="Business phone" type="tel" value={businessPhone} onChange={setBusinessPhone} placeholder={translatePortalText("+966 5x xxx xxxx")} error={phoneError(businessPhone)} />
             <TextField label="Website (optional)" type="url" value={website} onChange={setWebsite} placeholder={translatePortalText("https://")} />
@@ -954,8 +958,11 @@ export default function Onboarding() {
                     {p.description && <p className="mt-2 text-xs text-slate-500 leading-relaxed">{p.description}</p>}
 
                     <div className="mt-3 border-t border-slate-100 pt-2.5 text-xs text-slate-500 space-y-1">
-                      <p className="flex items-center gap-1.5 text-[11px]"><Check size={12} className="text-emerald-500 shrink-0" /> {translatePortalText("100% booking revenue to wallet")}</p>
                       <p className="flex items-center gap-1.5 text-[11px]"><Check size={12} className="text-emerald-500 shrink-0" /> {translatePortalText("0% platform commission")}</p>
+                      {/* Disclosed, not promised away: the card acquirer's fee on online
+                          payments still comes out of the payout ("100% to wallet" was
+                          shown here while 3.5% was deducted from every card booking). */}
+                      <p className="flex items-center gap-1.5 text-[11px] text-slate-400"><Info size={12} className="shrink-0" /> {translatePortalText("Card-processing fees apply to online payments")}</p>
                     </div>
 
                     {p.limits && Object.keys(p.limits).length > 0 && (
@@ -1016,7 +1023,10 @@ export default function Onboarding() {
       )}
 
       {key === 'images' && (
-        <StepBody onBack={goBack} onNext={() => goNext(true)} busy={busy}>
+        // Same 5–20 rule the API applies at submit; without it the step waved
+        // 4 photos through and the miss only surfaced on the review page.
+        <StepBody onBack={goBack} onNext={() => goNext(true)} busy={busy}
+          disabled={(reg?.images?.length ?? 0) < 5 || (reg?.images?.length ?? 0) > 20}>
           <p className="text-xs text-slate-500 flex items-center gap-1"><ImageIcon size={13} /> {translatePortalText("Upload 5–20 photos of your ")}{entityLabel(providerType).toLowerCase()}.</p>
           <ImageGalleryUpload images={reg?.images || []} categories={IMAGE_CATEGORIES[providerType]}
             onUpload={async (files, cat) => { await providerRegistrationApi.uploadImages(files, cat); await reload() }}
@@ -1193,7 +1203,9 @@ const VERDICT_TONE = {
 } as const
 
 /** Flags whose whole point is that a person decides — the server refuses to waive these too. */
-const UNWAIVABLE = ['fraud_risk', 'duplicate']
+// Kept in step with the API's UNWAIVABLE_FLAGS: `wrong_document` is a confident
+// reading of a different document — replace it, don't acknowledge it.
+const UNWAIVABLE = ['fraud_risk', 'duplicate', 'wrong_document']
 
 const fmtDocDate = (iso?: string) =>
   iso ? formatPortalDate(iso, { day: 'numeric', month: 'short', year: 'numeric' }) : ''

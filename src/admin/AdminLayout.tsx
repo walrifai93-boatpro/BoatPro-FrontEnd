@@ -6,7 +6,7 @@ import {
   LayoutDashboard, Users, BadgeCheck, Sailboat, CalendarCheck2, Landmark, Percent, Ticket,
   Star, Headset, BarChart3, Siren, Bot, Search, Menu, X, Plus, Radar, LogOut, Bell, Crown,
   Anchor, Fuel, Wrench, ShoppingBag, ShieldCheck, ChevronDown, LayoutGrid, ClipboardList, TrendingUp, CalendarDays, FileCheck2,
-  ShieldAlert, Sparkles, Megaphone, FlaskConical } from 'lucide-react'
+  ShieldAlert, Sparkles, Megaphone, FlaskConical, Tags } from 'lucide-react'
 import { avatar } from './adminData'
 import { fileUrl } from '../api'
 import { ToastStack, toast } from '../ui'
@@ -52,6 +52,8 @@ const NAV: NavPanel[] = [
       // What every provider type must upload to sign up. Site-wide, so it sits
       // here rather than being repeated under each provider panel.
       { to: '/admin/required-documents', label: 'Required Documents', icon: FileCheck2 },
+      // The curated vessel / trip / equipment lists and the providers' requests to extend them.
+      { to: '/admin/taxonomy', label: 'Vessel & Trip Types', icon: Tags },
       // Helpers for manual testing, such as the Fake fill button on signup forms.
       { to: '/admin/testing-tools', label: 'Testing Tools', icon: FlaskConical },
     ],
@@ -230,7 +232,7 @@ function Sidebar({ open, desktopOpen, onClose, onDesktopClose, pendingRoleCounts
       <aside className={`portal-sidebar bg-admin-gradient fixed inset-y-0 start-0 z-50 flex w-[264px] flex-col text-white transition-transform duration-300 ${desktopOpen ? 'lg:translate-x-0' : 'lg:-translate-x-full'} ${open ? 'translate-x-0' : '-translate-x-full'}`}>
         <div className="flex items-center gap-3 px-5 pt-6 pb-4">
           <div className="relative h-12 w-12 shrink-0">
-            <img src="/logo.png" alt={translatePortalText("BoatPro")} className="h-full w-full object-contain drop-shadow-[0_0_15px_rgba(16,185,129,0.4)]" onError={e => ((e.target as HTMLImageElement).style.display = 'none')} />
+            <img src="logo.png" alt={translatePortalText("BoatPro")} className="h-full w-full object-contain drop-shadow-[0_0_15px_rgba(16,185,129,0.4)]" onError={e => ((e.target as HTMLImageElement).style.display = 'none')} />
             <Crown size={15} className="absolute -bottom-1 -end-1 text-emerald-300" />
           </div>
           <div>
@@ -243,7 +245,7 @@ function Sidebar({ open, desktopOpen, onClose, onDesktopClose, pendingRoleCounts
 
         <div className="mx-4 mb-3 overflow-hidden rounded-2xl border border-white/10">
           <div className="relative h-[86px]">
-            <video src="/videos/promo.mp4" autoPlay loop muted playsInline className="h-full w-full object-cover" />
+            <video src="videos/promo.mp4" autoPlay loop muted playsInline className="h-full w-full object-cover" />
             <div className="absolute inset-0 bg-gradient-to-t from-[#041410]/90 via-[#041410]/30 to-transparent" />
             <div className="absolute bottom-2 start-3">
               <p className="font-display text-sm font-bold">{translatePortalText('BoatPro HQ')}</p>
@@ -538,14 +540,14 @@ export default function AdminLayout() {
           </div>
         </header>
         <main className="px-4 py-6 md:px-7 md:py-7 max-w-[1600px]">
-          <AnimatePresence mode="wait">
-            <motion.div key={loc.pathname} initial={{ opacity: 0, y: 18, scale: 0.995 }} animate={{ opacity: 1, y: 0, scale: 1 }}
-              exit={{ opacity: 0, y: -12, scale: 0.995 }} transition={{ duration: 0.28, ease: 'easeOut' }}>
-              {useOutlet()}
-            </motion.div>
-          </AnimatePresence>
+          {/* Enter-only CSS fade keyed by route. The old framer-motion
+              AnimatePresence mode="wait" could finish the outgoing page's exit
+              and never mount the next one, leaving a blank white page. */}
+          <div key={loc.pathname} className="route-enter">
+            {useOutlet()}
+          </div>
           <footer className="mt-10 flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 pt-5 pb-2 text-xs text-slate-400">
-            <p>© {formatPortalNumber(new Date().getFullYear())} HarborLink · {translatePortalText('BoatPro Platform HQ')} · {translatePortalText('Super Admin Console')}</p>
+            <p>© {formatPortalNumber(new Date().getFullYear(), { useGrouping: false })} HarborLink · {translatePortalText('BoatPro Platform HQ')} · {translatePortalText('Super Admin Console')}</p>
             {/* Was "99.98% uptime · 6 regions live", neither of which was
                 measured anywhere. The dot means the API answered this poll. */}
             <p className="flex items-center gap-1.5">

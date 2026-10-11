@@ -118,6 +118,7 @@ export const MARINA_ONBOARDING_ARABIC_MESSAGES: Record<string, string> = {
   'Have an invite code?': 'هل لديك رمز دعوة؟',
   'A code from the BoatPro team puts you on an agreed plan — leave it blank to choose one below.': 'يضعك الرمز المقدم من فريق BoatPro على باقة متفق عليها — اترك الحقل فارغًا لاختيار باقة أدناه.',
   '100% booking revenue to wallet': 'تحويل 100٪ من إيرادات الحجوزات إلى المحفظة',
+  'Card-processing fees apply to online payments': 'تُطبَّق رسوم معالجة البطاقات على المدفوعات الإلكترونية',
   '0% platform commission': 'عمولة المنصة 0٪',
   'No subscription packages are configured yet — contact support.': 'لم يتم إعداد باقات اشتراك بعد — يرجى التواصل مع الدعم.',
   'Pay per booking': 'الدفع لكل حجز',

@@ -6,7 +6,7 @@ import {
 } from 'lucide-react'
 import { money } from '../adminData'
 import { adminPortalApi, type ApiAdminPayment, type ApiReview } from '../../api'
-import { PageWrap, BOOKING_TYPE_META, PAYMENT_STATUS_META as STATUS_META, seededAvatar, personName, earnedCommission, paymentProviderLabel, paymentTitle } from './_shared'
+import { PageWrap, BOOKING_TYPE_META, PAYMENT_STATUS_META as STATUS_META, seededAvatar, personName, earnedCommission, platformCut, paymentProviderLabel, paymentTitle } from './_shared'
 import { ReviewStatCards, ReviewsBoard, useReviewModeration } from './AdminEngage'
 import { Modal, toast, Counter, downloadCsv } from '../../ui'
 import { AdminHeader, ABadge, ViewToggle } from '../adminUi'
@@ -140,7 +140,7 @@ export function CustomerBookings() {
               downloadCsv(
                 `bookings-${new Date().toISOString().slice(0, 10)}.csv`,
                 [
-                  ['Booking', 'Booked', 'Customer', 'Type', 'Provider', 'Date', `Amount (${BASE_CURRENCY})`, `Refunded (${BASE_CURRENCY})`, `Commission (${BASE_CURRENCY})`, 'Status', 'Gateway reference'],
+                  ['Booking', 'Booked', 'Customer', 'Type', 'Provider', 'Date', `Amount (${BASE_CURRENCY})`, `Refunded (${BASE_CURRENCY})`, `Commission (${BASE_CURRENCY})`, `Card fee (${BASE_CURRENCY})`, 'Status', 'Gateway reference'],
                   ...list.map(p => [
                     p.booking?.code ?? '',
                     paymentTitle(p),
@@ -150,7 +150,8 @@ export function CustomerBookings() {
                     (p.paidAt || p.createdAt || '').slice(0, 10),
                     p.amount,
                     p.refundAmount ?? 0,
-                    earnedCommission(p),
+                    platformCut(p).commission,
+                    platformCut(p).cardFee,
                     STATUS_META[p.status]?.label || p.status,
                     p.transactionId,
                   ]),
@@ -168,7 +169,7 @@ export function CustomerBookings() {
         {([
           ['Paid bookings', totals.count, '🗓️', undefined],
           ['Collected (after refunds)', totals.gross, '💰', BASE_CURRENCY],
-          ['Commission earned', totals.commission, '📈', BASE_CURRENCY],
+          ['Platform earnings', totals.commission, '📈', BASE_CURRENCY],
         ] as [string, number, string, string | undefined][]).map(([label, val, icon, cur], i) => (
           <motion.div
             key={label}
@@ -268,8 +269,11 @@ export function CustomerBookings() {
                     <div className="text-[13px] font-extrabold text-deep-900 whitespace-nowrap">
                       {money(p.amount)}
                       {!!p.refundAmount && <p className="text-[10px] font-semibold text-rose-500">−{money(p.refundAmount)} {translatePortalText('refunded')}</p>}
-                      {earnedCommission(p) > 0 && (
-                        <p className="text-[10px] font-semibold text-emerald-600">+{money(earnedCommission(p))} {translatePortalText(" comm.")}</p>
+                      {platformCut(p).cardFee > 0 && (
+                        <p className="text-[10px] font-semibold text-slate-400">+{money(platformCut(p).cardFee)} {translatePortalText("card fee")}</p>
+                      )}
+                      {platformCut(p).commission > 0 && (
+                        <p className="text-[10px] font-semibold text-emerald-600">+{money(platformCut(p).commission)} {translatePortalText(" comm.")}</p>
                       )}
                     </div>
 
@@ -382,7 +386,7 @@ export function CustomerBookings() {
               <div className="rounded-xl border border-slate-100 p-3">
                 <p className="text-[10px] font-bold uppercase text-slate-400">{translatePortalText("Financial Breakdown")}</p>
                 <p className="mt-1 font-extrabold text-emerald-600">{translatePortalText("Total: ")}{money(sel.amount)}</p>
-                <p className="mt-0.5 text-slate-500">{translatePortalText("Commission: ")}{money(earnedCommission(sel))}</p>
+                <p className="mt-0.5 text-slate-500">{translatePortalText("Commission: ")}{money(platformCut(sel).commission)} · {translatePortalText("Card fee:")} {money(platformCut(sel).cardFee)}</p>
                 {!!sel.refundAmount && <p className="mt-0.5 text-rose-500">{translatePortalText("Refunded:")} {money(sel.refundAmount)}</p>}
                 <p className="mt-0.5 text-slate-500">{translatePortalText("Method: ")}{translatePortalText(sel.method)}</p>
                 <p className="mt-0.5 break-all font-mono text-[10px] text-slate-400">{translatePortalText("Gateway reference")}: {sel.transactionId}</p>

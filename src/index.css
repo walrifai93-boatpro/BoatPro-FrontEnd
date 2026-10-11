@@ -88,6 +88,21 @@ body {
 }
 .splash-letter { display: inline-block; animation: riseIn 0.6s cubic-bezier(0.2, 0.8, 0.2, 1) both; }
 
+/* ── page entrance on route change (all consoles) ──
+   CSS, not JS: it runs on time even when rAF is throttled.
+   Opacity only, and `backwards` rather than `both`: any transform left on this
+   wrapper — even an identity matrix kept by a forwards fill — makes it the
+   containing block for every `position: fixed` modal inside the page, which
+   then renders squeezed into the content column instead of over the screen. */
+@keyframes routeEnter {
+  0% { opacity: 0; }
+  100% { opacity: 1; }
+}
+.route-enter { animation: routeEnter 0.2s ease-out backwards; }
+@media (prefers-reduced-motion: reduce) {
+  .route-enter { animation: none; }
+}
+
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;

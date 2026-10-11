@@ -93,7 +93,7 @@ function Sidebar({ open, desktopOpen, onClose, onDesktopClose }: { open: boolean
       <aside className={`portal-sidebar bg-fuel-gradient fixed inset-y-0 start-0 z-50 flex w-[264px] flex-col text-white transition-transform duration-300 ${desktopOpen ? 'lg:translate-x-0' : 'lg:-translate-x-full'} ${open ? 'translate-x-0' : '-translate-x-full'}`}>
         <div className="flex items-center gap-3 px-5 pt-6 pb-4">
           <div className="relative h-12 w-12 shrink-0">
-            <img src="/logo.png" alt={translatePortalText("BoatPro")} className="h-full w-full object-contain drop-shadow-[0_0_15px_rgba(251,146,60,0.35)]" onError={e => ((e.target as HTMLImageElement).style.display = 'none')} />
+            <img src="logo.png" alt={translatePortalText("BoatPro")} className="h-full w-full object-contain drop-shadow-[0_0_15px_rgba(251,146,60,0.35)]" onError={e => ((e.target as HTMLImageElement).style.display = 'none')} />
           </div>
           <div>
             <p className="font-display text-xl font-extrabold leading-tight tracking-wide text-white drop-shadow-sm">{translatePortalText("BoatPro")}</p>
@@ -695,12 +695,12 @@ function FuelShell() {
               {translatePortalText(error)}
             </div>
           )}
-          <AnimatePresence mode="wait">
-            <motion.div key={loc.pathname} initial={{ opacity: 0, y: 18, scale: 0.995 }} animate={{ opacity: 1, y: 0, scale: 1 }}
-              exit={{ opacity: 0, y: -12, scale: 0.995 }} transition={{ duration: 0.28, ease: 'easeOut' }}>
-              {useOutlet()}
-            </motion.div>
-          </AnimatePresence>
+          {/* Enter-only CSS fade keyed by route. The old framer-motion
+              AnimatePresence mode="wait" could finish the outgoing page's exit
+              and never mount the next one, leaving a blank white page. */}
+          <div key={loc.pathname} className="route-enter">
+            {useOutlet()}
+          </div>
           <footer className="mt-10 flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 pt-5 pb-2 text-xs text-slate-400">
             <p>© {new Date().getFullYear()} <bdi dir="auto">{localizedField(station, 'legalName') || localizedField(station, 'name') || 'BoatPro'}</bdi> · {translatePortalText('Powered by BoatPro')}</p>
             <p className="flex items-center gap-1.5">

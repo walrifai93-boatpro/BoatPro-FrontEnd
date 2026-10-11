@@ -204,10 +204,15 @@ export function describeFieldErrors(details: unknown, limit = 3): string | undef
  * its inputs still tells the user *which* input, rather than reciting a validator
  * string with no subject.
  */
-export function apiErrorFromResponse(status: number, body: any): ApiError {
+export function apiErrorFromResponse(status: number, body: any, opts?: { signIn?: boolean }): ApiError {
   const kind = kindForStatus(status);
   const serverMsg = typeof body?.message === 'string' && body.message.trim() ? body.message : undefined;
-  const useServerMsg = !!serverMsg && kind !== 'server' && kind !== 'auth';
+  /*
+    A 401 from signing in is not an expired session — it is "Incorrect email or
+    password", written for the user. Replacing it with the session copy told
+    someone who mistyped their password that their session had expired.
+  */
+  const useServerMsg = !!serverMsg && kind !== 'server' && (kind !== 'auth' || (!!opts?.signIn && status === 401));
   const described = kind === 'validation' ? describeFieldErrors(body?.errors) : undefined;
   const message =
     status === 403

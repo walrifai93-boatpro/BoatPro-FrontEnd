@@ -12,7 +12,7 @@ import { ToastStack, toast, CoverPhoto } from './ui'
 import { ConfirmHost, RouteProgressBar } from './async'
 import { ThemeToggle } from './theme'
 import { LanguageToggle } from './i18n/LanguageToggle'
-import { formatPortalDate, formatPortalNumber, formatPortalTime, isPortalArabic, localizedField, translatePortalText } from './i18n/runtime'
+import { formatPortalDate, formatPortalNumber, formatPortalTime, isPortalArabic, localizedField, translatePortalText, meterUnit } from './i18n/runtime'
 import { notificationsApi, portalApi, fileUrl, type ApiNotification } from './api'
 import { fmtRelative, marinaCoverPhotos, useMarina, windDir, formatMoney, weatherText } from './live'
 import { useOps } from './opsStore'
@@ -78,7 +78,7 @@ function Sidebar({ open, desktopOpen, onClose, onDesktopClose, onOpenWeather }: 
       <aside className={`portal-sidebar bg-hero-gradient fixed inset-y-0 start-0 z-50 flex w-[264px] flex-col text-white transition-transform duration-300 ${desktopOpen ? 'lg:translate-x-0' : 'lg:-translate-x-full'} ${open ? 'translate-x-0' : '-translate-x-full'}`}>
         <div className="flex items-center gap-3 px-5 pt-6 pb-4">
           <div className="relative h-12 w-12 shrink-0">
-            <img src="/logo.png" alt={translatePortalText("BoatPro")} className="h-full w-full object-contain drop-shadow-[0_0_15px_rgba(55,184,217,0.3)]" onError={e => ((e.target as HTMLImageElement).style.display = 'none')} />
+            <img src="logo.png" alt={translatePortalText("BoatPro")} className="h-full w-full object-contain drop-shadow-[0_0_15px_rgba(55,184,217,0.3)]" onError={e => ((e.target as HTMLImageElement).style.display = 'none')} />
           </div>
           <div>
             <p className="font-display text-xl font-extrabold leading-tight tracking-wide text-white drop-shadow-sm">BoatPro</p>
@@ -388,7 +388,7 @@ function Splash() {
       className="bg-hero-gradient fixed inset-0 z-[200] grid place-items-center">
       <div className="text-center text-white">
         <div className="relative mx-auto mb-6 h-28 w-28">
-          <img src="/logo.png" alt={translatePortalText("BoatPro")} className="h-full w-full object-contain drop-shadow-[0_0_25px_rgba(55,184,217,0.5)]" onError={e => ((e.target as HTMLImageElement).style.display = 'none')} />
+          <img src="logo.png" alt={translatePortalText("BoatPro")} className="h-full w-full object-contain drop-shadow-[0_0_25px_rgba(55,184,217,0.5)]" onError={e => ((e.target as HTMLImageElement).style.display = 'none')} />
         </div>
         <p className="font-display text-4xl font-extrabold tracking-tight text-white drop-shadow-md">
           {'BoatPro'.split('').map((ch, i) => (
@@ -555,7 +555,7 @@ function WeatherModal({ open, onClose }: { open: boolean; onClose: () => void })
                   <span>{translatePortalText("Sea State")}</span>
                 </div>
                 <p className="font-display text-lg font-bold text-white">{translatePortalText(windSpeed < 10 ? 'Calm Glass' : windSpeed < 18 ? 'Smooth Chop' : 'Moderate Swell')}</p>
-                <p className="text-[11px] text-slate-400 mt-0.5">{translatePortalText("Waves ")}{windSpeed < 10 ? `${formatPortalNumber(0.1)}–${formatPortalNumber(0.3)}` : `${formatPortalNumber(0.4)}–${formatPortalNumber(1)}`} {translatePortalText('Meter abbreviation')}</p>
+                <p className="text-[11px] text-slate-400 mt-0.5">{translatePortalText("Waves ")}{windSpeed < 10 ? `${formatPortalNumber(0.1)}–${formatPortalNumber(0.3)}` : `${formatPortalNumber(0.4)}–${formatPortalNumber(1)}`} {meterUnit()}</p>
               </div>
 
               <div className="rounded-2xl bg-white/5 p-4 border border-white/5">
@@ -581,8 +581,8 @@ function WeatherModal({ open, onClose }: { open: boolean; onClose: () => void })
               <div className="rounded-2xl bg-white/5 p-3.5 border border-white/5">
                 <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400 mb-1">{translatePortalText("Tide Level Today (m)")}</p>
                 <div className="flex items-center justify-between text-xs font-semibold text-ocean-200">
-                  <span>{translatePortalText("Current Tide: ")}{formatPortalNumber(tides[tides.length - 1]?.height)} {translatePortalText('Meter abbreviation')}</span>
-                  <span>{translatePortalText("Range: ")}{formatPortalNumber(Math.min(...tides.map(t => t.height)))}–{formatPortalNumber(Math.max(...tides.map(t => t.height)))} {translatePortalText('Meter abbreviation')}</span>
+                  <span>{translatePortalText("Current Tide: ")}{formatPortalNumber(tides[tides.length - 1]?.height)} {meterUnit()}</span>
+                  <span>{translatePortalText("Range: ")}{formatPortalNumber(Math.min(...tides.map(t => t.height)))}–{formatPortalNumber(Math.max(...tides.map(t => t.height)))} {meterUnit()}</span>
                 </div>
               </div>
             )}
@@ -663,14 +663,14 @@ export default function Layout() {
         </header>
         <MarinaStatusBanner />
         <main className="px-4 py-6 md:px-7 md:py-7 max-w-[1600px]">
-          <AnimatePresence mode="wait">
-            <motion.div key={loc.pathname} initial={{ opacity: 0, y: 18, scale: 0.995 }} animate={{ opacity: 1, y: 0, scale: 1 }}
-              exit={{ opacity: 0, y: -12, scale: 0.995 }} transition={{ duration: 0.28, ease: 'easeOut' }}>
-              {useOutlet()}
-            </motion.div>
-          </AnimatePresence>
+          {/* Enter-only CSS fade keyed by route. The old framer-motion
+              AnimatePresence mode="wait" could finish the outgoing page's exit
+              and never mount the next one, leaving a blank white page. */}
+          <div key={loc.pathname} className="route-enter">
+            {useOutlet()}
+          </div>
           <footer className="mt-10 flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 pt-5 pb-2 text-xs text-slate-400">
-            <p>© {formatPortalNumber(new Date().getFullYear())} HarborLink · <bdi dir="auto">{localizedField(marina, 'name') || translatePortalText('Your Marina')}</bdi> · {translatePortalText('Powered by BoatPro')}</p>
+            <p>© {formatPortalNumber(new Date().getFullYear(), { useGrouping: false })} HarborLink · <bdi dir="auto">{localizedField(marina, 'name') || translatePortalText('Your Marina')}</bdi> · {translatePortalText('Powered by BoatPro')}</p>
             <p className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse-soft" /> {translatePortalText("All systems operational")}</p>
           </footer>
         </main>

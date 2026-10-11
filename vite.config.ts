@@ -125,5 +125,9 @@ function portalArabicCatalogPlugin() {
 
 export default defineConfig({
   plugins: [portalArabicCatalogPlugin(), react()],
+  // Relative asset URLs: the portal uses HashRouter, so the page itself is
+  // always the folder's index.html and it can be hosted under any subpath
+  // (e.g. boatpro.club/Admin/) as well as at a domain root.
+  base: './',
   server: { port: 5199 },
 })

@@ -27,6 +27,7 @@ export const BOAT_CATEGORIES: TaxonomyEntry[] = [
   { key: 'floating_restaurant', labelEn: 'Floating Restaurant', labelAr: 'مطعم عائم', icon: 'UtensilsCrossed' },
   { key: 'water_bus', labelEn: 'Water Bus', labelAr: 'باص مائي', icon: 'Bus' },
   { key: 'cruise_ship', labelEn: 'Cruise Ship', labelAr: 'سفينة كروز', icon: 'Ship' },
+  { key: 'other', labelEn: 'Other', labelAr: 'أخرى', icon: 'MoreHorizontal' },
 ];
 
 export const TRIP_TYPES: TaxonomyEntry[] = [
@@ -50,6 +51,7 @@ export const TRIP_TYPES: TaxonomyEntry[] = [
   { key: 'photography', labelEn: 'Marine Photography & Drone', labelAr: 'جولات تصوير فوتوغرافي', icon: 'Camera' },
   { key: 'business_vip', labelEn: 'VIP & Corporate Charters', labelAr: 'رحلات رجال أعمال وVIP', icon: 'Crown' },
   { key: 'travel_recreation', labelEn: 'Travel & Recreation Trips', labelAr: 'رحلات سفر وترفيه ممتد', icon: 'Compass' },
+  { key: 'other', labelEn: 'Other', labelAr: 'أخرى', icon: 'MoreHorizontal' },
 ];
 
 export const BOAT_STATUSES: TaxonomyEntry[] = [

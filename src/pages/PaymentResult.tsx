@@ -5,6 +5,7 @@ import { addOnApi, addOnRequestApi, monetizationApi, planInviteApi, onboardingAp
 import { checkoutIdFromResourcePath, getPendingCheckout, takePendingCheckout } from '../payments/HyperpayCheckout'
 import { toApiError } from '../async/errors'
 import { translatePortalText } from '../i18n/runtime'
+import { useAuth } from '../auth'
 
 
 /**
@@ -14,9 +15,18 @@ import { translatePortalText } from '../i18n/runtime'
  * the pending-checkout stash, calls the matching confirm endpoint, then sends
  * the provider back to where they started.
  */
+/**
+ * Checkouts already being confirmed by this tab. HyperPay answers a checkout's
+ * status once, and React's StrictMode runs the effect below twice in dev — the
+ * second confirm read "No payment session found" and could overwrite the real
+ * answer on screen. Module scope, so it survives the simulated remount.
+ */
+const confirming = new Set<string>()
+
 export default function PaymentResult() {
   const [params] = useSearchParams()
   const navigate = useNavigate()
+  const { refreshMe } = useAuth()
   const [state, setState] = useState<'working' | 'success' | 'error'>('working')
   const [message, setMessage] = useState('Confirming your payment…')
 
@@ -62,6 +72,8 @@ export default function PaymentResult() {
     }
 
     const targetCheckoutId = checkoutId || ''
+    if (confirming.has(targetCheckoutId)) return
+    confirming.add(targetCheckoutId)
     const pending = targetCheckoutId ? getPendingCheckout(targetCheckoutId) : null
 
     ;(async () => {
@@ -120,6 +132,10 @@ export default function PaymentResult() {
           }
         }
         if (targetCheckoutId) takePendingCheckout(targetCheckoutId)
+        // The session still holds the pre-payment status (pending_subscription_payment),
+        // so "Go to Provider Dashboard" bounced straight back to the Pay screen and
+        // invited a second charge. Pick up the activated account first.
+        await refreshMe()
         setState('success')
         setMessage(`${pending?.label || 'Subscription'} — payment received.`)
       } catch (e) {

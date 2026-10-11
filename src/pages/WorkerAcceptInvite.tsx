@@ -104,7 +104,7 @@ export default function WorkerAcceptInvite() {
       <div className="relative z-10 mx-auto flex min-h-screen max-w-md items-center px-5 py-10">
         <motion.div initial={{ opacity: 0, y: 24 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.5 }} className="w-full">
           <div className="mb-6 text-center">
-            <img src="/logo.png" alt={translatePortalText("BoatPro")} className="mx-auto h-14 w-14 object-contain drop-shadow-[0_0_18px_rgba(255,255,255,0.35)]" onError={e => ((e.target as HTMLImageElement).style.display = 'none')} />
+            <img src="logo.png" alt={translatePortalText("BoatPro")} className="mx-auto h-14 w-14 object-contain drop-shadow-[0_0_18px_rgba(255,255,255,0.35)]" onError={e => ((e.target as HTMLImageElement).style.display = 'none')} />
             <p className="mt-2 font-display text-2xl font-extrabold text-white">{cfg.label}</p>
           </div>
 

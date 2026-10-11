@@ -139,6 +139,7 @@ const AdminFeaturedListings = lazyPage(() => import('./admin/pages/AdminFeatured
 const AdminSupportAgents = lazyPage(() => import('./admin/pages/AdminSupportAgents'))
 const AdminRequiredDocuments = lazyPage(() => import('./admin/pages/AdminRequiredDocuments').then(m => ({ default: m.AdminRequiredDocuments })))
 const AdminTestingTools = lazyPage(() => import('./admin/pages/AdminTestingTools').then(m => ({ default: m.AdminTestingTools })))
+const AdminTaxonomy = lazyPage(() => import('./admin/pages/AdminTaxonomy').then(m => ({ default: m.AdminTaxonomy })))
 
 function RequireRole({ role, children }: { role: PortalRole; children: React.ReactNode }) {
   const auth = useAuth()
@@ -431,6 +432,7 @@ export default function App() {
           <Route path="ai" element={<AdminAI />} />
           <Route path="required-documents" element={<AdminRequiredDocuments />} />
           <Route path="testing-tools" element={<AdminTestingTools />} />
+          <Route path="taxonomy" element={<AdminTaxonomy />} />
           <Route path="security" element={<AdminFraud />} />
           {/* Customer fraud alerts now live on Risk & Fraud; this page kept the security settings. */}
           <Route path="fraud" element={<Navigate to="/admin/risk?tab=customers" replace />} />

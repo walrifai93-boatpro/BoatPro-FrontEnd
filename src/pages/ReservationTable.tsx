@@ -2,7 +2,7 @@ import React, { useMemo, useState } from 'react'
 import { motion } from 'framer-motion'
 import { TableProperties, Download, Printer, Filter, Eye, ArrowUpDown, Phone, Mail } from 'lucide-react'
 import { PageHeader, Badge, Modal, toast, SearchInput, printDoc, download, toCSV, LoadingState, ErrorState } from '../ui'
-import {
+import { boatTypeLabel,
   useAsync, useMarina, berthLabel, fmtDateTime, formatMoney, humanize, personOf, todayIso,
   RESERVATION_LABELS,
 } from '../live'
@@ -73,7 +73,7 @@ export default function ReservationTable() {
         [translatePortalText('Phone')]: c?.phone ?? '',
         [translatePortalText('Vessel')]: r.boatName,
         [translatePortalText('Registration')]: r.plate,
-        [translatePortalText('Vessel Type')]: translatePortalText(humanize(r.boatType)),
+        [translatePortalText('Vessel Type')]: translatePortalText(boatTypeLabel(r.boatType)),
         [translatePortalText('LOA (ft)')]: r.lengthFt,
         [translatePortalText('Beam (ft)')]: r.widthFt,
         [translatePortalText('Draft (ft)')]: r.draftFt,
@@ -100,7 +100,7 @@ export default function ReservationTable() {
       <h1>${translatePortalText('Reservation')} ${r.reservationNo}</h1><p class="sub">${marinaName} · ${translatePortalText('booking summary')}</p>
       <div class="row"><span>${translatePortalText('Guest')}</span><span>${c?.name ?? '—'}</span></div>
       <div class="row"><span>${translatePortalText('Contact')}</span><span>${c?.email ?? '—'}${c?.phone ? ` · ${c.phone}` : ''}</span></div>
-      <div class="row"><span>${translatePortalText('Vessel')}</span><span>${r.boatName} · ${r.plate} · ${formatPortalNumber(r.lengthFt)} ${translatePortalText('ft')} ${translatePortalText(humanize(r.boatType))}</span></div>
+      <div class="row"><span>${translatePortalText('Vessel')}</span><span>${r.boatName} · ${r.plate} · ${formatPortalNumber(r.lengthFt)} ${translatePortalText('ft')} ${translatePortalText(boatTypeLabel(r.boatType))}</span></div>
       <div class="row"><span>${translatePortalText('Berth')}</span><span>${berthLabel(r.pontoon, r.slot)}</span></div>
       <div class="row"><span>${translatePortalText('Dates')}</span><span>${formatPortalDate(r.startDate)} → ${formatPortalDate(r.endDate)} (${formatPortalNumber(r.months)} ${translatePortalText(r.months === 1 ? 'month' : 'months')})</span></div>
       <div class="row"><span>${translatePortalText('Status')}</span><span>${translatePortalText(RESERVATION_LABELS[r.status] ?? r.status)}</span></div>
@@ -226,7 +226,7 @@ export default function ReservationTable() {
                           <VendorLogoBadge logoUrl={(r as any).boatLogo || (r as any).providerLogo || c?.avatar} name={r.boatName} role="boat_provider" size="sm" />
                           <div className="min-w-0">
                             <p className="font-bold text-deep-900">{r.boatName}</p>
-                            <p className="text-[11px] text-slate-400">{formatPortalNumber(r.lengthFt)} {translatePortalText("ft LOA · ")}{formatPortalNumber(r.widthFt)} {translatePortalText("ft beam · ")}{translatePortalText(humanize(r.boatType))}</p>
+                            <p className="text-[11px] text-slate-400">{formatPortalNumber(r.lengthFt)} {translatePortalText("ft LOA · ")}{formatPortalNumber(r.widthFt)} {translatePortalText("ft beam · ")}{translatePortalText(boatTypeLabel(r.boatType))}</p>
                           </div>
                         </div>
                       </td>
@@ -283,7 +283,7 @@ export default function ReservationTable() {
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
                 {[
                   ['Vessel', `${detail.boatName} · ${detail.plate}`],
-                  ['Vessel Type', `${formatPortalNumber(detail.lengthFt)} ${translatePortalText('ft')} ${translatePortalText(humanize(detail.boatType))}`],
+                  ['Vessel Type', `${formatPortalNumber(detail.lengthFt)} ${translatePortalText('ft')} ${translatePortalText(boatTypeLabel(detail.boatType))}`],
                   ['Berth Slip', berthLabel(detail.pontoon, detail.slot)],
                   ['Dates', `${formatPortalDate(detail.startDate)} → ${formatPortalDate(detail.endDate)}`],
                   ['Monthly Rate', formatMoney(Math.round(detail.priceSar / Math.max(1, detail.months)), currency)],

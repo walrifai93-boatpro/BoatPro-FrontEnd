@@ -5,7 +5,7 @@ import { useNavigate } from 'react-router-dom'
 import { PageHeader, Badge, Modal, toast, SearchInput, Img, ViewToggle, AsyncBlock, EmptyState, ListRowSkeleton } from '../ui'
 import { TablePagination, useTableFilters, type TableFiltersConfig } from '../shared/TableFilters'
 import { boatPhoto } from '../images'
-import { useAsync, useMarina, berthLabel, fmtDate, fmtRelative, formatMoney, humanize } from '../live'
+import { boatTypeLabel, useAsync, useMarina, berthLabel, fmtDate, fmtRelative, formatMoney, humanize } from '../live'
 import { chatApi, idOf, portalApi, reservationsApi, fileUrl, type ApiMarinaBoat, type ApiMarinaCustomer } from '../api'
 import { formatPortalDate, formatPortalNumber, translatePortalText } from '../i18n/runtime'
 
@@ -270,7 +270,7 @@ export function Boats() {
                 </div>
                 <div className="p-5">
                   <p className="font-display text-lg font-extrabold text-deep-900">{b.name}</p>
-                  <p className="text-xs text-slate-400">{translatePortalText(humanize(b.boatType))} · {b.plate}</p>
+                  <p className="text-xs text-slate-400">{translatePortalText(boatTypeLabel(b.boatType))} · {b.plate}</p>
                   <div className="mt-3 grid grid-cols-3 gap-1.5 text-center text-[11px]">
                     {[['LOA', b.lengthFt], ['Beam', b.widthFt], ['Draft', b.draftFt]].map(([l, v]) => (
                       <div key={l as string} className="rounded-lg bg-sand py-1.5">
@@ -307,7 +307,7 @@ export function Boats() {
                           <Img src={boatPhoto(b.name)} className="h-9 w-9 shrink-0 rounded-xl" />
                           <div className="min-w-0">
                             <p className="truncate font-bold text-deep-900">{b.name}</p>
-                            <p className="truncate text-[11px] text-slate-400">{b.plate} · {translatePortalText(humanize(b.boatType))}</p>
+                            <p className="truncate text-[11px] text-slate-400">{b.plate} · {translatePortalText(boatTypeLabel(b.boatType))}</p>
                           </div>
                         </div>
                       </td>
@@ -347,7 +347,7 @@ export function Boats() {
             </div>
             <div>
               <h3 className="font-display text-xl font-extrabold text-deep-900">{sel.name}</h3>
-              <p className="text-xs text-slate-400">{translatePortalText(humanize(sel.boatType))} {translatePortalText("· Reg ")}{sel.plate}</p>
+              <p className="text-xs text-slate-400">{translatePortalText(boatTypeLabel(sel.boatType))} {translatePortalText("· Reg ")}{sel.plate}</p>
             </div>
             <div className="grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
               {[

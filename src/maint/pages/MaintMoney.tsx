@@ -20,11 +20,11 @@ import {
   type BankDetailsValue,
 } from '../../utils/iban'
 import { maintenancePortalApi, maintenanceShopApi, type ApiMaintenanceShop, type MaintenanceInvoice, type MaintenanceWorkOrder } from '../../api'
-import { formatPortalDate, formatPortalPercent, localizedField, translatePortalText } from '../../i18n/runtime'
+import { formatPortalDate, formatPortalPercent, localizedField, translatePortalTemplate, translatePortalText } from '../../i18n/runtime'
 
 /** Map backend invoice to the UI MaintInvoice shape. */
 const statusMap = (s: string): MaintInvoice['status'] => {
-  const m: Record<string, MaintInvoice['status']> = { paid: 'Paid', pending: 'Pending', overdue: 'Overdue', draft: 'Pending', sent: 'Pending', refunded: 'Refunded' }
+  const m: Record<string, MaintInvoice['status']> = { paid: 'Paid', pending: 'Pending', overdue: 'Overdue', draft: 'Pending', sent: 'Pending', refunded: 'Refunded', void: 'Void' }
   return m[s] || 'Pending'
 }
 const toInvView = (inv: MaintenanceInvoice): MaintInvoice => ({
@@ -44,6 +44,7 @@ const toInvView = (inv: MaintenanceInvoice): MaintInvoice => ({
   total: inv.total,
   status: statusMap(inv.status),
   method: 'Card on file',
+  refunded: inv.refundedAmount || 0,
 })
 
 // ══════════ BILLING & PAYMENTS (§27) ══════════
@@ -58,6 +59,7 @@ function BillingPage() {
   const [form, setForm] = useState({ customer: '', boat: '', labor: 0, parts: 0, workOrderId: '' })
   const [remindTarget, setRemindTarget] = useState<MaintInvoice | null>(null)
   const [collectTarget, setCollectTarget] = useState<MaintInvoice | null>(null)
+  const [refundTarget, setRefundTarget] = useState<MaintInvoice | null>(null)
   // Billable jobs to invoice against — picking one pre-fills labour/parts from
   // the actual job so the invoice can't silently disagree with the work done.
   const [billableOrders, setBillableOrders] = useState<MaintenanceWorkOrder[]>([])
@@ -231,12 +233,11 @@ function BillingPage() {
   const collected = invoices.filter(i => i.status === 'Paid').reduce((s, i) => s + i.total, 0)
   const avgJobValue = invoices.length ? Math.round(invoices.reduce((s, i) => s + i.total, 0) / invoices.length) : 0
 
-  const setStatus = async (id: string, status: 'Paid' | 'Refunded') => {
+  const setStatus = async (id: string, status: 'Paid') => {
     const record = invoiceRecords.find(r => r.code === id || r.id === id)
     if (!record) return
     try {
-      // The API's status enum has no 'refunded' — a reversed invoice is voided.
-      await maintenancePortalApi.updateInvoice(record.id || (record as any)._id, { status: status === 'Refunded' ? 'void' : 'paid' })
+      await maintenancePortalApi.updateInvoice(record.id || (record as any)._id, { status: 'paid' })
       await loadInvoices()
       maintToast(`Invoice ${id} marked as ${status}`)
     } catch (err) {
@@ -328,7 +329,7 @@ function BillingPage() {
                 <div className="flex gap-1.5">
                   {inv.status === 'Pending' && <button onClick={() => setCollectTarget(inv)} className="btn-maint !py-1.5 !px-2.5 !text-[11px]">{translatePortalText("Collect")}</button>}
                   {inv.status === 'Overdue' && <button onClick={() => setRemindTarget(inv)} className="btn-ghost !py-1.5 !px-2.5 !text-[11px]"><Send size={12} /> {translatePortalText("Remind")}</button>}
-                  {inv.status === 'Paid' && <button onClick={() => setStatus(inv.id, 'Refunded')} className="btn-ghost !py-1.5 !px-2.5 !text-[11px]"><RotateCcw size={12} /> {translatePortalText("Refund")}</button>}
+                  {inv.status === 'Paid' && <button onClick={() => setRefundTarget(inv)} className="btn-ghost !py-1.5 !px-2.5 !text-[11px]"><RotateCcw size={12} /> {translatePortalText("Refund")}</button>}
                   <button onClick={() => downloadInvoice(inv)} className="grid h-8 w-8 place-items-center rounded-lg bg-slate-100 text-slate-500 transition hover:bg-slate-200"><Download size={13} /></button>
                 </div>
               </div>
@@ -356,7 +357,7 @@ function BillingPage() {
                   <div className="flex justify-end gap-1.5 whitespace-nowrap">
                     {inv.status === 'Pending' && <button onClick={() => setStatus(inv.id, 'Paid')} className="btn-maint !py-1.5 !px-2.5 !text-[11px]">{translatePortalText("Collect")}</button>}
                     {inv.status === 'Overdue' && <button onClick={() => setRemindTarget(inv)} className="btn-ghost !py-1.5 !px-2.5 !text-[11px]"><Send size={12} /> {translatePortalText("Remind")}</button>}
-                    {inv.status === 'Paid' && <button onClick={() => setStatus(inv.id, 'Refunded')} className="btn-ghost !py-1.5 !px-2.5 !text-[11px]"><RotateCcw size={12} /> {translatePortalText("Refund")}</button>}
+                    {inv.status === 'Paid' && <button onClick={() => setRefundTarget(inv)} className="btn-ghost !py-1.5 !px-2.5 !text-[11px]"><RotateCcw size={12} /> {translatePortalText("Refund")}</button>}
                     <button onClick={() => downloadInvoice(inv)} className="grid h-8 w-8 place-items-center rounded-lg bg-slate-100 text-slate-500 transition hover:bg-slate-200"><Download size={13} /></button>
                   </div>
                 </motion.div>
@@ -541,6 +542,12 @@ function BillingPage() {
         )}
       </Modal>
 
+      <RefundInvoiceModal
+        invoice={refundTarget}
+        recordId={refundTarget ? (invoiceRecords.find(r => r.code === refundTarget.id || r.id === refundTarget.id)?.id ?? null) : null}
+        onClose={() => setRefundTarget(null)}
+        onDone={() => void loadInvoices()}
+      />
       <CollectPaymentModal
         open={!!collectTarget}
         invoice={collectTarget}
@@ -558,6 +565,58 @@ function BillingPage() {
  * backend verifies it with HyperPay and marks the invoice paid automatically,
  * no confirmation needed from the shop.
  */
+/**
+ * Returns money on a paid invoice. Goes through the refund service — the card is
+ * credited (or a desk payment recorded as returned) and the workshop's wallet
+ * reversed — instead of relabelling the invoice, which is what "Refund" did.
+ * Up to 96% of the total: the card fee on the original charge is not returned.
+ */
+function RefundInvoiceModal({ invoice, recordId, onClose, onDone }: { invoice: MaintInvoice | null; recordId: string | null; onClose: () => void; onDone: () => void }) {
+  const refundable = invoice ? Math.max(0, Math.round((Math.round(invoice.total * 96) / 100 - (invoice.refunded ?? 0)) * 100) / 100) : 0
+  const [amount, setAmount] = useState('')
+  const [reason, setReason] = useState('')
+  const [busy, setBusy] = useState(false)
+  useEffect(() => {
+    if (invoice) { setAmount(String(refundable)); setReason('') }
+  }, [invoice?.id])
+  if (!invoice || !recordId) return null
+
+  const submit = async () => {
+    const value = Number(amount)
+    if (!Number.isFinite(value) || value <= 0) { maintToast('Enter the amount to refund', 'warn'); return }
+    if (value > refundable) { maintToast(translatePortalTemplate('At most {{amount}} can be refunded', { amount: money(refundable) }), 'warn'); return }
+    setBusy(true)
+    try {
+      const res = await maintenancePortalApi.refundInvoice(recordId, { amount: value, reason: reason.trim() || undefined })
+      const days = res.data.refund.settlementBusinessDays
+      maintToast(translatePortalTemplate('{{amount}} refunded — the customer is notified. It reaches their card in {{min}}–{{max}} business days.', { amount: money(res.data.refund.amountSar), min: days.min, max: days.max }))
+      onDone()
+      onClose()
+    } catch (error) {
+      maintToast(error instanceof Error ? error.message : 'Could not refund this invoice', 'warn')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Modal open onClose={onClose} title={`↩️ ${translatePortalText('Refund')} — ${invoice.id}`}>
+      <p className="mb-4 text-sm text-slate-500">{invoice.customer} · {invoice.boat} · {translatePortalText('Paid')} {money(invoice.total)}</p>
+      <label className="label">{translatePortalText('Amount to refund (SAR)')}</label>
+      <input className="input" type="number" min={0} step="0.01" inputMode="decimal" value={amount} onChange={e => setAmount(e.target.value)} />
+      <p className="mt-1 text-xs text-slate-400">
+        {translatePortalTemplate('Up to {{amount}} — 96% of the total, less anything already refunded. The card fee on the original payment is not returned.', { amount: money(refundable) })}
+      </p>
+      <label className="label mt-4">{translatePortalText('Reason (shown to the customer)')}</label>
+      <input className="input" maxLength={500} value={reason} onChange={e => setReason(e.target.value)} placeholder={translatePortalText('e.g. Sea trial postponed — labour refunded')} />
+      <div className="mt-6 flex justify-end gap-2">
+        <button onClick={onClose} className="btn-ghost">{translatePortalText('Cancel')}</button>
+        <button onClick={() => void submit()} disabled={busy || refundable <= 0} className="btn-maint">{translatePortalText('Refund to customer')}</button>
+      </div>
+    </Modal>
+  )
+}
+
 function CollectPaymentModal({ open, invoice, onClose, onPaid }: { open: boolean; invoice: MaintInvoice | null; onClose: () => void; onPaid: () => void }) {
   const [mode, setMode] = useState<'choose' | 'qr'>('choose')
   const [qr, setQr] = useState<{ qrDataUrl: string; payUrl: string; reference: string } | null>(null)

@@ -5,6 +5,14 @@ import { translatePortalText } from '../i18n/runtime'
 
 
 /**
+ * Test tooling never ships: only a dev build (`vite`), or a staging build that
+ * opts in with VITE_ALLOW_FAKE_FILL=true, asks the server at all. The admin
+ * switch alone used to be the only gate, so leaving it on put the button on
+ * every real provider's signup form in production.
+ */
+const FAKE_FILL_BUILD_ALLOWED = (import.meta as any).env?.DEV === true || (import.meta as any).env?.VITE_ALLOW_FAKE_FILL === 'true'
+
+/**
  * Whether an admin has the "Fake fill" testing button switched on.
  *
  * Read once per mount rather than cached, so switching it off in Admin →
@@ -15,6 +23,7 @@ import { translatePortalText } from '../i18n/runtime'
 export function useFakeFillEnabled(): boolean {
   const [enabled, setEnabled] = useState(false)
   useEffect(() => {
+    if (!FAKE_FILL_BUILD_ALLOWED) return
     let alive = true
     testingToolsApi
       .get()

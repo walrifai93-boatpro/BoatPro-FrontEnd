@@ -395,6 +395,13 @@ export async function bootstrapPortalLanguage(): Promise<PortalLanguage> {
   return language
 }
 
+/**
+ * The metre unit after a number. It was written as translatePortalText('Meter
+ * abbreviation'), which only has an Arabic entry — English screens printed
+ * "20 Meter abbreviation". ("m" can't be the key: it already means minutes.)
+ */
+export const meterUnit = (): string => (isPortalArabic() ? 'م' : 'm')
+
 /** Translate fixed interface copy; free-form account data stays intact. */
 export function translatePortalText(input: string): string {
   if (!isPortalArabic() || !input) return input

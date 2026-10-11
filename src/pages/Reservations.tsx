@@ -15,7 +15,7 @@ import {
 import { DateField } from '../components/SemanticFormControls'
 import { confirmAndRun } from '../async'
 import { AiDocumentVerificationModal } from '../components/AiDocumentVerificationModal'
-import { formatPortalDate, formatPortalNumber, localizedField, translatePortalText } from '../i18n/runtime'
+import { formatPortalDate, formatPortalNumber, localizedField, translatePortalText, meterUnit } from '../i18n/runtime'
 
 // The four boards the operator works: what needs a decision, what needs paying,
 // what is live, and everything that's finished.
@@ -50,6 +50,8 @@ export default function Reservations() {
   const [settling, setSettling] = useState<ApiReservation | null>(null)
   const [payMethod, setPayMethod] = useState('cash')
   const [declining, setDeclining] = useState<ApiReservation | null>(null)
+  /** A stay whose boat is still alongside — completing it checks the boat out first. */
+  const [alongside, setAlongside] = useState<ApiReservation | null>(null)
   const [reason, setReason] = useState('')
   const [view, setView] = useState<'card' | 'table'>('table')
   const [busy, setBusy] = useState(false)
@@ -70,11 +72,12 @@ export default function Reservations() {
 
   const refresh = async () => { await state.reload(); await berths.reload(); await reloadOverview() }
 
-  const run = async (fn: () => Promise<unknown>, msg: string, tone: 'success' | 'warn' = 'success') => {
+  /** `msg` may be a function, read once `fn` is done, when the outcome decides it. */
+  const run = async (fn: () => Promise<unknown>, msg: string | (() => string), tone: 'success' | 'warn' = 'success') => {
     setBusy(true)
     try {
       await fn()
-      toast(translatePortalText(msg), tone)
+      toast(translatePortalText(typeof msg === 'function' ? msg() : msg), tone)
       await refresh()
     } catch (e) {
       toast(translatePortalText(e instanceof Error ? e.message : 'That action failed'), 'warn')
@@ -97,13 +100,19 @@ export default function Reservations() {
     const move = berth && berth.id !== r.slotRef ? { pontoon: berth.pontoon, slot: berth.number } : undefined
     const where = berth ? berthLabel(berth.pontoon, berth.number) : berthLabel(r.pontoon, r.slot)
     setAssigning(null)
+    if (r.status === 'active' || r.status === 'pending_payment') {
+      return run(() => reservationsApi.transfer(r.id, move?.pontoon ?? r.pontoon, move?.slot ?? r.slot), `${r.boatName} moved to ${where}`)
+    }
+    // What happened to a held card decides the message — charged and live, or
+    // refused and the boater asked to pay.
+    let held: 'captured' | 'failed' | null | undefined
     return run(
-      () => (r.status === 'active' || r.status === 'pending_payment'
-        ? reservationsApi.transfer(r.id, move?.pontoon ?? r.pontoon, move?.slot ?? r.slot)
-        : reservationsApi.approve(r.id, move)),
-      r.status === 'pending_approval'
-        ? `${where} approved for ${r.boatName} — awaiting payment`
-        : `${r.boatName} moved to ${where}`,
+      async () => { held = (await reservationsApi.approve(r.id, move)).data.cardHold },
+      () => held === 'captured'
+        ? `${where} approved for ${r.boatName} — their card was charged and the berth is confirmed`
+        : held === 'failed'
+          ? `${where} approved for ${r.boatName} — their card could not be charged, so they have been asked to pay`
+          : `${where} approved for ${r.boatName} — awaiting payment`,
     )
   }
 
@@ -119,6 +128,32 @@ export default function Reservations() {
     setDeclining(null)
     await run(() => reservationsApi.decline(r.id, reason.trim() || undefined), `${r.reservationNo} declined`, 'warn')
     setReason('')
+  }
+
+  /*
+    Completing over a boat that is still checked in used to drop it off the
+    departures board for good and free its berth with the hull in it. The
+    server now refuses that (`BOAT_ALONGSIDE`); this asks, then checks the boat
+    out and completes in one step.
+  */
+  const complete = async (r: ApiReservation) => {
+    setBusy(true)
+    try {
+      await reservationsApi.complete(r.id)
+      toast(translatePortalText(`${r.boatName}'s stay completed`), 'success')
+      await refresh()
+    } catch (e) {
+      const code = (e as Error & { details?: { code?: string } })?.details?.code
+      if (code === 'BOAT_ALONGSIDE') setAlongside(r)
+      else toast(translatePortalText(e instanceof Error ? e.message : 'That action failed'), 'warn')
+    } finally { setBusy(false) }
+  }
+
+  const submitCheckOutAndComplete = async () => {
+    if (!alongside) return
+    const r = alongside
+    setAlongside(null)
+    await run(() => reservationsApi.complete(r.id, { checkOut: true }), `${r.boatName} checked out and the stay completed`)
   }
 
   const submitSettle = async () => {
@@ -141,7 +176,7 @@ export default function Reservations() {
       </>)}
       {r.status === 'active' && (<>
         <button className="btn-ghost !py-1.5 !px-2.5 text-[11px]" onClick={() => setAssigning(r)}>{translatePortalText("↔ Move berth")}</button>
-        <button className="btn-ghost !py-1.5 !px-2.5 text-[11px]" onClick={() => run(() => reservationsApi.complete(r.id), `${r.boatName}'s stay completed`)}>{translatePortalText("🛫 Complete")}</button>
+        <button className="btn-ghost !py-1.5 !px-2.5 text-[11px]" disabled={busy} onClick={() => complete(r)}>{translatePortalText("🛫 Complete")}</button>
       </>)}
       <button className="btn-ghost !py-1.5 !px-2.5 text-[11px]" onClick={() => setDetail(r)}>{translatePortalText("Details")}</button>
     </>
@@ -275,7 +310,7 @@ export default function Reservations() {
                       {requested
                         ? [
                             translatePortalText(humanize(requested.category)),
-                            requested.maxLength != null ? `${formatPortalNumber(requested.maxLength)} ${translatePortalText('Meter abbreviation')}` : null,
+                            requested.maxLength != null ? `${formatPortalNumber(requested.maxLength)} ${meterUnit()}` : null,
                             requested.monthlyPrice != null ? `${formatMoney(requested.monthlyPrice, currency)}/mo` : null,
                           ].filter(Boolean).join(' · ')
                         : translatePortalText('This berth is no longer available — pick another below.')}
@@ -310,7 +345,7 @@ export default function Reservations() {
                   }`}>
                   <p className="font-display font-extrabold text-deep-900">{berthLabel(b.pontoon, b.number)}</p>
                   <p className="text-[11px] text-slate-400">
-                    {translatePortalText(humanize(b.category))}{b.maxLength != null ? ` · ${formatPortalNumber(b.maxLength)} ${translatePortalText('Meter abbreviation')}` : ''}
+                    {translatePortalText(humanize(b.category))}{b.maxLength != null ? ` · ${formatPortalNumber(b.maxLength)} ${meterUnit()}` : ''}
                     {b.monthlyPrice != null ? ` · ${formatMoney(b.monthlyPrice, currency)}/mo` : ''}
                     {b.id === assigning.slotRef ? ` · ${translatePortalText('current')}` : ''}
                   </p>
@@ -327,7 +362,9 @@ export default function Reservations() {
               <p className="mt-4 text-xs text-slate-400">
                 {assigning.paidAt
                   ? translatePortalText('This boater has already paid — approving makes the berth live and schedules their arrival.')
-                  : translatePortalText('Not paid yet. Approving holds the berth and sends them to payment; it only goes live once they pay.')}
+                  : assigning.cardHold?.status === 'held'
+                    ? `${translatePortalText("The boater's card is on hold for")} ${formatMoney(assigning.cardHold.amountSar, currency)}. ${translatePortalText('Approving charges it and confirms the berth at once.')}`
+                    : translatePortalText('Not paid yet. Approving holds the berth and sends them to payment; it only goes live once they pay.')}
               </p>
             )}
           </>)
@@ -499,6 +536,17 @@ export default function Reservations() {
         </div>
       </Modal>
 
+      {/* boat still alongside — check out, then complete */}
+      <Modal open={!!alongside} onClose={() => setAlongside(null)} title={translatePortalText("⚓ Boat still alongside")}>
+        <p className="text-sm text-slate-500">
+          <bdi dir="auto">{localizedField<string>(alongside, 'boatName') ?? alongside?.boatName}</bdi> {translatePortalText('is still checked in at')} {alongside ? berthLabel(alongside.pontoon, alongside.slot) : ''}. {translatePortalText('Completing the stay checks the boat out now — unbilled utilities and services are totalled — and releases the berth.')}
+        </p>
+        <div className="mt-6 flex justify-end gap-2">
+          <button className="btn-ghost" onClick={() => setAlongside(null)}>{translatePortalText("Keep it berthed")}</button>
+          <button className="btn-primary" disabled={busy} onClick={submitCheckOutAndComplete}>{translatePortalText("Check out & complete")}</button>
+        </div>
+      </Modal>
+
       {/* take payment modal */}
       <Modal open={!!settling} onClose={() => setSettling(null)} title={translatePortalText("💳 Record payment")}>
         <p className="text-sm text-slate-500">
@@ -536,7 +584,7 @@ function NewBookingModal({ open, onClose, onCreated, berths, currency }: {
   currency: string
 }) {
   const blank = {
-    email: '', boatName: '', plate: '', boatType: 'cruiser',
+    email: '', boatName: '', plate: '', boatType: 'power',
     lengthFt: '', widthFt: '', draftFt: '',
     berthId: '', months: 1, startDate: todayIso(), notes: '',
   }

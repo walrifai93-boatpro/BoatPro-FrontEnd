@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import { motion } from 'framer-motion'
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
-import { ClipboardList, Wrench, Stethoscope, CalendarDays, Plus, Check, X, Pencil, Copy, Printer, Pause, Play, ArrowRight, UserCog, Search, Filter, Clock, Calendar, Lock, Bell, CreditCard, CheckCircle2, Trash2, CalendarClock } from 'lucide-react'
+import { ClipboardList, Wrench, Stethoscope, CalendarDays, Plus, Check, X, Pencil, Copy, Printer, Pause, Play, ArrowRight, UserCog, Search, Filter, Clock, Calendar, Lock, Bell, CreditCard, CheckCircle2, Trash2, CalendarClock, Receipt } from 'lucide-react'
 import {
   INSPECTION_TYPES, MAINT_CATEGORIES, catByKey, money, avatar,
   type MaintRequest, type WorkOrder, type Inspection, type CheckResult, type SchedItem,
@@ -30,8 +30,19 @@ const displayStatus = (status: string) => {
 }
 const toRequestView = (request: MaintenanceProviderRequest): MaintRequest => {
   const requestedAt = new Date(request.requestedAt)
+  /*
+    The appointment the customer booked, when they booked one. The list showed
+    only when the request was sent, so a job booked for Sunday 08:00 read
+    "Thursday 17:14" and the shop had to open the app to find the time.
+  */
+  const booked = request.preferredDate ? new Date(request.preferredDate) : null
+  const when = booked && !Number.isNaN(booked.getTime()) ? booked : null
   return {
     id: request.id,
+    ref: `REQ-${request.id.slice(-4).toUpperCase()}`,
+    requested: `${formatPortalDate(requestedAt)} · ${formatPortalTime(requestedAt)}`,
+    booked: !!when,
+    quoteResponse: request.customerQuoteResponse,
     customer: request.customer?.name || translatePortalText('Customer'),
     avatar: request.customer?.avatar || '',
     boat: request.boatName,
@@ -42,8 +53,8 @@ const toRequestView = (request: MaintenanceProviderRequest): MaintRequest => {
     desc: String(localizedField(request, 'description') ?? request.description),
     sourceTitle: request.title,
     sourceDesc: request.description,
-    date: formatPortalDate(requestedAt),
-    time: formatPortalTime(requestedAt),
+    date: formatPortalDate(when ?? requestedAt, when ? { weekday: 'short', month: 'short', day: 'numeric' } : undefined),
+    time: when && request.preferredSlot ? request.preferredSlot : formatPortalTime(when ?? requestedAt),
     priority: displayStatus(request.priority) as MaintRequest['priority'],
     status: (request.status === 'declined' ? 'Cancelled' : displayStatus(request.status)) as MaintRequest['status'],
     emergency: request.priority === 'critical',
@@ -100,6 +111,10 @@ const toWorkOrderView = (order: MaintenanceWorkOrder): WorkOrder => {
     assignments: order.assignments ?? [],
     paymentStatus: isPaid ? 'paid' : 'unpaid',
     invoice: (order as any).invoice,
+    agreedQuote: (order as any).request?.customerQuoteResponse === 'accepted' && (order as any).request?.quotedAmount > 0
+      ? Number((order as any).request.quotedAmount)
+      : undefined,
+    invoiceTotal: typeof (order as any).invoice?.total === 'number' ? (order as any).invoice.total : undefined,
   }
 }
 
@@ -223,6 +238,7 @@ function RequestsPage() {
   const [editing, setEditing] = useState<MaintRequest | null>(null)
   /** Request id whose "propose a new time" modal is open. */
   const [proposeFor, setProposeFor] = useState<string | null>(null)
+  const [quoteFor, setQuoteFor] = useState<string | null>(null)
   const [view, setView] = useState<'card' | 'table'>('table')
 
   const loadRequests = async () => {
@@ -314,14 +330,20 @@ function RequestsPage() {
             through Edit above — which moves a time they agreed to without
             asking. Only offered past Pending: a request still being accepted
             has no agreed time to move. */}
-        <button
+        {!['Cancelled', 'Completed'].includes(r.status) && <button
           onClick={() => setProposeFor(r.id)}
           className="grid h-8 w-8 place-items-center rounded-lg bg-amber-50 text-amber-600 transition hover:bg-amber-100"
           title={translatePortalText("Propose a new time")}
-        ><CalendarClock size={14} /></button>
+        ><CalendarClock size={14} /></button>}
       </>)}
+      {/* The price the customer says yes to. Open while they can still answer
+          it — before the job is scheduled — and closed once they decline. */}
+      {['Pending', 'Approved'].includes(r.status) && r.quoteResponse !== 'declined' && (
+        <button onClick={() => setQuoteFor(r.id)} className="grid h-8 w-8 place-items-center rounded-lg bg-violet-50 text-violet-600 transition hover:bg-violet-100" title={translatePortalText(r.est != null ? 'Revise quote' : 'Send quote')}><Receipt size={14} /></button>
+      )}
       <button onClick={() => void duplicate(r)} className="grid h-8 w-8 place-items-center rounded-lg bg-slate-100 text-slate-500 transition hover:bg-slate-200" title={translatePortalText("Duplicate")}><Copy size={14} /></button>
-      {!requestRecords.find(request => request.id === r.id)?.workOrder && <button onClick={() => void createWorkOrder(r)} className="btn-maint !py-1.5 !px-2.5 !text-[11px]">{translatePortalText("Work order")} <ArrowRight size={12} className="rtl:rotate-180" /></button>}
+      {/* A closed request cannot be given a work order — the server refuses it. */}
+      {!['Cancelled', 'Completed'].includes(r.status) && !requestRecords.find(request => request.id === r.id)?.workOrder && <button onClick={() => void createWorkOrder(r)} className="btn-maint !py-1.5 !px-2.5 !text-[11px]">{translatePortalText("Work order")} <ArrowRight size={12} className="rtl:rotate-180" /></button>}
     </>
   )
 
@@ -385,7 +407,7 @@ function RequestsPage() {
                     <img src={r.avatar} className="h-11 w-11 rounded-full object-cover ring-2 ring-white shadow-soft" />
                     <div className="min-w-0 flex-1">
                       <p className="truncate font-display text-[15px] font-extrabold text-deep-900">{r.boat} <span className="text-xs font-semibold text-slate-400">{r.boatLen}</span></p>
-                      <p className="truncate text-xs text-slate-400">{r.customer} · {r.id}</p>
+                      <p className="truncate text-xs text-slate-400">{r.customer} · {r.ref ?? r.id}</p>
                     </div>
                     <MBadge>{r.priority}</MBadge>
                   </div>
@@ -394,10 +416,10 @@ function RequestsPage() {
                     <p className="mt-1 text-xs text-slate-500 line-clamp-2">{r.desc}</p>
                   </div>
                   <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-400">
-                    <span>📅 {r.date} · {r.time}</span><span>📍 {r.location}</span>
+                    <span title={r.booked ? `${translatePortalText('Requested')} ${r.requested}` : undefined}>📅 {r.booked ? `${translatePortalText('Booked for')} ` : ''}{r.date} · {r.time}</span><span>📍 {r.location}</span>
                     <span>📷 {r.photos}</span><span>{translatePortalText("via")} {r.source}</span>
-                    {r.est && <b className="ms-auto text-sm text-violet-600">~{money(r.est)}</b>}
                   </div>
+                  <QuoteLine r={r} />
                   {/* The shop's own outstanding ask. Without this, proposing is
                       write-only: there is no way to tell you already asked, and
                       no way to take it back. */}
@@ -431,7 +453,7 @@ function RequestsPage() {
                       <img src={r.avatar} className="h-9 w-9 shrink-0 rounded-full object-cover ring-2 ring-white shadow-soft" />
                       <div className="min-w-0">
                         <p className="truncate text-[13px] font-extrabold text-deep-900">{r.emergency && <span title={translatePortalText("Emergency")}>🚨 </span>}{r.boat} <span className="text-[11px] font-semibold text-slate-400">{r.boatLen}</span></p>
-                        <p className="truncate text-[11px] text-slate-400">{r.customer} · {r.id}</p>
+                        <p className="truncate text-[11px] text-slate-400">{r.customer} · {r.ref ?? r.id}</p>
                       </div>
                     </div>
                     <div className="min-w-0">
@@ -439,8 +461,8 @@ function RequestsPage() {
                       <p className="truncate text-[11px] text-slate-400">{translatePortalText(c.name)}</p>
                     </div>
                     <div className="whitespace-nowrap"><MBadge>{r.priority}</MBadge></div>
-                    <div className="whitespace-nowrap"><MBadge dot={['Pending', 'In progress'].includes(r.status)}>{r.status}</MBadge></div>
-                    <div className="truncate text-[11px] text-slate-500">📅 {r.date} · {r.time}<br />📍 {r.location}</div>
+                    <div className="whitespace-nowrap"><MBadge dot={['Pending', 'In progress'].includes(r.status)}>{r.status}</MBadge><QuoteLine r={r} compact /></div>
+                    <div className="truncate text-[11px] text-slate-500" title={r.booked ? `${translatePortalText('Requested')} ${r.requested}` : undefined}>📅 {r.booked ? `${translatePortalText('Booked for')} ` : ''}{r.date} · {r.time}<br />📍 {r.location}</div>
                     <div className="flex justify-end gap-1.5 whitespace-nowrap">{actions(r)}</div>
                   </motion.div>
                 )
@@ -453,14 +475,116 @@ function RequestsPage() {
 
       <RequestFormModal open={formOpen} onClose={() => { setFormOpen(false); setEditing(null) }} onSave={saveRequest} editing={editing} customers={customers} />
       {proposeModal}
+      <QuoteModal
+        record={quoteFor ? requestRecords.find(x => x.id === quoteFor) ?? null : null}
+        onClose={() => setQuoteFor(null)}
+        onSent={() => void loadRequests()}
+      />
       {createWO.modal}
     </PageWrap>
   )
 }
 
-function RequestFormModal({ open, onClose, onSave, editing, customers }: { open: boolean; onClose: () => void; onSave: (r: MaintRequest, customerId?: string) => void; editing: MaintRequest | null; customers: MaintenanceCustomer[] }) {
+/** Where the quote stands, in a line: the figure and whether the customer has answered it. */
+function QuoteLine({ r, compact }: { r: MaintRequest; compact?: boolean }) {
+  if (r.est == null) return null
+  const [label, tone] =
+    r.quoteResponse === 'accepted' ? ['Quote accepted', 'text-emerald-600']
+      : r.quoteResponse === 'declined' ? ['Quote declined', 'text-rose-600']
+        : ['Awaiting customer', 'text-amber-600']
+  return (
+    <p className={`${compact ? 'mt-1 text-[10px]' : 'mt-2 text-[11px]'} flex items-center gap-1.5 font-bold`}>
+      <Receipt size={compact ? 11 : 12} className="text-violet-500" />
+      <span className="text-deep-900">{money(r.est)}</span>
+      <span className={tone}>· {translatePortalText(label)}</span>
+    </p>
+  )
+}
+
+/**
+ * The workshop's price for a request, sent to the customer to accept or decline
+ * in the app. Sending one on a pending request accepts the request with it.
+ * Revising an accepted quote asks the customer to approve the new figure.
+ */
+function QuoteModal({ record, onClose, onSent }: { record: MaintenanceProviderRequest | null; onClose: () => void; onSent: () => void }) {
+  const [amount, setAmount] = useState('')
+  const [notes, setNotes] = useState('')
+  const [busy, setBusy] = useState(false)
+  useEffect(() => {
+    if (!record) return
+    setAmount(record.quotedAmount != null ? String(record.quotedAmount) : '')
+    setNotes(record.quoteNotes ?? '')
+  }, [record?.id])
+  if (!record) return null
+  const revising = record.quotedAmount != null
+  const wasAccepted = record.customerQuoteResponse === 'accepted'
+
+  const send = async () => {
+    const value = Number(amount)
+    if (!Number.isFinite(value) || value <= 0) { maintToast('Enter the quote amount', 'warn'); return }
+    setBusy(true)
+    try {
+      await maintenancePortalApi.updateRequest(record.id, {
+        quotedAmount: Math.round(value * 100) / 100,
+        quoteNotes: notes.trim() || undefined,
+        // The customer can only answer a quote on an accepted request.
+        ...(record.status === 'pending' ? { status: 'approved' } : {}),
+      })
+      maintToast(revising ? 'Revised quote sent — the customer is asked to approve it again' : 'Quote sent — the customer accepts or declines it in the app')
+      onSent()
+      onClose()
+    } catch (error) {
+      maintToast(error instanceof Error ? error.message : 'Could not send the quote', 'warn')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Modal open onClose={onClose} title={translatePortalText(revising ? 'Revise quote' : 'Send quote')}>
+      <p className="mb-4 text-sm text-slate-500">{record.boatName} — {String(localizedField(record, 'title') ?? record.title)}</p>
+      <label className="label">{translatePortalText('Quote amount (SAR, before VAT)')}</label>
+      <input className="input" type="number" min={0} step="0.01" inputMode="decimal" value={amount} onChange={e => setAmount(e.target.value)} placeholder="0.00" autoFocus />
+      <label className="label mt-4">{translatePortalText("What's included")}</label>
+      <textarea className="input" rows={3} maxLength={2000} value={notes} onChange={e => setNotes(e.target.value)} placeholder={translatePortalText('e.g. Labour 6 h, impeller and thermostat, sea trial')} />
+      {wasAccepted && (
+        <p className="mt-3 rounded-xl bg-amber-50 p-3 text-xs font-semibold text-amber-700">
+          {translatePortalText('The customer already accepted the current quote. Changing it asks them to approve the new figure before work continues.')}
+        </p>
+      )}
+      <p className="mt-3 text-xs text-slate-400">{translatePortalText('VAT is added on the final invoice. The customer accepts or declines the quote in the BoatPro app.')}</p>
+      <div className="mt-6 flex justify-end gap-2">
+        <button onClick={onClose} className="btn-ghost">{translatePortalText('Cancel')}</button>
+        <button onClick={() => void send()} disabled={busy} className="btn-maint">{translatePortalText(revising ? 'Send revised quote' : 'Send quote')}</button>
+      </div>
+    </Modal>
+  )
+}
+
+function RequestFormModal({ open, onClose, onSave, editing, customers: known }: { open: boolean; onClose: () => void; onSave: (r: MaintRequest, customerId?: string) => void; editing: MaintRequest | null; customers: MaintenanceCustomer[] }) {
   const blank = { customerId: '', customer: '', boat: '', boatLen: '', cat: 'engine', priority: 'Medium' as MaintRequest['priority'], title: '', desc: '', emergency: false }
   const [f, setF] = useState(blank)
+  /*
+    The list holds this shop's own customers only — the platform no longer hands
+    every account's contact details to every workshop. Someone new is found by
+    the exact email or phone they give the desk.
+  */
+  const [lookup, setLookup] = useState('')
+  const [found, setFound] = useState<MaintenanceCustomer[]>([])
+  const customers = [...known, ...found.filter(c => !known.some(k => k.id === c.id))]
+  const findCustomer = async () => {
+    const q = lookup.trim()
+    if (!q) return
+    try {
+      const res = await maintenancePortalApi.customers({ search: q })
+      const hits = res.data.customers
+      if (!hits.length) { maintToast('No BoatPro account with that exact email or phone', 'warn'); return }
+      setFound(prev => [...prev, ...hits.filter(h => !prev.some(p => p.id === h.id))])
+      setF(s => ({ ...s, customerId: hits[0].id }))
+    } catch (error) {
+      maintToast(error instanceof Error ? error.message : 'Could not look that up', 'warn')
+    }
+  }
   React.useEffect(() => {
     if (open) setF(editing ? { customerId: '', customer: editing.customer, boat: editing.boat, boatLen: editing.boatLen, cat: editing.cat, priority: editing.priority, title: editing.sourceTitle ?? editing.title, desc: editing.sourceDesc ?? editing.desc, emergency: !!editing.emergency } : blank)
   }, [open, editing])
@@ -477,7 +601,14 @@ function RequestFormModal({ open, onClose, onSave, editing, customers }: { open:
   return (
     <Modal open={open} onClose={onClose} title={editing ? `✏️ Edit ${editing.id}` : translatePortalText("🔧 Create maintenance request")} wide>
       <div className="grid gap-4 sm:grid-cols-2">
-        <div><label className="label">{translatePortalText("Customer")}</label><select className="input" value={f.customerId} onChange={e => set('customerId')(e.target.value)} disabled={!!editing}><option value="">{translatePortalText("Select a BoatPro customer")}</option>{editing && <option value="">{editing.customer}</option>}{customers.map(customer => <option key={customer.id} value={customer.id}>{customer.name} · {customer.email}</option>)}</select></div>
+        <div><label className="label">{translatePortalText("Customer")}</label><select className="input" value={f.customerId} onChange={e => set('customerId')(e.target.value)} disabled={!!editing}><option value="">{translatePortalText("Select a BoatPro customer")}</option>{editing && <option value="">{editing.customer}</option>}{customers.map(customer => <option key={customer.id} value={customer.id}>{customer.name} · {customer.email}</option>)}</select>
+          {!editing && (
+            <div className="mt-2 flex gap-2">
+              <input className="input" value={lookup} onChange={e => setLookup(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); void findCustomer() } }} placeholder={translatePortalText('New customer? Exact email or phone')} />
+              <button type="button" onClick={() => void findCustomer()} className="btn-ghost whitespace-nowrap">{translatePortalText('Find')}</button>
+            </div>
+          )}
+        </div>
         <div><label className="label">{translatePortalText("Boat")}</label><input className="input" value={f.boat} onChange={e => set('boat')(e.target.value)} placeholder={translatePortalText("Boat name")} /></div>
         <div><label className="label">{translatePortalText("Boat length")}</label><input className="input" value={f.boatLen} onChange={e => set('boatLen')(e.target.value)} placeholder={translatePortalText("e.g. 42 ft")} /></div>
         <div><label className="label">{translatePortalText("Service category")}</label>
@@ -703,7 +834,7 @@ function WorkOrdersPage() {
                         </span>
                       )}
                     </div>
-                    <div className="whitespace-nowrap"><MBadge dot={['In progress', 'En route', 'Diagnosis'].includes(w.status)}>{w.paused ? translatePortalText("Paused") : w.status}</MBadge></div>
+                    <div className="whitespace-nowrap"><MBadge dot={['In progress', 'En route', 'Diagnosis'].includes(w.status)}>{w.paused && !['Cancelled', 'Completed', 'Delivered'].includes(w.status) ? translatePortalText("Paused") : w.status}</MBadge></div>
                     <div className="whitespace-nowrap"><MBadge>{w.priority}</MBadge></div>
                     <div className="flex items-center gap-2 min-w-0"><JobProgress pct={w.progress} /><span className="text-[10px] font-bold text-slate-400 shrink-0">{formatPortalPercent(w.progress)}</span></div>
                     <div className="flex justify-end gap-1.5 whitespace-nowrap">{rowActions(w)}</div>
@@ -744,7 +875,7 @@ function WorkOrdersPage() {
                 <div className="mt-2.5 flex items-center gap-2 rounded-xl bg-sand p-2.5">
                   <img src={w.techAvatar} className="h-7 w-7 rounded-full object-cover" />
                   <span className="truncate text-xs font-semibold text-slate-600">{w.tech}</span>
-                  <span className="ms-auto"><MBadge dot={['In progress', 'En route', 'Diagnosis'].includes(w.status)}>{w.paused ? translatePortalText("Paused") : w.status}</MBadge></span>
+                  <span className="ms-auto"><MBadge dot={['In progress', 'En route', 'Diagnosis'].includes(w.status)}>{w.paused && !['Cancelled', 'Completed', 'Delivered'].includes(w.status) ? translatePortalText("Paused") : w.status}</MBadge></span>
                 </div>
                 <div className="mt-3 flex items-center gap-2">
                   <JobProgress pct={w.progress} /><span className="text-[10px] font-bold text-slate-400">{formatPortalPercent(w.progress)}</span>
@@ -875,6 +1006,12 @@ function WorkOrderDetail({
     : order.hourlyRate !== undefined
     ? Math.round(hoursDraft * order.hourlyRate * 100) / 100
     : order.labor
+  // What the customer is charged before VAT: the work logged, capped at the quote they accepted.
+  const logged = previewLabour + partsDraft
+  const billable = order.agreedQuote != null ? Math.min(logged, order.agreedQuote) : logged
+  const overQuote = order.agreedQuote != null ? Math.round(Math.max(0, logged - order.agreedQuote) * 100) / 100 : 0
+  // Once the invoice exists its total (with VAT) is what the customer is asked for.
+  const amountDue = order.invoiceTotal ?? billable
 
   /** What a save sends: the roles when billing by role, else the flat hours. */
   const hoursPayload = () => (byRole ? { assignments: lineDraft } : { workedHours: hoursDraft })
@@ -923,7 +1060,7 @@ function WorkOrderDetail({
             'bg-slate-100 text-slate-700'
           }`}>
             <span className={`h-1.5 w-1.5 rounded-full ${isDelivered ? 'bg-emerald-500' : 'bg-violet-500 animate-pulse'}`} />
-            {order.paused ? translatePortalText("Paused") : translatePortalText(order.status)}
+            {order.paused && !['Cancelled', 'Completed', 'Delivered'].includes(order.status) ? translatePortalText("Paused") : translatePortalText(order.status)}
           </span>
           <span className={`rounded-full px-2.5 py-0.5 text-xs font-bold ${
             order.priority === 'Critical' ? 'bg-rose-50 text-rose-600 ring-1 ring-rose-200' :
@@ -1219,10 +1356,29 @@ function WorkOrderDetail({
 
         <div className="rounded-2xl border border-violet-200 bg-gradient-to-br from-violet-50 to-indigo-50/70 p-4 shadow-sm text-center">
           <p className="text-[10px] font-extrabold uppercase tracking-wider text-violet-600">{translatePortalText("Total Invoice Amount")}</p>
-          <p className="mt-1 font-display text-2xl font-extrabold text-violet-700">{money(previewLabour + partsDraft)}</p>
-          <p className="mt-0.5 text-[10px] font-bold text-violet-500">{translatePortalText("Labor + Parts")}</p>
+          <p className="mt-1 font-display text-2xl font-extrabold text-violet-700">{money(billable)}</p>
+          <p className="mt-0.5 text-[10px] font-bold text-violet-500">
+            {order.agreedQuote != null
+              ? `${translatePortalText('Accepted quote')} ${money(order.agreedQuote)} · ${translatePortalText('before VAT')}`
+              : `${translatePortalText('Labor + Parts')} · ${translatePortalText('before VAT')}`}
+          </p>
         </div>
       </div>
+
+      {/* The customer agreed to a price. Logged work over it is not billed —
+          the server caps the invoice — so say so before the job is closed. */}
+      {overQuote > 0 && (
+        <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs font-semibold text-amber-800">
+          <span>⚠️</span>
+          <span>
+            {translatePortalTemplate('Logged work comes to {{logged}}, {{over}} over the quote the customer accepted. The invoice is capped at {{quote}} — send a revised quote before the job is scheduled to charge more.', {
+              logged: money(previewLabour + partsDraft),
+              over: money(overQuote),
+              quote: money(order.agreedQuote!),
+            })}
+          </span>
+        </div>
+      )}
 
       {/* Next Step Progression Action Bar */}
       {hasNextSteps && (
@@ -1242,7 +1398,7 @@ function WorkOrderDetail({
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="flex items-center gap-2 font-bold">
                   <CreditCard size={16} className="text-amber-700 shrink-0" />
-                  <span>{translatePortalText("Awaiting Boat Owner Payment (")}{money(previewLabour + partsDraft)})</span>
+                  <span>{translatePortalText("Awaiting Boat Owner Payment (")}{money(amountDue)})</span>
                 </div>
                 <button
                   type="button"
@@ -1260,7 +1416,7 @@ function WorkOrderDetail({
                 </button>
               </div>
               <p className="mt-1 text-[11px] text-amber-700 font-medium">
-                {translatePortalText("Vessel delivery is locked until the client completes payment of")} {money(previewLabour + partsDraft)} {translatePortalText("via HyperPay on the BoatPro mobile app.")}
+                {translatePortalText("Vessel delivery is locked until the client completes payment of")} {money(amountDue)} {translatePortalText("via HyperPay on the BoatPro mobile app.")}
               </p>
             </div>
           )}
@@ -1268,7 +1424,7 @@ function WorkOrderDetail({
           {nextOptions.includes('delivered') && isPaid && (previewLabour + partsDraft) > 0 && (
             <div className="mb-3 flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 p-2.5 text-xs font-bold text-emerald-800">
               <CheckCircle2 size={16} className="text-emerald-600 shrink-0" />
-              <span>{translatePortalText("Payment settled via HyperPay (")}{money(previewLabour + partsDraft)}{translatePortalText(") · Vessel is authorized for delivery")}</span>
+              <span>{translatePortalText("Payment settled via HyperPay (")}{money(amountDue)}{translatePortalText(") · Vessel is authorized for delivery")}</span>
             </div>
           )}
 

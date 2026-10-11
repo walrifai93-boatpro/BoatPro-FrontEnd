@@ -180,7 +180,7 @@ export default function AdminDashboard() {
       {/* ── Hero ── */}
       <motion.div initial={{ opacity: 0, scale: 0.985 }} animate={{ opacity: 1, scale: 1 }} transition={{ duration: 0.5 }}
         className="relative overflow-hidden rounded-3xl bg-admin-gradient text-white shadow-lift">
-        <video src="/videos/promo.mp4" autoPlay loop muted playsInline className="absolute inset-0 h-full w-full object-cover opacity-30" />
+        <video src="videos/promo.mp4" autoPlay loop muted playsInline className="absolute inset-0 h-full w-full object-cover opacity-30" />
         <div className="absolute inset-0 bg-gradient-to-r from-[#041410]/85 via-[#041410]/55 to-transparent" />
         <div className="relative z-10 flex flex-wrap items-end justify-between gap-6 p-7 md:p-10">
           <div>

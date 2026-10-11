@@ -130,7 +130,11 @@ export default function ProviderApprovals() {
     setLoading(true); setError(null)
     try {
       const res = await adminApi.listProviders(tab ? { status: tab } : undefined)
-      setProviders(res.data.providers)
+      // The list comes back lean — `_id` only, no `id` virtual — and every action
+      // on this page keys off `p.id`, so Approve / Reject / Activate / Suspend all
+      // went to `/admin/providers/undefined/…` and 400'd (the reject dialog just
+      // stayed open). Normalise once here.
+      setProviders(res.data.providers.map((p) => ({ ...p, id: p.id ?? p._id })))
       setCounts(res.data.statusCounts || {})
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load providers')
@@ -152,11 +156,11 @@ export default function ProviderApprovals() {
     return off
   }, [load])
 
-  const act = async (p: AdminProvider, fn: () => Promise<unknown>, msg: string, tone: any = 'success') => {
+  const act = async (p: AdminProvider, fn: () => Promise<unknown>, msg: string | ((res: any) => string), tone: any = 'success') => {
     setBusyId(p.id)
     try {
-      await fn()
-      toast(translatePortalText(msg), tone)
+      const res = await fn()
+      toast(translatePortalText(typeof msg === 'function' ? msg(res) : msg), tone)
       setRejecting(null); setReason(''); setDetail(null); setRegistration(null); setRegDocs([])
       await load()
     } catch (e) {
@@ -165,6 +169,16 @@ export default function ProviderApprovals() {
       setBusyId(null)
     }
   }
+
+  // Approving only takes a provider live when nothing is owed: commission, or a
+  // subscription already paid / waived. The server answers with the status it
+  // landed on, so the toast reads that instead of guessing (it used to say
+  // "awaiting subscription payment" to commission providers, and "now live" to
+  // unpaid subscription ones).
+  const approvedMsg = (p: AdminProvider) => (res: any) =>
+    res?.data?.user?.onboarding?.status === 'pending_subscription_payment'
+      ? `${p.business?.businessName || p.name} approved — awaiting subscription payment`
+      : `${p.business?.businessName || p.name} approved — now live`
 
   const doReject = () => {
     if (!rejecting) return
@@ -284,17 +298,17 @@ export default function ProviderApprovals() {
                   <div className="mt-3 flex gap-1.5 border-t border-slate-100 pt-3">
                     <button onClick={() => openDetail(p)} className="btn-ghost flex-1 !justify-center !py-1.5 !text-[11px]">{translatePortalText("Details")}</button>
                     {status === 'pending' && (<>
-                      <button disabled={busyId === p.id} onClick={() => act(p, () => adminApi.approve(p.id), `${p.business?.businessName || p.name} approved — awaiting subscription payment`)} className="btn-admin flex-1 !justify-center !py-1.5 !text-[11px] disabled:opacity-60"><Check size={12} /> {translatePortalText("Approve")}</button>
+                      <button disabled={busyId === p.id} onClick={() => act(p, () => adminApi.approve(p.id), approvedMsg(p))} className="btn-admin flex-1 !justify-center !py-1.5 !text-[11px] disabled:opacity-60"><Check size={12} /> {translatePortalText("Approve")}</button>
                       <button disabled={busyId === p.id} onClick={() => { setRejecting(p); setReason('') }} className="btn-ghost !justify-center !py-1.5 !px-2.5 !text-[11px] !text-rose-500"><X size={12} /></button>
                     </>)}
                     {status === 'pending_subscription_payment' && (
-                      <button disabled={busyId === p.id} onClick={() => act(p, () => adminApi.approve(p.id, { directApprove: true }), `${p.business?.businessName || p.name} activated — now live`)} className="btn-admin flex-1 !justify-center !py-1.5 !text-[11px] disabled:opacity-60"><Check size={12} /> {translatePortalText("Activate Live")}</button>
+                      <button disabled={busyId === p.id} onClick={() => act(p, () => adminApi.approve(p.id, { forceBypassPayment: true }), `${p.business?.businessName || p.name} activated — now live`)} className="btn-admin flex-1 !justify-center !py-1.5 !text-[11px] disabled:opacity-60"><Check size={12} /> {translatePortalText("Activate Live")}</button>
                     )}
                     {status === 'approved' && (
                       <button disabled={busyId === p.id} onClick={() => act(p, () => adminApi.suspend(p.id), `${p.business?.businessName || p.name} suspended`, 'warn')} className="btn-ghost flex-1 !justify-center !py-1.5 !text-[11px] !text-amber-600"><Ban size={12} /> {translatePortalText("Suspend")}</button>
                     )}
                     {(status === 'rejected' || status === 'suspended') && (
-                      <button disabled={busyId === p.id} onClick={() => act(p, () => adminApi.approve(p.id, { directApprove: true }), `${p.business?.businessName || p.name} approved — now live`)} className="btn-admin flex-1 !justify-center !py-1.5 !text-[11px] disabled:opacity-60"><Check size={12} /> {translatePortalText(" Approve")}</button>
+                      <button disabled={busyId === p.id} onClick={() => act(p, () => adminApi.approve(p.id), approvedMsg(p))} className="btn-admin flex-1 !justify-center !py-1.5 !text-[11px] disabled:opacity-60"><Check size={12} /> {translatePortalText(" Approve")}</button>
                     )}
                   </div>
                 </div>
@@ -559,7 +573,7 @@ export default function ProviderApprovals() {
             <div className="flex justify-end gap-2 border-t border-slate-100 pt-4">
               {detail.onboarding?.status === 'pending' && (<>
                 <button className="btn-ghost !text-rose-500" onClick={() => { setDetail(null); setRejecting(detail); setReason('') }}>{translatePortalText("Reject")}</button>
-                <button className="btn-admin" onClick={() => act(detail, () => adminApi.approve(detail.id), `${detail.business?.businessName || detail.name} approved`)}>{translatePortalText("Approve provider")}</button>
+                <button className="btn-admin" onClick={() => act(detail, () => adminApi.approve(detail.id), approvedMsg(detail))}>{translatePortalText("Approve provider")}</button>
               </>)}
             </div>
           </div>

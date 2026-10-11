@@ -45,6 +45,23 @@ export function earnedCommission(p: ApiAdminPayment): number {
   return Math.round((amount - (p.providerNet ?? amount)) * kept * 100) / 100
 }
 
+/**
+ * What the platform kept, split the way a statement should show it.
+ *
+ * `earnedCommission` is everything between the charge and the provider's net,
+ * which also holds the card-processing fee when the provider bears it — a
+ * subscription marina on "0% commission" showed "+SAR 14.09 comm." for what was
+ * entirely the acquirer's 3.5%. `commissionAmount` is the commission alone;
+ * the rest of the cut is the card fee.
+ */
+export function platformCut(p: ApiAdminPayment): { commission: number; cardFee: number } {
+  const total = earnedCommission(p)
+  const amount = p.amount || 0
+  const kept = amount > 0 ? 1 - (p.refundAmount ?? 0) / amount : 0
+  const commission = Math.min(total, Math.round((p.commissionAmount ?? total) * kept * 100) / 100)
+  return { commission, cardFee: Math.round((total - commission) * 100) / 100 }
+}
+
 /** The business a booking was made with; the account holder's name only when no business name was set. */
 export function paymentProviderLabel(p: ApiAdminPayment): string {
   const pr = p.provider

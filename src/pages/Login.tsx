@@ -5,7 +5,7 @@ import { motion, AnimatePresence } from 'framer-motion'
 import {
   Anchor, Fuel, Wrench, Crown, Eye, EyeOff, Lock, Mail, ArrowRight, ShieldCheck,
   Waves, Sparkles, Check, Building2, User, Compass, Zap, ChevronDown, Ship, Phone } from 'lucide-react'
-import { toast, Modal, FieldWarning } from '../ui'
+import { toast, ToastStack, Modal, FieldWarning } from '../ui'
 import { ThemeToggle } from '../theme'
 import { useAuth, type PortalRole } from '../auth'
 import { authApi, planInviteApi, setSessionPersistence } from '../api'
@@ -333,6 +333,10 @@ export default function Login() {
     // provider-type switch scrolled it ~116px sideways, cutting off the hero and
     // leaving a blank strip at the end. Clip has nothing to scroll.
     <div className="relative min-h-screen overflow-clip">
+      {/* The stack lives in each console layout, and this page is outside all of
+          them — so every toast here (a wrong password, a reset code sent, a
+          sign-up refused) was raised and never drawn. */}
+      <ToastStack />
       {/* ── role-themed background cross-dissolve ── */}
       <AnimatePresence>
         <motion.div key={role} className={`absolute inset-0 ${active.bg}`}
@@ -363,7 +367,7 @@ export default function Login() {
         <motion.div initial={{ opacity: 0, x: -28 }} animate={{ opacity: 1, x: 0 }} transition={{ duration: 0.6 }} className="hidden text-white lg:block">
           <div className="mb-9 flex items-center gap-3">
             <div className="relative">
-              <img src="/logo.png" alt={translatePortalText("BoatPro")} className="h-14 w-14 object-contain drop-shadow-[0_0_22px_rgba(255,255,255,0.35)]" onError={e => ((e.target as HTMLImageElement).style.display = 'none')} />
+              <img src="logo.png" alt={translatePortalText("BoatPro")} className="h-14 w-14 object-contain drop-shadow-[0_0_22px_rgba(255,255,255,0.35)]" onError={e => ((e.target as HTMLImageElement).style.display = 'none')} />
             </div>
             <div>
               <p className="font-display text-3xl font-extrabold tracking-tight">BoatPro</p>
@@ -380,7 +384,7 @@ export default function Login() {
 
           {/* Continuous Promo video background */}
           <div className="relative mt-8 overflow-hidden rounded-[26px] border border-white/15 shadow-lift">
-            <video src="/videos/promo.mp4" autoPlay loop muted playsInline className="absolute inset-0 h-full w-full object-cover" />
+            <video src="videos/promo.mp4" autoPlay loop muted playsInline className="absolute inset-0 h-full w-full object-cover" />
             
             {/* crossfading role badge overlay */}
             <AnimatePresence mode="wait">
@@ -435,7 +439,7 @@ export default function Login() {
         <motion.div initial={{ opacity: 0, y: 28 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.6, delay: 0.1 }}
           className="mx-auto w-full max-w-[430px]">
           <div className="mb-6 text-center lg:hidden">
-            <img src="/logo.png" alt={translatePortalText("BoatPro")} className="mx-auto h-14 w-14 object-contain drop-shadow-[0_0_18px_rgba(255,255,255,0.35)]" onError={e => ((e.target as HTMLImageElement).style.display = 'none')} />
+            <img src="logo.png" alt={translatePortalText("BoatPro")} className="mx-auto h-14 w-14 object-contain drop-shadow-[0_0_18px_rgba(255,255,255,0.35)]" onError={e => ((e.target as HTMLImageElement).style.display = 'none')} />
             <p className="mt-2 font-display text-2xl font-extrabold text-white">{translatePortalText("BoatPro Console")}</p>
           </div>
 
@@ -639,7 +643,7 @@ export default function Login() {
                         */}
                         <span className="font-semibold text-slate-600 dark:text-slate-300">{translatePortalText("Terms of Service")}</span> &amp;{' '}
                         <a
-                          href="/privacy.html"
+                          href="privacy.html"
                           target="_blank"
                           rel="noopener noreferrer"
                           className="font-bold text-ocean-600 underline decoration-ocean-300 underline-offset-2 hover:decoration-ocean-600"
@@ -692,7 +696,7 @@ export default function Login() {
               reason as the one on the consent line above. */}
           <p className="mt-5 flex items-center justify-center gap-2 text-center text-[11px] text-white/65">
             <User size={12} /> © {new Date().getFullYear()} HarborLink · BoatPro · {translatePortalText("Provider Console")} ·{' '}
-            <a href="/privacy.html" target="_blank" rel="noopener noreferrer" className="underline hover:text-white/70">{translatePortalText("Privacy")}</a>
+            <a href="privacy.html" target="_blank" rel="noopener noreferrer" className="underline hover:text-white/70">{translatePortalText("Privacy")}</a>
           </p>
         </motion.div>
       </div>

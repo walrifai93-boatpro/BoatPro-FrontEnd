@@ -15,7 +15,7 @@ import {
   type Provider, type ABooking,
 } from '../adminData'
 import { listingPhoto } from '../../images'
-import { PageWrap, ChartTip, BOOKING_TYPE_META, PAYMENT_STATUS_META, seededAvatar, personName, MONTH_NAMES, toKycItem, aiDocToKycItem, REVIEW_TARGET_TYPES_FOR_KIND, REVIEW_STAFF_MODEL_FOR_KIND, vatCertificateLabel, earnedCommission, paymentProviderLabel } from './_shared'
+import { PageWrap, ChartTip, BOOKING_TYPE_META, PAYMENT_STATUS_META, seededAvatar, personName, MONTH_NAMES, toKycItem, aiDocToKycItem, REVIEW_TARGET_TYPES_FOR_KIND, REVIEW_STAFF_MODEL_FOR_KIND, vatCertificateLabel, earnedCommission, platformCut, paymentProviderLabel } from './_shared'
 import { Section, toast, Img, Counter, Modal, CardGridSkeleton, TableSkeleton, downloadCsv } from '../../ui'
 import { TableToolbar, useTableFilters, NoFilterMatches, TablePagination, type TableFiltersConfig } from '../../shared/TableFilters'
 import { AdminHeader, ABadge, AProgress, ViewToggle } from '../adminUi'
@@ -430,7 +430,7 @@ export function ProviderDirectory({ cfg }: { cfg: DomainCfg }) {
           <div className="overflow-x-auto custom-scrollbar">
             <div className="min-w-[1050px]">
               <div className="grid grid-cols-[20fr_15fr_12fr_12fr_10fr_12fr_180px] items-center gap-4 border-b border-slate-100 bg-sand px-5 py-3.5 text-[11px] font-bold uppercase tracking-wider text-slate-400">
-                <span>{translatePortalText("Provider")}</span><span>{translatePortalText("Owner")}</span><span className="text-center">{translatePortalText("Plan")}</span><span className="text-right">{translatePortalText("Revenue")}</span><span className="text-center">{translatePortalText("Rating")}</span><span className="text-center">{translatePortalText("Status")}</span><span className="text-right">{translatePortalText("Actions")}</span>
+                <span>{translatePortalText("Provider")}</span><span>{translatePortalText("Owner")}</span><span className="text-center">{translatePortalText("Plan")}</span><span className="text-right">{translatePortalText("Revenue")}</span><span className="text-center">{translatePortalText("Rating")}</span><span className="text-center">{translatePortalText("Status")}</span><span className="sticky end-0 z-[1] -my-3.5 bg-sand py-3.5 text-right">{translatePortalText("Actions")}</span>
               </div>
               {list.map((p, i) => (
                 <motion.div key={p.id} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: i * 0.03 }}
@@ -484,7 +484,7 @@ export function ProviderDirectory({ cfg }: { cfg: DomainCfg }) {
                       <ABadge dot={p.status === 'Live'}>{translatePortalText(p.status)}</ABadge>
                     )}
                   </div>
-                  <div className="flex justify-end gap-1.5 whitespace-nowrap">
+                  <div className="sticky end-0 z-[1] flex justify-end gap-1.5 whitespace-nowrap bg-white ps-2 shadow-[-12px_0_12px_-12px_rgba(15,23,42,0.18)]">
                     {p.status === 'Pending' ? (<>
                       <button onClick={() => approve(p)} className="btn-admin !py-1.5 !px-2.5 !text-[11px]"><Check size={12} /> {translatePortalText("Approve")}</button>
                       <button onClick={() => reject(p)} className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-rose-50 text-rose-500 hover:bg-rose-100" title={translatePortalText("Reject")}><X size={13} /></button>
@@ -1299,7 +1299,7 @@ export function ProviderBookings({ cfg }: { cfg: DomainCfg }) {
             onClick={() => {
               if (items.length === 0) { toast(translatePortalText('Nothing to export'), 'warn'); return }
               downloadCsv(`${cfg.kind}-bookings-${new Date().toISOString().slice(0, 10)}.csv`, [
-                ['Booking', cfg.kind === 'Boat' ? 'Trip' : 'Booked', 'Customer', 'Provider', 'Date', `Amount (${BASE_CURRENCY})`, `Refunded (${BASE_CURRENCY})`, `Commission (${BASE_CURRENCY})`, 'Status', 'Gateway reference'],
+                ['Booking', cfg.kind === 'Boat' ? 'Trip' : 'Booked', 'Customer', 'Provider', 'Date', `Amount (${BASE_CURRENCY})`, `Refunded (${BASE_CURRENCY})`, `Commission (${BASE_CURRENCY})`, `Card fee (${BASE_CURRENCY})`, 'Status', 'Gateway reference'],
                 ...items.map(p => [
                   p.booking?.code ?? '',
                   p.booking?.title ?? '',
@@ -1308,7 +1308,8 @@ export function ProviderBookings({ cfg }: { cfg: DomainCfg }) {
                   (p.paidAt || p.createdAt || '').slice(0, 10),
                   p.amount,
                   p.refundAmount ?? 0,
-                  earnedCommission(p),
+                  platformCut(p).commission,
+                  platformCut(p).cardFee,
                   p.status,
                   p.transactionId,
                 ]),
@@ -1322,7 +1323,7 @@ export function ProviderBookings({ cfg }: { cfg: DomainCfg }) {
 
       <div className="mb-5 grid grid-cols-2 gap-4 md:grid-cols-3">
         {/* Currency, not a symbol — these are riyals. See AdminCustomers. */}
-        {([['Paid bookings', totals.count, undefined], ['Collected (after refunds)', totals.gross, BASE_CURRENCY], ['Commission earned', totals.commission, BASE_CURRENCY]] as [string, number, string | undefined][]).map(([l, v, cur], i) => (
+        {([['Paid bookings', totals.count, undefined], ['Collected (after refunds)', totals.gross, BASE_CURRENCY], ['Platform earnings', totals.commission, BASE_CURRENCY]] as [string, number, string | undefined][]).map(([l, v, cur], i) => (
           <motion.div key={l} initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: i * 0.05 }} className="card p-4">
             <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400">{translatePortalText(l)}</p>
             <p className="mt-1 font-display text-2xl font-extrabold text-deep-900"><Counter value={v} currency={cur} /></p>
@@ -1364,7 +1365,8 @@ export function ProviderBookings({ cfg }: { cfg: DomainCfg }) {
                     <div className="text-right text-[13px] font-extrabold text-deep-900 whitespace-nowrap">
                       {money(b.amount)}
                       {!!b.refundAmount && <p className="text-[10px] font-semibold text-rose-500">−{money(b.refundAmount)} {translatePortalText('refunded')}</p>}
-                      {earnedCommission(b) > 0 && <p className="text-[10px] font-semibold text-emerald-600">+{money(earnedCommission(b))} {translatePortalText(" comm.")}</p>}
+                      {platformCut(b).commission > 0 && <p className="text-[10px] font-semibold text-emerald-600">+{money(platformCut(b).commission)} {translatePortalText(" comm.")}</p>}
+                      {platformCut(b).cardFee > 0 && <p className="text-[10px] font-semibold text-slate-400">+{money(platformCut(b).cardFee)} {translatePortalText("card fee")}</p>}
                     </div>
                     <div className="flex justify-center whitespace-nowrap"><ABadge dot={PAYMENT_STATUS_META[b.status]?.dot}>{translatePortalText(PAYMENT_STATUS_META[b.status]?.label || b.status)}</ABadge></div>
                     <div className="flex justify-end gap-1.5 whitespace-nowrap">
@@ -1398,7 +1400,7 @@ export function ProviderBookings({ cfg }: { cfg: DomainCfg }) {
               <div className="rounded-xl border border-slate-100 p-3">
                 <p className="text-[10px] font-bold uppercase text-slate-400">{translatePortalText("Financial Breakdown")}</p>
                 <p className="mt-1 font-extrabold text-emerald-600">{translatePortalText("Total:")} {money(sel.amount)}</p>
-                <p className="mt-0.5 text-slate-500">{translatePortalText("Commission:")} {money(earnedCommission(sel))}</p>
+                <p className="mt-0.5 text-slate-500">{translatePortalText("Commission:")} {money(platformCut(sel).commission)} · {translatePortalText("Card fee:")} {money(platformCut(sel).cardFee)}</p>
                 <p className="mt-0.5 text-slate-500">{translatePortalText("Method:")} {translatePortalText(sel.method)}</p>
                 {!!sel.refundAmount && <p className="mt-0.5 text-rose-500">{translatePortalText("Refunded:")} {money(sel.refundAmount)}</p>}
               </div>

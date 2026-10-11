@@ -697,16 +697,20 @@ export interface FuelInvoice {
   due: string
   items: string
   amount: number
-  status: 'Paid' | 'Pending' | 'Overdue' | 'Refunded'
+  status: 'Paid' | 'Pending' | 'Overdue' | 'Refunded' | 'Credit note'
   method: string
   pdfUrl?: string
 }
 
+// `credit_note` rows are the tax documents for refunds (CN-… numbers). They are
+// neither collectable nor owed, so they get their own label rather than falling
+// back to "Pending" and offering a Collect button.
 const INVOICE_STATUS: Record<string, FuelInvoice['status']> = {
   paid: 'Paid',
   pending: 'Pending',
   overdue: 'Overdue',
   refunded: 'Refunded',
+  credit_note: 'Credit note',
 }
 
 export function toInvoice(i: ApiFuelInvoice): FuelInvoice {

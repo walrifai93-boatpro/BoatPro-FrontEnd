@@ -371,8 +371,9 @@ export async function request<T>(path: string, options: ApiRequestOptions = {}):
   if (!res.ok) {
     // `apiErrorFromResponse` keeps the status and picks user-safe copy: it
     // trusts the backend's own wording for 4xx (written for the user) but never
-    // for 5xx or auth, where it is an internal detail.
-    throw apiErrorFromResponse(res.status, body);
+    // for 5xx or auth, where it is an internal detail — except a sign-in's own
+    // refusal, which is addressed to the user.
+    throw apiErrorFromResponse(res.status, body, { signIn: path.startsWith('/auth/') });
   }
   return body as T;
 }
@@ -911,6 +912,8 @@ export interface ApiReservation {
   declinedAt?: string;
   declineReason?: string;
   paidAt?: string;
+  /** The boater's card held with the request — approving captures it. */
+  cardHold?: { status: 'held' | 'captured' | 'released' | 'failed'; amountSar: number; heldAt?: string; note?: string };
   cancelledAt?: string;
   cancelReason?: string;
   completedAt?: string;
@@ -944,8 +947,9 @@ export const reservationsApi = {
     notes?: string;
   }) => post<Ok<{ subscription: ApiReservation; nextStep: 'payment' }>>('/dock-subscriptions/walk-in', data),
 
+  /** `cardHold` says what approving did with the boater's held card, when there was one. */
   approve: (id: string, move?: { pontoon: string; slot: number }) =>
-    patch<Ok<{ subscription: ApiReservation }>>(`/dock-subscriptions/${id}/approve`, move ?? {}),
+    patch<Ok<{ subscription: ApiReservation; cardHold?: 'captured' | 'failed' | null }>>(`/dock-subscriptions/${id}/approve`, move ?? {}),
 
   decline: (id: string, reason?: string) =>
     patch<Ok<{ subscription: ApiReservation }>>(`/dock-subscriptions/${id}/decline`, { reason }),
@@ -957,7 +961,12 @@ export const reservationsApi = {
   cancel: (id: string, reason?: string) =>
     patch<Ok<{ subscription: ApiReservation }>>(`/dock-subscriptions/${id}/cancel`, { reason }),
 
-  complete: (id: string) => patch<Ok<{ subscription: ApiReservation }>>(`/dock-subscriptions/${id}/complete`),
+  /**
+   * Refused with `details.code === 'BOAT_ALONGSIDE'` while the boat is still
+   * checked in; `checkOut: true` checks it out (billing utilities) and completes.
+   */
+  complete: (id: string, opts?: { checkOut?: boolean }) =>
+    patch<Ok<{ subscription: ApiReservation }>>(`/dock-subscriptions/${id}/complete`, opts?.checkOut ? { checkOut: true } : {}),
 
   renew: (id: string, months: number) => patch<Ok<{ subscription: ApiReservation }>>(`/dock-subscriptions/${id}/renew`, { months }),
 
@@ -1294,6 +1303,18 @@ export interface ApiInvoice {
   pdfUrl?: string;
   payment?: { status: string; method: string; paidAt?: string; amount: number } | string;
   createdAt: string;
+  /** `invoice` when absent. Credit notes (CN-…) are the tax documents for refunds. */
+  kind?: 'invoice' | 'credit_note';
+  /** Refund state of the document itself (not the payment). Absent on older invoices. */
+  status?: 'issued' | 'partially_refunded' | 'refunded';
+  /** The row status the billing endpoint derives from the invoice and its payment. */
+  displayStatus?: 'credit_note' | 'refunded' | 'partially_refunded' | 'paid' | 'pending';
+  refundedTotal?: number;
+  originalInvoiceNumber?: string;
+  reason?: string;
+  buyerName?: string;
+  issuedAt?: string;
+  zatcaReady?: boolean;
 }
 
 export interface ApiStaffMember {
@@ -1618,8 +1639,10 @@ export const marinaDocsApi = {
 // Marina services catalogue (what boaters can order)
 // ---------------------------------------------------------------------------
 export const servicesApi = {
-  create: (data: { marinaId: string; name: string; category: string; price: number; pricingUnit?: string; description?: string }) =>
-    post<Ok<{ service: ApiMarinaService }>>('/marina-services', data),
+  // The backend only creates under the marina it belongs to (`POST /manage/:marinaId`,
+  // which also checks ownership); a bare `POST /marina-services` has no route and 404'd.
+  create: ({ marinaId, ...data }: { marinaId: string; name: string; category: string; price: number; pricingUnit?: string; description?: string }) =>
+    post<Ok<{ service: ApiMarinaService }>>(`/marina-services/manage/${marinaId}`, data),
   update: (id: string, data: Partial<ApiMarinaService>) => patch<Ok<{ service: ApiMarinaService }>>(`/marina-services/${id}`, data),
   remove: (id: string) => del<Ok<unknown>>(`/marina-services/${id}`),
   setBookingStatus: (id: string, status: 'pending' | 'confirmed' | 'completed' | 'cancelled') =>
@@ -2796,7 +2819,7 @@ export interface AdminBoatApproval {
 export const adminApi = {
   listProviders: (params?: { role?: string; status?: string }) =>
     get<Ok<{ providers: AdminProvider[]; statusCounts: Record<string, number> }>>('/admin/providers', params),
-  approve: (id: string, options?: { directApprove?: boolean }) =>
+  approve: (id: string, options?: { forceBypassPayment?: boolean }) =>
     patch<Ok<{ user: AdminProvider }>>(`/admin/providers/${id}/approve`, options),
   getRegistration: (id: string) =>
     get<
@@ -2927,6 +2950,8 @@ export interface MaintenanceProviderRequest {
   id: string; _id?: string; boatName: string; boatLengthFt?: number; category: string; title: string; description: string;
   titleAr?: string; descriptionAr?: string;
   priority: string; status: string; location?: string; requestedAt: string; quotedAmount?: number; quoteNotes?: string; quoteNotesAr?: string; scheduledFor?: string;
+  /** The customer's answer to `quotedAmount`; absent while they have not answered. */
+  customerQuoteResponse?: 'accepted' | 'declined';
   declineReason?: string; declineReasonAr?: string;
   /** Photos the owner attached to the request. */
   photos?: string[];
@@ -3033,7 +3058,7 @@ export interface MaintenanceWorkOrder { id: string; _id?: string; code: string; 
   assignments?: { role: string; roleAr?: string; technician: string; hourlyRate: number; hours: number }[];
 }
 export interface MaintenancePart { id: string; _id?: string; sku: string; name: string; nameAr?: string; category?: string; stock: number; minimumStock: number; unitCost: number; supplier?: string; location?: string }
-export interface MaintenanceInvoice { id: string; _id?: string; code: string; customerName: string; boatName: string; labor: number; parts: number; tax: number; discount: number; total: number; status: string; notes?: string; notesAr?: string; assignments?: { role: string; roleAr?: string }[]; dueDate?: string; paidAt?: string; createdAt: string; customer?: { name?: string; avatar?: string; email?: string }
+export interface MaintenanceInvoice { id: string; _id?: string; code: string; customerName: string; boatName: string; labor: number; parts: number; tax: number; discount: number; total: number; status: string; refundedAmount?: number; notes?: string; notesAr?: string; assignments?: { role: string; roleAr?: string }[]; dueDate?: string; paidAt?: string; createdAt: string; customer?: { name?: string; avatar?: string; email?: string }
   /** Taxable amount before VAT. Optional: invoices issued before VAT was applied have none. */
   subtotal?: number
   /** VAT percentage stamped at issue (15 = 15%) — `tax` is the amount it produced. */
@@ -3246,6 +3271,9 @@ export const maintenancePortalApi = {
   invoices: (params?: Record<string, string | number | boolean | undefined>) => get<Ok<Paginated<MaintenanceInvoice>>>('/maintenance-portal/invoices', params),
   createInvoice: (body: Record<string, unknown>) => post<Ok<{ invoice: MaintenanceInvoice }>>('/maintenance-portal/invoices', body),
   updateInvoice: (id: string, body: Record<string, unknown>) => patch<Ok<{ invoice: MaintenanceInvoice }>>(`/maintenance-portal/invoices/${id}`, body),
+  /** Returns money on a paid invoice — through the gateway, or recorded for a desk payment. Omit `amount` for everything refundable. */
+  refundInvoice: (id: string, body: { amount?: number; reason?: string }) =>
+    post<Ok<{ invoice: MaintenanceInvoice; refund: { amountSar: number; refundedSar: number; refundableSar: number; settlementBusinessDays: { min: number; max: number } } }>>(`/maintenance-portal/invoices/${id}/refund`, body),
   generatePaymentQr: (id: string) => get<Ok<{ qrDataUrl: string; payUrl: string; reference: string; amount: number; currency: string }>>(`/maintenance-portal/invoices/${id}/payment-qr`),
   inspections: (params?: Record<string, string | number | boolean | undefined>) => get<Ok<Paginated<MaintenanceInspection>>>('/maintenance-portal/inspections', params),
   createInspection: (body: Record<string, unknown>) => post<Ok<{ inspection: MaintenanceInspection }>>('/maintenance-portal/inspections', body),
@@ -3492,6 +3520,78 @@ export const testingToolsApi = {
   /** Admin: switch the "Fake fill" button on the provider signup forms on or off. */
   update: (data: { fakeFillEnabled: boolean }) => patch<Ok<ApiTestingTools>>('/testing-tools', data),
 };
+
+// ---------------------------------------------------------------------------
+// Curated vessel / trip / equipment lists — the admin side of "Request a new type".
+// ---------------------------------------------------------------------------
+export type TaxonomyListType =
+  | 'boat_category'
+  | 'trip_type'
+  | 'engine_type'
+  | 'hull_material'
+  | 'navigation_equipment'
+  | 'safety_equipment'
+
+export type HullFormKey = 'power' | 'sail' | 'multihull' | 'pwc'
+
+export interface ApiTaxonomyRow {
+  _id: string
+  type: TaxonomyListType
+  key: string
+  labelEn: string
+  labelAr: string
+  description?: string
+  hullForm?: HullFormKey
+  status?: 'pending' | 'approved' | 'rejected'
+  isActive: boolean
+  isCustom: boolean
+  reviewNote?: string
+  reviewedAt?: string
+  createdAt: string
+  createdBy?: { _id: string; name?: string; email?: string; role?: string; business?: { businessName?: string } } | string
+}
+
+export interface ApiTaxonomyManaged {
+  /** Present on approved additions only (built-ins live in code). */
+  id?: string
+  key: string
+  labelEn: string
+  labelAr: string
+  source: 'built_in' | 'approved'
+  isActive: boolean
+  logoUrl?: string
+  hullForm?: HullFormKey
+  /** Boats (or trips) currently using it. */
+  usage: number
+}
+
+export const taxonomyAdminApi = {
+  /** pending = the request queue · approved = additions in the shared list · rejected = declined requests. */
+  list: (status: 'pending' | 'approved' | 'rejected') =>
+    get<Ok<{ items: ApiTaxonomyRow[]; counts: { pending: number } }>>('/content/taxonomy/requests', { status }),
+  approve: (id: string, data: { labelEn: string; labelAr: string; key?: string; hullForm?: HullFormKey }) =>
+    patch<Ok<{ item: ApiTaxonomyRow }>>(`/content/taxonomy/requests/${id}/approve`, data),
+  reject: (id: string, reason: string) =>
+    patch<Ok<{ item: ApiTaxonomyRow }>>(`/content/taxonomy/requests/${id}/reject`, { reason }),
+  /** Retire (hide) or restore an approved addition. */
+  setActive: (id: string, isActive: boolean) => patch<Ok<{ item: ApiTaxonomyRow }>>(`/content/taxonomy/${id}/active`, { isActive }),
+  /** Built-in entries and approved additions together, with logo, hull form and usage. */
+  manage: (type: 'boat_category' | 'trip_type') =>
+    get<Ok<{ type: string; items: ApiTaxonomyManaged[] }>>('/content/taxonomy/manage', { type }),
+  /** A transparent PNG, prepared (background removed, trimmed) in the browser. */
+  uploadLogo: (type: 'boat_category' | 'trip_type', key: string, png: Blob) => {
+    const fd = new FormData()
+    fd.append('type', type)
+    fd.append('key', key)
+    fd.append('logo', png, `${key}.png`)
+    return post<Ok<{ type: string; key: string; logoUrl: string }>>('/content/taxonomy/logo', fd)
+  },
+  removeLogo: (type: 'boat_category' | 'trip_type', key: string) =>
+    del<Ok<{ type: string; key: string }>>(`/content/taxonomy/logo?type=${type}&key=${encodeURIComponent(key)}`),
+  /** An admin adding an entry directly — answers `exists` when the list already has it. */
+  create: (data: { type: TaxonomyListType; labelEn: string; labelAr?: string; hullForm?: HullFormKey }) =>
+    post<Ok<{ status: 'exists' | 'approved'; match?: { key: string; labelEn: string; labelAr: string }; item?: ApiTaxonomyRow }>>('/content/taxonomy', data),
+}
 
 export const documentsApi = {
   /** Admin: which documents each provider type is asked for. */

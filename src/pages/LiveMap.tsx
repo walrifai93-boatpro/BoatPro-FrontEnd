@@ -3,12 +3,12 @@ import { motion } from 'framer-motion'
 import { RadioTower, Maximize2, Minimize2, MoveHorizontal, Plus, Pencil, Camera, Eye, X, Anchor } from 'lucide-react'
 import { PageHeader, Badge, Img, toast, Modal, AsyncBlock, EmptyState } from '../ui'
 import { boatPhoto } from '../images'
-import { useAsync, useMarina, BERTH_LABELS, fmtDate, formatMoney, humanize, personOf, todayIso } from '../live'
+import { boatTypeLabel, useAsync, useMarina, BERTH_LABELS, fmtDate, formatMoney, humanize, personOf, todayIso } from '../live'
 import { chatApi, idOf, portalApi, movementsApi, fileUrl, type ApiBerthMapEntry } from '../api'
 import { BERTH_TINT as STATUS_FILL, HarbourChart, harbourScrolls } from '../harbour'
 import BerthModal from '../components/BerthModal'
 import DockModal from '../components/DockModal'
-import { formatPortalNumber, translatePortalText } from '../i18n/runtime'
+import { formatPortalNumber, translatePortalText, meterUnit } from '../i18n/runtime'
 
 
 const CREW_ACTIONS = ['Prepare lines', 'Fenders out', 'Pump-out cart', 'Fuel top-up']
@@ -306,7 +306,7 @@ export default function LiveMap() {
                   <div>
                     <p className="text-xs font-bold uppercase tracking-wider text-slate-400">{translatePortalText("Current Occupant")}</p>
                     <p className="text-sm font-bold text-deep-900">{r.boatName}</p>
-                <p className="text-xs text-slate-500">{owner?.name ?? r.plate} · {formatPortalNumber(r.lengthFt)} {translatePortalText("ft ")}{translatePortalText(humanize(r.boatType))}</p>
+                <p className="text-xs text-slate-500">{owner?.name ?? r.plate} · {formatPortalNumber(r.lengthFt)} {translatePortalText("ft ")}{translatePortalText(boatTypeLabel(r.boatType))}</p>
                     <p className="mt-0.5 text-[11px] text-slate-400">{translatePortalText("Until ")}{fmtDate(r.endDate)} · {formatMoney(r.totalSar, currency)}</p>
                   </div>
                 </div>
@@ -323,9 +323,9 @@ export default function LiveMap() {
 
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
               {[
-                ['Max length', sel.maxLength != null ? `${formatPortalNumber(sel.maxLength)} ${translatePortalText('Meter abbreviation')}` : '—'],
-                ['Max beam', sel.maxWidth != null ? `${formatPortalNumber(sel.maxWidth)} ${translatePortalText('Meter abbreviation')}` : '—'],
-                ['Max draft', sel.maxDepth != null ? `${formatPortalNumber(sel.maxDepth)} ${translatePortalText('Meter abbreviation')}` : '—'],
+                ['Max length', sel.maxLength != null ? `${formatPortalNumber(sel.maxLength)} ${meterUnit()}` : '—'],
+                ['Max beam', sel.maxWidth != null ? `${formatPortalNumber(sel.maxWidth)} ${meterUnit()}` : '—'],
+                ['Max draft', sel.maxDepth != null ? `${formatPortalNumber(sel.maxDepth)} ${meterUnit()}` : '—'],
                 ['Power', sel.powerSupply ?? '—'],
                 ['Water', translatePortalText(sel.hasWater ? 'Yes 💧' : 'No')],
                 ['Wi-Fi', translatePortalText(sel.hasWifi ? 'Yes 📶' : 'No')],
