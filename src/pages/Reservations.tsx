@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { BookMarked, Check, X, Wand2, Plus, Sparkles, ShieldCheck, Eye, FileCheck, AlertTriangle } from 'lucide-react'
 import { PageHeader, Badge, Modal, toast, SearchInput, EmptyState, ViewToggle, LoadingState, ErrorState } from '../ui'
@@ -15,7 +15,7 @@ import {
 import { DateField } from '../components/SemanticFormControls'
 import { confirmAndRun } from '../async'
 import { AiDocumentVerificationModal } from '../components/AiDocumentVerificationModal'
-import { formatPortalDate, formatPortalNumber, localizedField, translatePortalText, meterUnit } from '../i18n/runtime'
+import { formatPortalDate, formatPortalNumber, localizedField, translatePortalText, translatePortalTemplate, meterUnit } from '../i18n/runtime'
 
 // The four boards the operator works: what needs a decision, what needs paying,
 // what is live, and everything that's finished.
@@ -36,6 +36,37 @@ const PAY_METHODS = [
 
 const FT = 3.28084
 
+/**
+ * Share of what the boater paid that comes back when the MARINA calls a paid
+ * berth off (cancel or decline). Mirrors the backend's
+ * `PROVIDER_CANCELLATION_REFUND_PCT` (config/cancellationPolicy.ts) — the rest
+ * is the card fee the acquirer keeps. The API does not expose the rate yet, so
+ * the dialogs quote it from here; the toast afterwards reports the amount the
+ * server actually refunded.
+ */
+const MARINA_CANCEL_REFUND_PCT = 96
+
+/** Legacy `pending` rows are requests awaiting review, as the server treats them. */
+const statusOf = (r: ApiReservation): ReservationStatus =>
+  (r.status as string) === 'pending' ? 'pending_approval' : r.status
+
+/**
+ * The badge a row shows. `expired` covers both a paid lease that ran out and a
+ * request that lapsed before anyone paid — the second must not read like a stay.
+ */
+const statusLabel = (r: ApiReservation) =>
+  statusOf(r) === 'expired' && !r.paidAt ? 'Lapsed — never paid' : RESERVATION_LABELS[statusOf(r)] ?? r.status
+
+/** What the boater actually paid, from the payment records (not the quote). */
+const paidSar = (r: ApiReservation) =>
+  r.paidAt ? Math.round((r.payments ?? []).reduce((s, p) => s + (p.amountSar || 0), 0) * 100) / 100 : 0
+
+/** What a marina-side cancel/decline refunds — per payment, rounded as the server does. */
+const marinaRefundSar = (r: ApiReservation) =>
+  r.paidAt
+    ? Math.round((r.payments ?? []).reduce((s, p) => s + Math.round((p.amountSar || 0) * MARINA_CANCEL_REFUND_PCT) / 100, 0) * 100) / 100
+    : 0
+
 const avatarFor = (name?: string, avatar?: string) =>
   fileUrl(avatar) ?? `https://ui-avatars.com/api/?name=${encodeURIComponent(name ?? '?')}&background=e2e8f0&color=475569`
 
@@ -50,6 +81,26 @@ export default function Reservations() {
   const [settling, setSettling] = useState<ApiReservation | null>(null)
   const [payMethod, setPayMethod] = useState('cash')
   const [declining, setDeclining] = useState<ApiReservation | null>(null)
+  /*
+   * The server's refund for a marina-side cancel/decline, fetched when a dialog
+   * opens (the list rows do not carry it). Until it arrives the dialogs fall
+   * back to the local estimate, so they never show nothing.
+   */
+  const [preview, setPreview] = useState<{ id: string; marinaPct: number; marinaSar: number } | null>(null)
+  const previewFor = detail ?? declining
+  useEffect(() => {
+    if (!previewFor?.paidAt) { setPreview(null); return }
+    let alive = true
+    reservationsApi.one(previewFor.id)
+      .then(res => {
+        const p = res.data?.refundPreview
+        if (alive && p) setPreview({ id: previewFor.id, marinaPct: p.marinaCancel.pct, marinaSar: p.marinaCancel.amountSar })
+      })
+      .catch(() => { /* keep the estimate */ })
+    return () => { alive = false }
+  }, [previewFor?.id, previewFor?.paidAt])
+  const refundPct = (r: ApiReservation) => (preview?.id === r.id ? preview.marinaPct : MARINA_CANCEL_REFUND_PCT)
+  const refundSar = (r: ApiReservation) => (preview?.id === r.id ? preview.marinaSar : marinaRefundSar(r))
   /** A stay whose boat is still alongside — completing it checks the boat out first. */
   const [alongside, setAlongside] = useState<ApiReservation | null>(null)
   const [reason, setReason] = useState('')
@@ -57,18 +108,32 @@ export default function Reservations() {
   const [busy, setBusy] = useState(false)
   const [inspectingDoc, setInspectingDoc] = useState<AIDocument | null>(null)
 
-  // One fetch of everything, so the tab counts are always right.
-  const state = useAsync(() => reservationsApi.list({ status: 'all', search: q.trim() || undefined, limit: 100 }).then(r => r.data), [q])
+  /*
+    Each board is fetched on its own, newest first. One `status: 'all'` page
+    (the API caps it at 100) used to feed every tab, so at a busy marina an old
+    live lease was pushed off the Active board by a hundred newer requests, and
+    the tab counts stopped at 100. The counts now come from the server's
+    `statusCounts`, which cover the whole marina.
+  */
+  const statuses = TABS.find(t => t.key === tab)!.statuses
+  const state = useAsync(
+    () => reservationsApi.list({ status: statuses.join(','), search: q.trim() || undefined, limit: 100 }).then(r => r.data),
+    [q, tab],
+  )
   const berths = useAsync(() => portalApi.berthMap().then(r => r.data), [])
 
   const list = state.data?.items ?? []
-  const statuses = TABS.find(t => t.key === tab)!.statuses
-  const rows = useMemo(() => list.filter(r => statuses.includes(r.status)), [list, statuses])
+  const rows = useMemo(() => list.filter(r => statuses.includes(statusOf(r))), [list, statuses])
   const resCfg: TableFiltersConfig<ApiReservation> = useMemo(() => ({
     searchFields: (r) => [r.boatName, r.reservationNo, r.plate, personOf(r.subscriber)?.name, personOf(r.subscriber)?.email],
   }), [])
   const resTf = useTableFilters(rows, resCfg)
-  const count = (keys: ReservationStatus[]) => list.filter(r => keys.includes(r.status)).length
+  const statusCounts = state.data?.statusCounts
+  const count = (keys: ReservationStatus[]) =>
+    statusCounts ? keys.reduce((n, k) => n + (statusCounts[k] ?? 0), 0) : list.filter(r => keys.includes(statusOf(r))).length
+  /** More on the server than this page holds — say so instead of implying that is all. */
+  const serverTotal = state.data?.pagination?.total ?? list.length
+  const truncated = serverTotal > list.length
 
   const refresh = async () => { await state.reload(); await berths.reload(); await reloadOverview() }
 
@@ -84,11 +149,23 @@ export default function Reservations() {
     } finally { setBusy(false) }
   }
 
+  /**
+   * Another boat's paid lease on this berth for overlapping dates — the case
+   * the server refuses ("Another boat is already confirmed on this berth").
+   * The requested berth used to count as free whatever happened to it after
+   * the request, so "Approve as requested" stayed enabled on a taken berth.
+   */
+  const takenByOther = (b: ApiBerthMapEntry, r: ApiReservation) => {
+    const h = b.reservation
+    return !!h && h.id !== (r.id || r._id) && h.status === 'active' && h.startDate < r.endDate && r.startDate < h.endDate
+  }
+
   /** Free berths that physically fit the boat. */
   const fits = (r: ApiReservation): ApiBerthMapEntry[] =>
     (berths.data?.berths ?? []).filter(b => {
       const free = b.status === 'available' || b.id === r.slotRef
       if (!free) return false
+      if (b.status === 'maintenance' || b.status === 'blocked' || takenByOther(b, r)) return false
       if (b.maxLength && r.lengthFt > b.maxLength * FT + 0.01) return false
       if (b.maxWidth && r.widthFt > b.maxWidth * FT + 0.01) return false
       if (b.maxDepth && r.draftFt > b.maxDepth * FT + 0.01) return false
@@ -100,7 +177,7 @@ export default function Reservations() {
     const move = berth && berth.id !== r.slotRef ? { pontoon: berth.pontoon, slot: berth.number } : undefined
     const where = berth ? berthLabel(berth.pontoon, berth.number) : berthLabel(r.pontoon, r.slot)
     setAssigning(null)
-    if (r.status === 'active' || r.status === 'pending_payment') {
+    if (statusOf(r) === 'active' || statusOf(r) === 'pending_payment') {
       return run(() => reservationsApi.transfer(r.id, move?.pontoon ?? r.pontoon, move?.slot ?? r.slot), `${r.boatName} moved to ${where}`)
     }
     // What happened to a held card decides the message — charged and live, or
@@ -122,11 +199,14 @@ export default function Reservations() {
     return assign(r, best)
   }
 
+  /** The boater is told why (W-22): an empty reason is no longer sent. */
   const submitDecline = async () => {
-    if (!declining) return
+    if (!declining || busy) return
+    const why = reason.trim()
+    if (!why) return toast(translatePortalText('Tell the boater why the request is declined'), 'warn')
     const r = declining
     setDeclining(null)
-    await run(() => reservationsApi.decline(r.id, reason.trim() || undefined), `${r.reservationNo} declined`, 'warn')
+    await run(() => reservationsApi.decline(r.id, why), `${r.reservationNo} declined`, 'warn')
     setReason('')
   }
 
@@ -165,17 +245,19 @@ export default function Reservations() {
 
   const rowActions = (r: ApiReservation) => (
     <>
-      {r.status === 'pending_approval' && (<>
-        <button className="btn-primary !py-1.5 !px-2.5 text-[11px]" onClick={() => setAssigning(r)}><Check size={12} /> {translatePortalText("Accept")}</button>
-        <button className="btn-ghost !py-1.5 !px-2.5 text-[11px] hover:!bg-rose-50 hover:!border-rose-200 hover:text-rose-500" onClick={() => { setDeclining(r); setReason('') }}><X size={12} /></button>
+      {statusOf(r) === 'pending_approval' && (<>
+        <button className="btn-primary !py-1.5 !px-2.5 text-[11px]" disabled={busy} onClick={() => setAssigning(r)}><Check size={12} /> {translatePortalText("Accept")}</button>
+        <button className="btn-ghost !py-1.5 !px-2.5 text-[11px] hover:!bg-rose-50 hover:!border-rose-200 hover:text-rose-500" disabled={busy}
+          title={translatePortalText("Decline request")} aria-label={translatePortalText("Decline request")}
+          onClick={() => { setDeclining(r); setReason('') }}><X size={12} /></button>
       </>)}
-      {r.status === 'pending_payment' && (<>
+      {statusOf(r) === 'pending_payment' && (<>
         {/* Marina has approved this request. The berth is held while we wait
             for the boater to pay. No action needed from marina. */}
         <span className="text-[11px] text-slate-400 italic">{translatePortalText("Awaiting boater payment")}</span>
       </>)}
-      {r.status === 'active' && (<>
-        <button className="btn-ghost !py-1.5 !px-2.5 text-[11px]" onClick={() => setAssigning(r)}>{translatePortalText("↔ Move berth")}</button>
+      {statusOf(r) === 'active' && (<>
+        <button className="btn-ghost !py-1.5 !px-2.5 text-[11px]" disabled={busy} onClick={() => setAssigning(r)}>{translatePortalText("↔ Move berth")}</button>
         <button className="btn-ghost !py-1.5 !px-2.5 text-[11px]" disabled={busy} onClick={() => complete(r)}>{translatePortalText("🛫 Complete")}</button>
       </>)}
       <button className="btn-ghost !py-1.5 !px-2.5 text-[11px]" onClick={() => setDetail(r)}>{translatePortalText("Details")}</button>
@@ -192,7 +274,7 @@ export default function Reservations() {
         actions={<>
           <button className="btn-primary" onClick={() => setCreating(true)}><Plus size={15} /> {translatePortalText("New booking")}</button>
           <ViewToggle view={view} onChange={setView} />
-          <SearchInput value={q} onChange={setQ} placeholder={translatePortalText("Search boat, guest or booking…")} />
+          <SearchInput value={q} onChange={setQ} placeholder={translatePortalText("Search boat, registration or booking…")} />
         </>} />
 
       <div className="mb-5 flex flex-wrap gap-2">
@@ -205,7 +287,21 @@ export default function Reservations() {
         ))}
       </div>
 
-      {rows.length === 0 && <div className="card"><EmptyState icon="🗓️" text={q ? translatePortalText(`Nothing matches “${q}”.`) : translatePortalText('Nothing here — smooth sailing.')} /></div>}
+      {/* A failed refresh keeps the last list on screen — say it is stale. */}
+      {state.error && state.data && (
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-2 rounded-xl bg-rose-50 px-4 py-2.5 text-xs font-semibold text-rose-700 ring-1 ring-rose-200">
+          <span>{translatePortalText('Could not refresh reservations — showing the last list loaded.')}</span>
+          <button className="btn-ghost !py-1 !px-2.5 text-[11px]" onClick={() => state.reload()}>{translatePortalText('Retry')}</button>
+        </div>
+      )}
+      {truncated && rows.length > 0 && (
+        <p className="mb-3 text-xs font-semibold text-amber-700">
+          {translatePortalTemplate('Showing the newest {{shown}} of {{total}} — search by boat, registration or booking number to find older ones.', { shown: formatPortalNumber(list.length), total: formatPortalNumber(serverTotal) })}
+        </p>
+      )}
+
+      {rows.length === 0 && (state.loading || state.refreshing) && <LoadingState label="Loading reservations…" rows={3} />}
+      {rows.length === 0 && !state.loading && !state.refreshing && <div className="card"><EmptyState icon="🗓️" text={q ? translatePortalText(`Nothing matches “${q}”.`) : translatePortalText('Nothing here — smooth sailing.')} /></div>}
 
       {rows.length > 0 && view === 'card' && (
         <div className="space-y-4">
@@ -222,7 +318,7 @@ export default function Reservations() {
                       <p className="truncate text-[13px] font-extrabold text-deep-900">{r.boatName} <span className="font-medium text-slate-400">· {formatPortalNumber(r.lengthFt)} {translatePortalText("ft")}</span></p>
                       <p className="truncate text-[11px] text-slate-400">{who?.name ?? r.plate} · {r.reservationNo}</p>
                     </div>
-                    <Badge>{translatePortalText(RESERVATION_LABELS[r.status] ?? r.status)}</Badge>
+                    <Badge>{translatePortalText(statusLabel(r))}</Badge>
                   </div>
                   <div className="mt-3 flex items-center justify-between rounded-xl bg-sand px-3 py-2.5 text-xs">
                     <span className="font-semibold text-slate-500">{formatPortalDate(new Date(`${r.startDate}T12:00:00Z`), { month: 'short', day: 'numeric', timeZone: 'UTC' })} → {formatPortalDate(new Date(`${r.endDate}T12:00:00Z`), { month: 'short', day: 'numeric', timeZone: 'UTC' })}</span>
@@ -246,7 +342,10 @@ export default function Reservations() {
           <div className="overflow-x-auto custom-scrollbar">
             <table className="w-full min-w-[920px]">
               <thead><tr className="border-b border-slate-100 bg-sand/50">
-                <th className="th">{translatePortalText("Guest & vessel")}</th><th className="th">{translatePortalText("Dates")}</th><th className="th">{translatePortalText("Berth")}</th><th className="th text-right">{translatePortalText("Total")}</th><th className="th">{translatePortalText("Status")}</th><th className="th text-right">{translatePortalText("Actions")}</th>
+                <th className="th">{translatePortalText("Guest & vessel")}</th><th className="th">{translatePortalText("Dates")}</th><th className="th">{translatePortalText("Berth")}</th><th className="th text-right">{translatePortalText("Total")}</th><th className="th">{translatePortalText("Status")}</th>
+                {/* Pinned to the trailing edge (W-21): at laptop width the
+                    table scrolls and Accept used to sit off-screen. */}
+                <th className="th sticky end-0 z-[1] bg-sand text-right">{translatePortalText("Actions")}</th>
               </tr></thead>
               <tbody>
                 <AnimatePresence>
@@ -267,9 +366,9 @@ export default function Reservations() {
                         <td className="td whitespace-nowrap text-xs font-semibold text-slate-500">{formatPortalDate(new Date(`${r.startDate}T12:00:00Z`), { month: 'short', day: 'numeric', timeZone: 'UTC' })} → {formatPortalDate(new Date(`${r.endDate}T12:00:00Z`), { month: 'short', day: 'numeric', timeZone: 'UTC' })}</td>
                         <td className="td"><span className="rounded-lg bg-ocean-50 px-2 py-1 text-xs font-extrabold text-ocean-700">{berthLabel(r.pontoon, r.slot)}</span></td>
                         <td className="td text-right font-display font-extrabold">{formatMoney(r.totalSar, currency)}</td>
-                        <td className="td"><Badge>{translatePortalText(RESERVATION_LABELS[r.status] ?? r.status)}</Badge></td>
-                        <td className="td">
-                          <div className="flex flex-wrap justify-end gap-1.5">{rowActions(r)}</div>
+                        <td className="td"><Badge>{translatePortalText(statusLabel(r))}</Badge></td>
+                        <td className="td sticky end-0 z-[1] bg-white shadow-[-8px_0_12px_-12px_rgba(15,23,42,0.35)]">
+                          <div className="flex justify-end gap-1.5 whitespace-nowrap">{rowActions(r)}</div>
                         </td>
                       </motion.tr>
                     )
@@ -286,7 +385,7 @@ export default function Reservations() {
       <Modal
         open={!!assigning}
         onClose={() => setAssigning(null)}
-        title={assigning?.status === 'pending_approval' ? translatePortalText(`Review request — ${assigning?.boatName ?? ''}`) : translatePortalText(`Move berth — ${assigning?.boatName ?? ''}`)}
+        title={assigning && statusOf(assigning) === 'pending_approval' ? translatePortalText(`Review request — ${assigning?.boatName ?? ''}`) : translatePortalText(`Move berth — ${assigning?.boatName ?? ''}`)}
         wide
       >
         {assigning && (() => {
@@ -296,8 +395,15 @@ export default function Reservations() {
           // marina wants to re-shuffle), not the required step it used to be.
           const requested = fits(assigning).find(b => b.id === assigning.slotRef)
           const others = fits(assigning).filter(b => b.id !== assigning.slotRef)
-          const isApproval = assigning.status === 'pending_approval'
+          const isApproval = statusOf(assigning) === 'pending_approval'
           return (<>
+            {/* Without the berth map every berth reads as "no longer available". */}
+            {berths.error && (
+              <div className="mb-4 flex flex-wrap items-center justify-between gap-2 rounded-xl bg-rose-50 px-4 py-2.5 text-xs font-semibold text-rose-700 ring-1 ring-rose-200">
+                <span>{translatePortalText('Could not load the berth map, so berth availability is unknown.')}</span>
+                <button className="btn-ghost !py-1 !px-2.5 text-[11px]" onClick={() => berths.reload()}>{translatePortalText('Retry')}</button>
+              </div>
+            )}
             {isApproval && (
               <div className="mb-4 rounded-2xl bg-ocean-50 p-4 ring-1 ring-ocean-200">
                 <p className="text-xs font-bold uppercase tracking-wider text-ocean-700">{translatePortalText("Berth the boater requested")}</p>
@@ -380,7 +486,7 @@ export default function Reservations() {
               <div className="flex items-center gap-3">
                 <img src={avatarFor(who?.name, who?.avatar)} className="h-12 w-12 rounded-2xl object-cover" alt="" />
                 <div>
-                  <p className="font-bold text-deep-900">{who?.name ?? translatePortalText('Berth holder')} <Badge>{translatePortalText(RESERVATION_LABELS[detail.status] ?? detail.status)}</Badge></p>
+                  <p className="font-bold text-deep-900">{who?.name ?? translatePortalText('Berth holder')} <Badge>{translatePortalText(statusLabel(detail))}</Badge></p>
                   <p className="text-xs text-slate-400">{who?.email}{who?.phone ? ` · ${who.phone}` : ''}</p>
                 </div>
               </div>
@@ -389,7 +495,10 @@ export default function Reservations() {
                   ['Vessel', `${detail.boatName} · ${detail.plate}`],
                   ['Dates', `${detail.startDate} → ${detail.endDate}`],
                   ['Berth', berthLabel(detail.pontoon, detail.slot)],
-                  ['Term', translatePortalText(`${detail.months} month${detail.months === 1 ? '' : 's'}`)],
+                  // Plan leases are booked in days (a 7-day plan has `months: 0`).
+                  ['Term', detail.months > 0
+                    ? translatePortalText(`${detail.months} month${detail.months === 1 ? '' : 's'}`)
+                    : translatePortalTemplate('{{days}} days', { days: formatPortalNumber((detail as ApiReservation & { days?: number }).days ?? 0) })],
                   ['Berth fee', formatMoney(detail.priceSar, currency)],
                   ['VAT', formatMoney(detail.vatSar, currency)],
                   ['Total', formatMoney(detail.totalSar, currency)],
@@ -439,28 +548,24 @@ export default function Reservations() {
                             </p>
                           </div>
                         </div>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setInspectingDoc({
-                              fileUrl: doc.url || fileUrl(doc.url) || '',
-                              fileName: doc.name || 'document.pdf',
-                              docType: doc.key || 'boat_registration',
-                              status: 'analyzed',
-                              fields: [
-                                { key: 'vesselName', label: translatePortalText('Vessel Name'), value: detail.boatName || '—', confidence: 0.95 },
-                                { key: 'registrationNumber', label: translatePortalText('Plate / Reg #'), value: detail.plate || '—', confidence: 0.98 },
-                                { key: 'holderName', label: translatePortalText('Holder Name'), value: personOf(detail.subscriber)?.name || '—', confidence: 0.94 },
-                              ],
-                              missingFields: [],
-                              validation: [],
-                              confidence: { overall: 0.96 },
-                              createdAt: doc.uploadedAt || detail.createdAt,
-                            } as any);
-                          }}
-                          className="btn-secondary !py-1 !px-2.5 text-xs flex items-center gap-1 shrink-0"
+                        {/*
+                          This used to open the AI verification modal with a
+                          reading invented on the spot — the reservation's own
+                          boat name, plate and holder echoed back as "extracted"
+                          at 94–98% confidence, status "analyzed" — and its
+                          Approve/Reject did nothing (no document id). Files
+                          attached to a reservation are never analysed, so the
+                          button now opens the real file.
+                        */}
+                        <a
+                          href={fileUrl(doc.url) || doc.url || undefined}
+                          target="_blank"
+                          rel="noreferrer"
+                          aria-disabled={!doc.url}
+                          onClick={e => { if (!doc.url) e.preventDefault() }}
+                          className={`btn-secondary !py-1 !px-2.5 text-xs flex items-center gap-1 shrink-0 ${doc.url ? '' : 'pointer-events-none opacity-50'}`}
                         >
-                          <Eye className="w-3.5 h-3.5" /> {translatePortalText("Inspect AI\n                        ")}</button>
+                          <Eye className="w-3.5 h-3.5" /> {translatePortalText("Open document")}</a>
                       </div>
                     ))}
                   </div>
@@ -483,27 +588,56 @@ export default function Reservations() {
                 </p>
               )}
 
+              {/* The reservation carries no refund figure of its own; the refund
+                  and its credit note live on the billing side. */}
+              {detail.paidAt && ['cancelled', 'declined'].includes(statusOf(detail)) && (
+                <p className="rounded-xl bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                  {translatePortalTemplate('Paid {{paid}} before it was called off. Any refund and its credit note (CN-…) are listed in Billing & Payments.', { paid: formatMoney(paidSar(detail), currency) })}{' '}
+                  <a href="#/billing" className="font-bold underline">{translatePortalText('Open Billing →')}</a>
+                </p>
+              )}
+
               <div className="flex justify-end gap-2">
-                {!['cancelled', 'completed', 'declined', 'expired'].includes(detail.status) && (
+                {!['cancelled', 'completed', 'declined', 'expired'].includes(statusOf(detail)) && (
                   <button className="btn-ghost hover:!bg-rose-50 hover:text-rose-500" disabled={busy}
-                    onClick={() =>
-                      confirmAndRun({
+                    onClick={() => {
+                      /*
+                        BK-16: the dialog now says what this cancellation costs.
+                        A marina calling off a paid berth refunds the boater at
+                        the provider-cancellation rate out of the marina's own
+                        earnings; a card only held for the request is released.
+                      */
+                      const paid = paidSar(detail)
+                      const refund = refundSar(detail)
+                      const money = detail.paidAt
+                        ? paid > 0
+                          ? translatePortalTemplate('The boater paid {{paid}}. Because the marina is cancelling, {{refund}} ({{pct}}%) is refunded to them and taken back from your earnings — the card-processing fee is not returned — and a credit note is issued.', { paid: formatMoney(paid, currency), refund: formatMoney(refund, currency), pct: formatPortalNumber(refundPct(detail)) })
+                          : translatePortalText('This reservation is marked paid but no card payment is on record, so nothing is refunded automatically — settle any refund at the desk.')
+                        : detail.cardHold?.status === 'held'
+                          ? translatePortalTemplate('Nothing was charged — the {{amount}} hold on their card is released.', { amount: formatMoney(detail.cardHold.amountSar, currency) })
+                          : translatePortalText('Nothing was paid, so there is nothing to refund.')
+                      return confirmAndRun({
                         title: `Cancel ${detail.reservationNo}?`,
-                        body: 'The berth is released and the boater is notified. Tell them why:',
+                        body: `${money} ${translatePortalText('The berth is released and the boater is notified. Tell them why:')}`,
                         input: { label: 'Cancellation reason', placeholder: 'Shown to the boater', required: true, multiline: true, maxLength: 300 },
                         confirmLabel: 'Cancel reservation',
                         cancelLabel: 'Keep it',
                         busyLabel: 'Cancelling...',
                         danger: true,
                         run: async (reason) => {
-                          await reservationsApi.cancel(detail.id, reason)
+                          const res = await reservationsApi.cancel(detail.id, reason)
                           setDetail(null)
                           await refresh()
+                          // The server's own figure, not the quote above.
+                          return (res.data as { refund?: { amountSar?: number } }).refund?.amountSar ?? 0
                         },
-                        success: translatePortalText(`${detail.reservationNo} cancelled`),
-                        error: translatePortalText('Could not cancel the reservation. Please try again.'),
+                        success: (refunded) => refunded > 0
+                          ? translatePortalTemplate('{{no}} cancelled — {{amount}} is being refunded to the boater', { no: detail.reservationNo, amount: formatMoney(refunded, currency) })
+                          : translatePortalText(`${detail.reservationNo} cancelled`),
+                        // The server says why (a gateway refusal, a lease already ended…).
+                        error: (e) => (e instanceof Error && e.message) || 'Could not cancel the reservation. Please try again.',
                       })
-                    }>{translatePortalText("Cancel reservation")}</button>
+                    }}>{translatePortalText("Cancel reservation")}</button>
                 )}
                 <button className="btn-primary" onClick={() => setDetail(null)}>{translatePortalText("Done")}</button>
               </div>
@@ -527,12 +661,23 @@ export default function Reservations() {
         <p className="text-sm text-slate-500">
           <bdi dir="auto">{localizedField<string>(declining, 'boatName') ?? declining?.boatName}</bdi> {translatePortalText('requested this berth:')} {declining ? berthLabel(declining.pontoon, declining.slot) : ''}. {translatePortalText('The boater will be notified immediately, and the berth will be released.')}
         </p>
-        <label className="label mt-4">{translatePortalText("Reason (sent to the boater)")}</label>
-        <textarea className="input min-h-[90px]" value={reason} onChange={e => setReason(e.target.value)}
+        {/* What declining does with their money — the server refunds a paid request at the provider rate. */}
+        {declining && (declining.paidAt || declining.cardHold?.status === 'held') && (
+          <p className="mt-3 rounded-xl bg-amber-50 px-3 py-2 text-xs text-amber-800">
+            {declining.paidAt
+              ? paidSar(declining) > 0
+                ? translatePortalTemplate('They already paid {{paid}} — {{refund}} ({{pct}}%) is refunded to them and taken back from your earnings; the card-processing fee is not returned.', { paid: formatMoney(paidSar(declining), currency), refund: formatMoney(refundSar(declining), currency), pct: formatPortalNumber(refundPct(declining)) })
+                : translatePortalText('This request is marked paid but no card payment is on record, so nothing is refunded automatically — settle any refund at the desk.')
+              : translatePortalTemplate('Nothing was charged — the {{amount}} hold on their card is released.', { amount: formatMoney(declining.cardHold!.amountSar, currency) })}
+          </p>
+        )}
+        <label className="label mt-4">{translatePortalText("Reason (sent to the boater)")} *</label>
+        <textarea className="input min-h-[90px]" value={reason} maxLength={500} onChange={e => setReason(e.target.value)}
           placeholder={translatePortalText("e.g. Boat exceeds the berth's beam · Pontoon closed for works")} />
+        {!reason.trim() && <p className="mt-1 text-[11px] text-slate-400">{translatePortalText('Tell the boater why the request is declined')}</p>}
         <div className="mt-6 flex justify-end gap-2">
           <button className="btn-ghost" onClick={() => { setDeclining(null); setReason('') }}>{translatePortalText("Keep request")}</button>
-          <button className="btn-primary !bg-rose-500 hover:!bg-rose-600" disabled={busy} onClick={submitDecline}>{translatePortalText("Decline request")}</button>
+          <button className="btn-primary !bg-rose-500 hover:!bg-rose-600" disabled={busy || !reason.trim()} onClick={submitDecline}>{translatePortalText("Decline request")}</button>
         </div>
       </Modal>
 
@@ -667,7 +812,7 @@ function NewBookingModal({ open, onClose, onCreated, berths, currency }: {
           </select>
           {ferrs.berthId && <p className="mt-1 text-xs font-semibold text-rose-500">{translatePortalText(ferrs.berthId)}</p>}
         </div>
-        <div><label className="label">{translatePortalText("Months")}</label><input type="number" min={1} max={60} className="input" value={f.months} onChange={e => setF(s => ({ ...s, months: Math.max(1, Number(e.target.value)) }))} /></div>
+        <div><label className="label">{translatePortalText("Months")}</label><input type="number" min={1} max={60} className="input" value={f.months} onChange={e => setF(s => ({ ...s, months: Math.min(60, Math.max(1, Math.floor(Number(e.target.value) || 1))) }))} /></div>
         <DateField label={translatePortalText('Starts')} value={f.startDate} onChange={d => setF(s => ({ ...s, startDate: d }))} />
         <div className="sm:col-span-2"><label className="label">{translatePortalText("Notes")}</label><textarea className="input" rows={2} value={f.notes} onChange={e => setF(s => ({ ...s, notes: e.target.value }))} placeholder={translatePortalText("Requests, shore power, arrival ETA…")} /></div>
       </div>
@@ -679,7 +824,11 @@ function NewBookingModal({ open, onClose, onCreated, berths, currency }: {
               : translatePortalText('That berth has no monthly tariff — set one on the Berth Management page first')
             : translatePortalText('Pick a berth to price the booking')}
         </p>
-        <p className="font-display text-xl font-extrabold text-deep-900">{total != null ? formatMoney(total, currency) : '—'}</p>
+        {/* The berth fee before VAT — the server adds the marina's VAT rate when it prices the booking. */}
+        <p className="text-end font-display text-xl font-extrabold text-deep-900">
+          {total != null ? formatMoney(total, currency) : '—'}
+          {total != null && <span className="block text-[10px] font-semibold text-slate-400">{translatePortalText('excl. VAT')}</span>}
+        </p>
       </div>
       <div className="mt-4 flex justify-end gap-2">
         <button onClick={onClose} className="btn-ghost">{translatePortalText("Cancel")}</button>

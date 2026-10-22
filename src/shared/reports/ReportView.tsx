@@ -93,6 +93,10 @@ export function ReportView({
   const [busy, setBusy] = React.useState(true)
   const [error, setError] = React.useState('')
   const [reloadTick, setReloadTick] = React.useState(0)
+  // The filters/actions list failing is its own error: the report can still run,
+  // but silently losing the Filters button read as "this report has no filters".
+  const [metaError, setMetaError] = React.useState<string | null>(null)
+  const [metaTick, setMetaTick] = React.useState(0)
   const [downloading, setDownloading] = React.useState<ExportFormat | null>(null)
   const [runningAction, setRunningAction] = React.useState<string | null>(null)
 
@@ -108,6 +112,7 @@ export function ReportView({
   // What filters, actions and groupings this report offers.
   React.useEffect(() => {
     let alive = true
+    setMetaError(null)
     reportApi
       .filters(entry.key)
       .then(res => {
@@ -115,9 +120,13 @@ export function ReportView({
         setMeta({ filters: res.data.filters ?? [], actions: res.data.actions ?? [], grains: res.data.granularities ?? [] })
         if (res.data.defaultPageSize) setPageSize(res.data.defaultPageSize)
       })
-      .catch(() => { if (alive) setMeta({ filters: [], actions: [], grains: [] }) })
+      .catch(e => {
+        if (!alive) return
+        setMeta({ filters: [], actions: [], grains: [] })
+        setMetaError(errorMessage(e) || translatePortalText('Could not load the filters for this report'))
+      })
     return () => { alive = false }
-  }, [entry.key])
+  }, [entry.key, metaTick])
 
   // Debounced: the server re-runs the whole report, which is not a per-keystroke operation.
   React.useEffect(() => {
@@ -477,6 +486,7 @@ export function ReportView({
       </section>
 
       {/* ── The result ────────────────────────────────────── */}
+      {metaError && <div className="mb-5"><ErrorNotice message={metaError} onRetry={() => setMetaTick(n => n + 1)} /></div>}
       {error && <div className="mb-5"><ErrorNotice message={error} onRetry={() => setReloadTick(n => n + 1)} /></div>}
 
       {!run && !error ? (

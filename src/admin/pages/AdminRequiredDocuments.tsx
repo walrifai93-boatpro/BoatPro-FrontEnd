@@ -114,6 +114,15 @@ export function AdminRequiredDocuments() {
   )
   const changeCount = dirty.length + dirtyAuto.length
 
+  // Closing or reloading the tab with unsaved rules asks first — the draft lives
+  // only in this page's state, and the work is a dozen clicks per provider type.
+  useEffect(() => {
+    if (!changeCount) return
+    const warn = (e: BeforeUnloadEvent) => { e.preventDefault(); e.returnValue = '' }
+    window.addEventListener('beforeunload', warn)
+    return () => window.removeEventListener('beforeunload', warn)
+  }, [changeCount])
+
   if (loadError) {
     return (
       <PageWrap>
@@ -138,6 +147,10 @@ export function AdminRequiredDocuments() {
   const rule = toRule(levels, catalogueKeys)
   const isCustom = data.customised.includes(active)
   const onDefaults = sameRule(rule, data.defaults[active])
+
+  // Rows the server drops for this provider type whatever is saved — fuel
+  // stations are never asked for an identity document.
+  const locked = data.neverAsked?.[active] ?? []
 
   const setLevel = (docType: string, level: Level) =>
     setDraft((d) => (d ? { ...d, [active]: { ...d[active], [docType]: level } } : d))
@@ -290,7 +303,8 @@ export function AdminRequiredDocuments() {
               <p className="mb-2 text-[10px] font-extrabold uppercase tracking-[0.2em] text-slate-400">{translatePortalText(GROUP_LABEL[group])}</p>
               <div className="divide-y divide-slate-100 rounded-xl border border-slate-200/70">
                 {items.map((item) => {
-                  const level = levels[item.docType] ?? 'off'
+                  const isLocked = locked.includes(item.docType)
+                  const level = isLocked ? 'off' : levels[item.docType] ?? 'off'
                   const changed = level !== (data.rules[active].required.includes(item.docType)
                     ? 'required'
                     : data.rules[active].optional.includes(item.docType) ? 'optional' : 'off')
@@ -301,9 +315,11 @@ export function AdminRequiredDocuments() {
                           {translatePortalText(item.label)}
                           {changed && <span className="text-[11px] font-bold text-amber-600">{translatePortalText("Unsaved")}</span>}
                         </p>
-                        {DOC_HINT[item.docType] && <p className="mt-0.5 text-xs text-slate-500">{translatePortalText(DOC_HINT[item.docType])}</p>}
+                        {isLocked
+                          ? <p className="mt-0.5 text-xs text-slate-500">{translatePortalText('Fuel stations are vetted as a business and are never asked for an identity document.')}</p>
+                          : DOC_HINT[item.docType] && <p className="mt-0.5 text-xs text-slate-500">{translatePortalText(DOC_HINT[item.docType])}</p>}
                       </div>
-                      <div className="flex shrink-0 rounded-lg border border-slate-200 bg-sand p-0.5" role="radiogroup" aria-label={`${translatePortalText(item.label)} requirement`}>
+                      <div className={`flex shrink-0 rounded-lg border border-slate-200 bg-sand p-0.5 ${isLocked ? 'opacity-60' : ''}`} role="radiogroup" aria-label={`${translatePortalText(item.label)} requirement`}>
                         {LEVELS.map((l) => {
                           const on = level === l.key
                           const tone =
@@ -313,8 +329,9 @@ export function AdminRequiredDocuments() {
                               key={l.key}
                               role="radio"
                               aria-checked={on}
+                              disabled={isLocked}
                               onClick={() => setLevel(item.docType, l.key)}
-                              className={`rounded-md px-3 py-1.5 text-[12px] font-semibold transition ${on ? tone : 'text-slate-500 hover:text-deep-900'}`}
+                              className={`rounded-md px-3 py-1.5 text-[12px] font-semibold transition disabled:cursor-not-allowed ${on ? tone : 'text-slate-500 hover:text-deep-900'}`}
                             >
                               {translatePortalText(l.label)}
                             </button>

@@ -2,8 +2,8 @@ import React, { useMemo } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { motion } from 'framer-motion'
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar, PieChart, Pie, Cell, Legend } from 'recharts'
-import { DollarSign, Droplets, Hourglass, Truck, CheckCircle2, AlertTriangle, ArrowRight, Wind, Eye, Sun, Waves } from 'lucide-react'
-import { stationCoverPhotos, notifStyle, relativeTime, toDelivery, toTank, toVehicle } from '../fuelData'
+import { DollarSign, Droplets, Hourglass, ClipboardList, CheckCircle2, AlertTriangle, ArrowRight, Wind, Eye, Sun, Waves } from 'lucide-react'
+import { stationCoverPhotos, notifStyle, relativeTime, toBooking, toPump, toTank } from '../fuelData'
 import { useFuel, useFuelResource } from '../fuelStore'
 import { fuelApi } from '../fuelApi'
 import { StatCard, Section, CoverPhoto, Counter, LoadingState } from '../../ui'
@@ -50,8 +50,11 @@ export default function FuelDashboard() {
   const model = useMemo(() => {
     if (!overview) return null
     const tanks = overview.tanks.map(toTank)
-    const vehicles = overview.vehicles.map(toVehicle)
-    const active = overview.activeDeliveries.map(toDelivery)
+    // Fuel is served at the station only: the work in hand is boats due at, or
+    // alongside, the fuel dock — and the pumps that will serve them. (This was
+    // dispatched delivery runs and the barge/truck fleet.)
+    const open = (overview.openOrders ?? []).map(toBooking)
+    const pumps = (overview.pumps ?? []).map(toPump)
     const lowTanks = tanks.filter((t) => t.status === 'Low' || t.status === 'Critical')
 
     // The dashboard chart only shows trading hours — a 24-bar day is mostly
@@ -75,7 +78,7 @@ export default function FuelDashboard() {
       })
       .sort((a, b) => b.value - a.value)
 
-    return { tanks, vehicles, active, lowTanks, hourly, monthly, fuelMix }
+    return { tanks, open, pumps, lowTanks, hourly, monthly, fuelMix }
   }, [overview, fuelByKey])
 
   if (loading && !overview) return <LoadingState label={translatePortalText("Loading your fuel operation…")} rows={6} />
@@ -88,6 +91,7 @@ export default function FuelDashboard() {
   const stationName = localizedField<string>(station, 'name', station?.name)
   const stationCity = localizedField<string>(station, 'city', station?.city)
   const firstName = stationName?.split(' ')[0]
+  const openCount = kpis.openOrders ?? kpis.activeDeliveries
 
   return (
     <div className="space-y-6">
@@ -105,18 +109,18 @@ export default function FuelDashboard() {
             </p>
             <h1 className="mt-2 font-display text-3xl md:text-4xl font-extrabold">{firstName ? <>{translatePortalText("Good day, ")}{firstName}</> : translatePortalText("Good day")} ⛽</h1>
             <p className="mt-2 max-w-xl text-sm text-white/70">
-              {kpis.pendingOrders} {translatePortalText(kpis.pendingOrders === 1 ? 'new order waiting' : 'new orders waiting')} · {kpis.activeDeliveries} {translatePortalText(kpis.activeDeliveries === 1 ? 'delivery in progress' : 'deliveries in progress')}.
+              {kpis.pendingOrders} {translatePortalText(kpis.pendingOrders === 1 ? 'new order waiting' : 'new orders waiting')} · {openCount} {translatePortalText(openCount === 1 ? 'order in progress' : 'orders in progress')}.
               {model.lowTanks.length > 0
                 ? translatePortalText(`${model.lowTanks.map((t) => t.code).join(', ')} are below the reorder point — raise a purchase order.`)
                 : translatePortalText("All tanks are above their reorder points.")}
             </p>
             <div className="mt-5 flex flex-wrap gap-2.5">
               <Link to="/fuel/bookings" className="btn-fuel">{translatePortalText("Review ")}{kpis.pendingOrders}{translatePortalText(" orders ")}<ArrowRight size={15} className="rtl:rotate-180" /></Link>
-              <Link to="/fuel/tracking" className="btn-ghost !bg-white/10 !border-white/20 !text-white hover:!bg-white/20">{translatePortalText("Open live tracking")}</Link>
+              <Link to="/fuel/deliveries" className="btn-ghost !bg-white/10 !border-white/20 !text-white hover:!bg-white/20">{translatePortalText("Manage orders")}</Link>
             </div>
           </div>
           <div className="flex gap-4">
-            {[{ n: Math.round(kpis.volumeToday), l: 'Volume sold today' }, { n: kpis.activeDeliveries, l: 'Active deliveries' }, { n: onDuty.length, l: 'Staff on duty' }].map((s, i) => (
+            {[{ n: Math.round(kpis.volumeToday), l: 'Volume sold today' }, { n: openCount, l: 'Orders in progress' }, { n: onDuty.length, l: 'Staff on duty' }].map((s, i) => (
               <motion.div key={s.l} initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.3 + i * 0.1 }}
                 className="rounded-2xl bg-white/10 px-5 py-4 text-center backdrop-blur border border-white/15">
                 <p className="font-display text-3xl font-extrabold"><Counter value={s.n} /></p>
@@ -141,7 +145,7 @@ export default function FuelDashboard() {
             <p className="text-xs text-rose-500">
               {emergency.quantity.toLocaleString(portalLocale())} {fuelByKey(emergency.fuelType).unit} {fuelByKey(emergency.fuelType).name} · {emergency.location ?? '—'}{translatePortalText(" · requested ASAP")}</p>
           </div>
-          <Link to="/fuel/bookings" className="btn-primary !bg-gradient-to-r !from-rose-600 !to-rose-400 !shadow-none">{translatePortalText("Dispatch now")}</Link>
+          <Link to="/fuel/bookings" className="btn-primary !bg-gradient-to-r !from-rose-600 !to-rose-400 !shadow-none">{translatePortalText("Review now")}</Link>
         </motion.div>
       )}
 
@@ -154,7 +158,7 @@ export default function FuelDashboard() {
         <StatCard i={0} label={translatePortalText(`Total revenue · ${new Date().toLocaleDateString(portalLocale(), { month: 'long' })}`)} value={kpis.revenueMonth} currency={currency} icon={<DollarSign size={20} />} tone="navy" spark={spark(model.monthly.map(m => m.diesel + m.petrol + m.other))} to="/fuel/billing" />
         <StatCard i={1} label={translatePortalText("Today's fuel sales")} value={kpis.salesToday} currency={currency} icon={<Droplets size={20} />} tone="amber" spark={spark(model.hourly.map(h => h.gal))} to="/fuel/reports" />
         <StatCard i={2} label={translatePortalText("Pending orders")} value={kpis.pendingOrders} icon={<Hourglass size={20} />} tone="violet" to="/fuel/bookings" />
-        <StatCard i={3} label={translatePortalText("Active deliveries")} value={kpis.activeDeliveries} icon={<Truck size={20} />} tone="ocean" to="/fuel/deliveries" />
+        <StatCard i={3} label={translatePortalText("Orders in progress")} value={openCount} icon={<ClipboardList size={20} />} tone="ocean" to="/fuel/deliveries" />
         <StatCard i={4} label={translatePortalText("Completed today")} value={kpis.completedToday} icon={<CheckCircle2 size={20} />} tone="green" to="/fuel/bookings" />
         <StatCard i={5} label={translatePortalText("Low stock alerts")} value={kpis.lowStockAlerts} icon={<AlertTriangle size={20} />} tone="rose" to="/fuel/inventory" />
       </div>
@@ -168,7 +172,7 @@ export default function FuelDashboard() {
 
       {/* ── Sales chart + inventory status ── */}
       <div className="grid gap-5 lg:grid-cols-3">
-        <Section title={translatePortalText("Fuel sales — today by hour")} sub={translatePortalText("All pumps, barge & mobile units combined")} className="lg:col-span-2"
+        <Section title={translatePortalText("Fuel sales — today by hour")} sub={translatePortalText("All pumps combined")} className="lg:col-span-2"
           actions={<Link to="/fuel/reports" className="btn-ghost !py-1.5 !px-3 text-xs">{translatePortalText("Full report")}</Link>}>
           <ResponsiveContainer width="100%" height={260}>
             <AreaChart data={model.hourly} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
@@ -186,7 +190,7 @@ export default function FuelDashboard() {
           </ResponsiveContainer>
         </Section>
 
-        <Section title={translatePortalText("Weather & marine")} sub={translatePortalText(stationCity ? `${stationCity} · barge ops window` : 'Barge ops window')}>
+        <Section title={translatePortalText("Weather & marine")} sub={translatePortalText(stationCity ? `${stationCity} · fuel dock conditions` : 'Fuel dock conditions')}>
           {weather.error || !w ? (
             <p className="rounded-2xl bg-sand px-4 py-8 text-center text-xs font-semibold text-slate-400">
               {weather.loading ? translatePortalText("Loading conditions…") : translatePortalText("Live conditions are unavailable right now.")}
@@ -215,7 +219,7 @@ export default function FuelDashboard() {
             </div>
             {w.warning && (
               <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs font-semibold text-amber-700">
-                ⚠️ {translatePortalText(w.warning)}{translatePortalText(" — secure barge ops.")}</div>
+                ⚠️ {translatePortalText(w.warning)}{translatePortalText(" — take care at the fuel dock.")}</div>
             )}
           </>)}
         </Section>
@@ -270,50 +274,49 @@ export default function FuelDashboard() {
         </Section>
       </div>
 
-      {/* ── Deliveries + vehicles + staff ── */}
+      {/* ── Orders in progress + pumps + notifications ── */}
       <div className="grid gap-5 lg:grid-cols-3">
-        <Section title={translatePortalText("Active deliveries")} sub={translatePortalText("Barge, truck & dockside operations")}
-          actions={<Link to="/fuel/deliveries" className="btn-ghost !py-1.5 !px-3 text-xs">{translatePortalText("All deliveries")}</Link>}>
+        <Section title={translatePortalText("Orders in progress")} sub={translatePortalText("Boats due at, or alongside, your fuel dock")}
+          actions={<Link to="/fuel/deliveries" className="btn-ghost !py-1.5 !px-3 text-xs">{translatePortalText("All orders")}</Link>}>
           <div className="space-y-2.5">
-            {model.active.length === 0 && <p className="rounded-xl bg-sand px-3 py-6 text-center text-xs font-semibold text-slate-400">{translatePortalText("Nothing in motion right now.")}</p>}
-            {model.active.map((d, i) => (
-              <motion.div key={d.id} initial={{ opacity: 0, x: -14 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: i * 0.07 }}
+            {model.open.length === 0 && <p className="rounded-xl bg-sand px-3 py-6 text-center text-xs font-semibold text-slate-400">{translatePortalText("No boats due at the fuel dock right now.")}</p>}
+            {model.open.map((b, i) => (
+              <motion.div key={b.id} initial={{ opacity: 0, x: -14 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: i * 0.07 }}
                 className="rounded-2xl border border-slate-100 bg-sand/60 p-3">
                 <div className="flex items-center gap-2.5">
-                  <VendorLogoBadge logoUrl={(d as any).boatLogo || (d as any).providerLogo || d.driverAvatar} name={d.boat} role="boat_provider" size="sm" />
+                  <VendorLogoBadge logoUrl={b.avatar} name={b.boat} role="boat_provider" size="sm" />
                   <div className="min-w-0 flex-1">
-                    <p className="truncate text-[13px] font-extrabold text-deep-900">{d.boat} · {d.qty.toLocaleString(portalLocale())} {fuelByKey(d.fuel).unit}</p>
-                    <p className="truncate text-[11px] text-slate-400">{d.vehicle} · {d.route}</p>
+                    <p className="truncate text-[13px] font-extrabold text-deep-900">{b.boat} · {b.qty.toLocaleString(portalLocale())} {fuelByKey(b.fuel).unit}</p>
+                    <p className="truncate text-[11px] text-slate-400">{b.ref} · {b.date} {b.time}</p>
                   </div>
-                  <FBadge dot>{d.status}</FBadge>
-                </div>
-                <div className="mt-2 flex items-center gap-2">
-                  <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-slate-100">
-                    <motion.div initial={{ width: 0 }} animate={{ width: `${d.progress}%` }} transition={{ duration: 1 }}
-                      className="h-full rounded-full bg-gradient-to-r from-amber-500 to-orange-400" />
-                  </div>
-                  <span className="text-[10px] font-bold text-slate-400">{translatePortalText("ETA ")}{d.eta}</span>
+                  <span className="flex shrink-0 items-center gap-1">
+                    <FBadge dot={b.status === 'In progress'}>{b.status}</FBadge>
+                    {b.paid && <span className="rounded-md bg-emerald-50 px-1.5 py-0.5 text-[9px] font-extrabold text-emerald-700">{translatePortalText("✓ Paid")}</span>}
+                  </span>
                 </div>
               </motion.div>
             ))}
           </div>
         </Section>
 
-        <Section title={translatePortalText("Delivery vehicles")} sub={translatePortalText("Fleet readiness right now")}
-          actions={<Link to="/fuel/tracking" className="btn-ghost !py-1.5 !px-3 text-xs">{translatePortalText("Track fleet")}</Link>}>
+        <Section title={translatePortalText("Fuel dock pumps")} sub={translatePortalText("Pump readiness right now")}
+          actions={<Link to="/fuel/inventory" className="btn-ghost !py-1.5 !px-3 text-xs">{translatePortalText("Manage pumps")}</Link>}>
           <div className="space-y-2.5">
-            {model.vehicles.length === 0 && <p className="rounded-xl bg-sand px-3 py-6 text-center text-xs font-semibold text-slate-400">{translatePortalText("No delivery vehicles registered.")}</p>}
-            {model.vehicles.map((v, i) => (
-              <motion.div key={v.id} initial={{ opacity: 0, x: 14 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: i * 0.07 }}
-                className="flex items-center gap-3 rounded-2xl border border-slate-100 p-2.5">
-                <span className="grid h-10 w-10 place-items-center rounded-xl bg-amber-50 text-xl">{v.icon}</span>
-                <div className="min-w-0 flex-1">
-                  <p className="text-[13px] font-extrabold text-deep-900">{v.name}</p>
-                  <p className="text-[11px] text-slate-400">{translatePortalText(v.type)} · {v.load.toLocaleString(portalLocale())} / {v.capacity.toLocaleString(portalLocale())}</p>
-                </div>
-                <FBadge dot={v.status === 'On delivery'}>{v.status}</FBadge>
-              </motion.div>
-            ))}
+            {model.pumps.length === 0 && <p className="rounded-xl bg-sand px-3 py-6 text-center text-xs font-semibold text-slate-400">{translatePortalText("No pumps registered yet.")}</p>}
+            {model.pumps.map((p, i) => {
+              const f = fuelByKey(p.fuel)
+              return (
+                <motion.div key={p.id} initial={{ opacity: 0, x: 14 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: i * 0.07 }}
+                  className="flex items-center gap-3 rounded-2xl border border-slate-100 p-2.5">
+                  <span className="grid h-10 w-10 place-items-center rounded-xl bg-amber-50 text-xl">{f.icon}</span>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-[13px] font-extrabold text-deep-900">{p.name}</p>
+                    <p className="text-[11px] text-slate-400">{p.code} · {f.name}</p>
+                  </div>
+                  <FBadge dot={p.status === 'Dispensing'}>{p.status}</FBadge>
+                </motion.div>
+              )
+            })}
           </div>
         </Section>
 

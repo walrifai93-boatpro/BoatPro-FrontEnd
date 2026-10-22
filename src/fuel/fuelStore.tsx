@@ -25,7 +25,7 @@ interface FuelContextValue {
   ticker: string[]
   counts: {
     pendingOrders: number
-    activeDeliveries: number
+    openOrders: number
     lowStock: number
     unread: number
     emergencies: number
@@ -108,14 +108,18 @@ export function FuelProvider({ children }: { children: React.ReactNode }) {
       const list = r.data.stations
       setStations(list)
       setCurrentStationIdState((prev) => {
-        const serverStationId = r.data.station?.id
-        if (serverStationId && list.some((s) => s.id === serverStationId)) {
-          persist(serverStationId)
-          return serverStationId
-        }
+        /*
+          The operator's own choice wins. This used to prefer the server's
+          `station` — which, asked without an id, is simply the oldest station —
+          and it runs again on every switch (the effect below depends on `load`,
+          which changes with the station). So picking a station snapped straight
+          back to the first one, and a company whose first station was rejected
+          could never see the orders at its live ones.
+        */
         if (prev === ALL_STATIONS) return prev
         if (prev && list.some((s) => s.id === prev)) return prev
-        const fallback = serverStationId ?? list[0]?.id ?? null
+        const serverStationId = r.data.station?.id
+        const fallback = (serverStationId && list.some((s) => s.id === serverStationId) ? serverStationId : list[0]?.id) ?? null
         persist(fallback)
         return fallback
       })
@@ -254,7 +258,7 @@ export function FuelProvider({ children }: { children: React.ReactNode }) {
       ticker,
       counts: {
         pendingOrders: overview?.kpis.pendingOrders ?? 0,
-        activeDeliveries: overview?.kpis.activeDeliveries ?? 0,
+        openOrders: overview?.kpis.openOrders ?? overview?.kpis.activeDeliveries ?? 0,
         lowStock: overview?.kpis.lowStockAlerts ?? 0,
         unread: overview?.alerts.filter((n) => !n.isRead).length ?? 0,
         emergencies: overview?.emergencyBooking ? 1 : 0,

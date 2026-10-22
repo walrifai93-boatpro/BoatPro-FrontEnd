@@ -82,8 +82,10 @@ export function AdminTestingTools() {
       const res = await testingToolsApi.update({ fakeFillEnabled: next })
       setData((d) => ({ ...(d ?? {}), ...res.data }))
       toast(translatePortalText(next ? 'Fake fill is on — the button shows on the next form opened' : 'Fake fill is off'))
-      // Picks up "who changed it" for the line under the switch.
-      load()
+      // Picks up "who changed it" for the line under the switch. Quietly: the
+      // save has already succeeded, and `load()` would swap the whole page for
+      // a load error if this follow-up read failed.
+      testingToolsApi.adminGet().then((r) => setData(r.data)).catch(() => {})
     } catch (err) {
       toast(translatePortalText(`Could not save: ${errorMessage(err)}`), 'warn')
     } finally {

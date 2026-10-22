@@ -28,8 +28,10 @@ function loadImage(file: File): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const url = URL.createObjectURL(file)
     const img = new Image()
-    img.onload = () => resolve(img)
-    img.onerror = () => reject(new Error('That file is not an image the browser can read'))
+    // The pixels are copied onto a canvas straight away, so the blob URL is
+    // done with once decoded either way — it was never released.
+    img.onload = () => { URL.revokeObjectURL(url); resolve(img) }
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('That file is not an image the browser can read')) }
     img.src = url
   })
 }
@@ -81,7 +83,7 @@ function removeBackground(d: Uint8ClampedArray, w: number, h: number, bg: Rgb, t
 }
 
 /** Draws `img` processed onto a fresh 512×512 transparent canvas. */
-export function prepare(img: HTMLImageElement, opts: { remove: boolean; tol: number }): { canvas: HTMLCanvasElement; alreadyClear: boolean } {
+export function prepare(img: HTMLImageElement, opts: { remove: boolean; tol: number }): { canvas: HTMLCanvasElement; alreadyClear: boolean; empty?: boolean } {
   const scale = Math.min(1, 1024 / Math.max(img.naturalWidth, img.naturalHeight))
   const w = Math.max(1, Math.round(img.naturalWidth * scale))
   const h = Math.max(1, Math.round(img.naturalHeight * scale))
@@ -110,7 +112,9 @@ export function prepare(img: HTMLImageElement, opts: { remove: boolean; tol: num
   const out = document.createElement('canvas')
   out.width = OUT
   out.height = OUT
-  if (maxX < 0) return { canvas: out, alreadyClear }
+  // Nothing left — the removal took the whole image. Flagged so the dialog can
+  // refuse to save a blank square as the logo.
+  if (maxX < 0) return { canvas: out, alreadyClear, empty: true }
   const bw = maxX - minX + 1, bh = maxY - minY + 1
   const fit = (OUT * 0.92) / Math.max(bw, bh)
   const dw = bw * fit, dh = bh * fit
@@ -135,23 +139,27 @@ export function LogoUploadModal({ open, title, onClose, onSave }: {
   const [tol, setTol] = useState(38)
   const [preview, setPreview] = useState<string | null>(null)
   const [alreadyClear, setAlreadyClear] = useState(false)
+  const [empty, setEmpty] = useState(false)
   const [saving, setSaving] = useState(false)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
 
   useEffect(() => {
-    if (!open) { setImg(null); setPreview(null); setRemove(true); setTol(38) }
+    if (!open) { setImg(null); setPreview(null); setRemove(true); setTol(38); setEmpty(false) }
   }, [open])
 
   useEffect(() => {
     if (!img) return
-    const { canvas, alreadyClear: clear } = prepare(img, { remove, tol })
+    const { canvas, alreadyClear: clear, empty: blank } = prepare(img, { remove, tol })
     canvasRef.current = canvas
     setAlreadyClear(clear)
+    setEmpty(!!blank)
     setPreview(canvas.toDataURL('image/png'))
   }, [img, remove, tol])
 
   const pick = async (file?: File | null) => {
     if (!file) return
+    // `accept` is only a hint to the picker; "All files" gets past it.
+    if (!/^image\/(png|jpeg|webp)$/.test(file.type)) { toast(translatePortalText('Choose a PNG, JPG or WebP image'), 'warn'); return }
     if (file.size > 8 * 1024 * 1024) { toast(translatePortalText('Keep the image under 8 MB'), 'warn'); return }
     try {
       setImg(await loadImage(file))
@@ -162,7 +170,7 @@ export function LogoUploadModal({ open, title, onClose, onSave }: {
 
   const save = async () => {
     const canvas = canvasRef.current
-    if (!canvas) return
+    if (!canvas || empty || saving) return
     setSaving(true)
     try {
       const blob = await new Promise<Blob | null>((r) => canvas.toBlob(r, 'image/png'))
@@ -177,7 +185,8 @@ export function LogoUploadModal({ open, title, onClose, onSave }: {
 
   return (
     <Modal open={open} onClose={onClose} title={title}>
-      <input ref={inputRef} type="file" accept="image/png,image/jpeg,image/webp" className="hidden" onChange={(e) => void pick(e.target.files?.[0])} />
+      {/* Value cleared after each pick, or choosing the same file again fires no change. */}
+      <input ref={inputRef} type="file" accept="image/png,image/jpeg,image/webp" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ''; void pick(f) }} />
       {!img ? (
         <button type="button" onClick={() => inputRef.current?.click()}
           className="flex w-full flex-col items-center gap-2 rounded-2xl border-2 border-dashed border-slate-200 p-8 text-slate-500 transition hover:border-emerald-300 hover:text-emerald-700">
@@ -197,6 +206,10 @@ export function LogoUploadModal({ open, title, onClose, onSave }: {
               </div>
             ))}
           </div>
+
+          {empty && (
+            <p className="rounded-lg bg-rose-50 px-3 py-2 text-xs font-semibold text-rose-700">{translatePortalText('Nothing is left after removing the background — lower the strength or turn removal off.')}</p>
+          )}
 
           {alreadyClear ? (
             <p className="rounded-lg bg-emerald-50 px-3 py-2 text-xs font-semibold text-emerald-700">{translatePortalText('This image already has a transparent background — kept as it is.')}</p>
@@ -220,7 +233,7 @@ export function LogoUploadModal({ open, title, onClose, onSave }: {
             <button className="btn-ghost" onClick={() => inputRef.current?.click()}>{translatePortalText('Choose another')}</button>
             <div className="flex gap-2">
               <button className="btn-ghost" onClick={onClose}>{translatePortalText('Cancel')}</button>
-              <button className="btn-admin" disabled={saving || !preview} onClick={() => void save()}>{saving ? <Spinner size={14} /> : <ImageUp size={14} />} {translatePortalText('Save logo')}</button>
+              <button className="btn-admin" disabled={saving || !preview || empty} onClick={() => void save()}>{saving ? <Spinner size={14} /> : <ImageUp size={14} />} {translatePortalText('Save logo')}</button>
             </div>
           </div>
         </div>

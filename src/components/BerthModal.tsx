@@ -35,6 +35,8 @@ interface BerthModalProps {
   docks: string[]
   onSaved: () => Promise<void>
   initialDock?: string
+  /** The marina's berths, so a duplicate number is caught here rather than as "Duplicate value for: pontoon, code". */
+  berths?: ApiBerthMapEntry[]
 }
 
 const num = (v: string) => (v === '' ? undefined : Number(v))
@@ -47,6 +49,7 @@ export default function BerthModal({
   docks,
   onSaved,
   initialDock,
+  berths = [],
 }: BerthModalProps) {
   const { currency } = useMarina()
   const createSlot = useLimitAwareAction(marinaApi.createSlot)
@@ -153,6 +156,28 @@ export default function BerthModal({
   }
 
   const save = async () => {
+    if (busy) return
+    /**
+     * Checked before anything is written. The server accepts 0 for every
+     * measurement and for the rate, so a 0 m berth (which no boat fits) or a
+     * cleared rate saved without complaint; a negative one came back as a raw
+     * validation error. A berth number of 0, -1 or 2.5 became the codes "S00",
+     * "S-1" and "S2.5".
+     */
+    const problems: Record<string, string> = {}
+    if (!berth && (!Number.isInteger(form.num) || form.num < 1)) problems.num = 'Berth number must be a whole number from 1'
+    if (form.maxLength !== undefined && !(form.maxLength > 0)) problems.maxLength = 'Max length must be more than 0 m'
+    if (form.maxBeam !== undefined && !(form.maxBeam > 0)) problems.maxBeam = 'Max beam must be more than 0 m'
+    if (form.monthlyPrice !== undefined && !(form.monthlyPrice >= 0)) problems.monthlyPrice = 'Monthly rate cannot be negative'
+    if (!berth && !problems.num) {
+      const dockCode = form.dock || docks[0]
+      const taken = berths.some(b => b.pontoon === dockCode && b.number === form.num)
+      if (taken) problems.num = `Berth ${dockCode}-${String(form.num).padStart(2, '0')} already exists`
+    }
+    if (Object.keys(problems).length) { fe.fail(problems); return }
+    if (form.maxDraft !== undefined && !(form.maxDraft > 0)) { toast(translatePortalText('Max draft must be more than 0 m'), 'warn'); return }
+    if (form.maxWeight !== undefined && !(form.maxWeight >= 0)) { toast(translatePortalText('Weight capacity cannot be negative'), 'warn'); return }
+
     setBusy(true)
     const validImages = form.images.filter((img) => !img.startsWith('blob:'))
     const specs = {
@@ -190,9 +215,10 @@ export default function BerthModal({
         }
 
         // If staged files exist, upload them to newly created slot
-        if (stagedFiles.length > 0 && created.data?.slot?._id) {
+        const createdId = created.data?.slot?._id ?? (created.data?.slot as { id?: string } | undefined)?.id
+        if (stagedFiles.length > 0 && createdId) {
           try {
-            await marinaApi.uploadSlotImages(created.data.slot._id, stagedFiles)
+            await marinaApi.uploadSlotImages(createdId, stagedFiles)
           } catch {
             toast(translatePortalText('Berth created, but some images failed to upload'), 'warn')
           }

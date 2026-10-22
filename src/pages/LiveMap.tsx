@@ -3,8 +3,9 @@ import { motion } from 'framer-motion'
 import { RadioTower, Maximize2, Minimize2, MoveHorizontal, Plus, Pencil, Camera, Eye, X, Anchor } from 'lucide-react'
 import { PageHeader, Badge, Img, toast, Modal, AsyncBlock, EmptyState } from '../ui'
 import { boatPhoto } from '../images'
-import { boatTypeLabel, useAsync, useMarina, BERTH_LABELS, fmtDate, formatMoney, humanize, personOf, todayIso } from '../live'
+import { boatTypeLabel, useAsync, useMarina, BERTH_LABELS, RESERVATION_LABELS, fmtDate, formatMoney, humanize, personOf } from '../live'
 import { chatApi, idOf, portalApi, movementsApi, fileUrl, type ApiBerthMapEntry } from '../api'
+import { onSocket } from '../socket'
 import { BERTH_TINT as STATUS_FILL, HarbourChart, harbourScrolls } from '../harbour'
 import BerthModal from '../components/BerthModal'
 import DockModal from '../components/DockModal'
@@ -20,6 +21,15 @@ export default function LiveMap() {
   const { marina, currency } = useMarina()
   const state = useAsync(() => portalApi.berthMap().then(r => r.data), [])
   const staff = useAsync(() => portalApi.staff().then(r => r.data), [])
+
+  // Vessels under way. Asked for by status, on any date: this read the first
+  // 40 movements *scheduled today* (in the server's UTC day) and kept the
+  // en-route ones, so a boat under way for tomorrow's slot — or any boat past
+  // the 40th movement of a busy day — never crossed the chart.
+  const transits = useAsync(
+    () => movementsApi.list({ date: 'all', status: 'en_route', limit: 40 }).then(r => r.data.items ?? []),
+    [],
+  )
 
   /**
    * The refresh the badge has always promised.
@@ -37,15 +47,25 @@ export default function LiveMap() {
    */
   const [lastSync, setLastSync] = useState(() => Date.now())
   const [ago, setAgo] = useState(0)
+  // A failed poll used to stamp the badge "just now" all the same (the
+  // `.then` ran on the `null` a failed reload resolves to).
+  const [syncFailed, setSyncFailed] = useState(false)
 
   useEffect(() => {
-    const refresh = setInterval(() => {
+    const refreshAll = () => {
       // `silent` so a background poll never flashes a loading state over a map
       // the operator is reading — the badge's age is the only thing that moves.
-      void state.reload({ silent: true }).then(() => setLastSync(Date.now()))
+      void state.reload({ silent: true }).then(res => {
+        if (res) { setLastSync(Date.now()); setSyncFailed(false) } else setSyncFailed(true)
+      })
+      void transits.reload({ silent: true })
       void staff.reload({ silent: true })
-    }, 60_000)
-    return () => clearInterval(refresh)
+    }
+    const refresh = setInterval(refreshAll, 60_000)
+    // A check-in or check-out changes what is alongside; redraw on the event
+    // instead of up to a minute later.
+    const off = onSocket('movement:updated', refreshAll)
+    return () => { clearInterval(refresh); off() }
     // `state`/`staff` are stable hook handles; re-subscribing on each render
     // would tear the interval down before it ever fired.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -94,13 +114,6 @@ export default function LiveMap() {
   const pontoonCount = docks.length
   const scrolls = harbourScrolls(pontoonCount)
 
-  // Vessels under way
-  const transits = useAsync(
-    () => movementsApi.list({ date: todayIso(), limit: 40 }).then(r =>
-      (r.data.items ?? []).filter(m => m.status === 'en_route')),
-    [],
-  )
-
   const openAddBerth = (targetDock?: string) => {
     setEditingBerth(null)
     setInitialDockForBerth(targetDock)
@@ -130,22 +143,32 @@ export default function LiveMap() {
     }
     if (!crewMsg.trim()) { toast(translatePortalText('Write a message for the crew'), 'warn'); return }
     setSending(true)
+    // One member at a time, each on its own: the first failure used to abort
+    // the loop and toast "could not reach the crew" after some had already been
+    // messaged — so a retry messaged them twice.
+    let sent = 0
+    let failed = 0
+    let firstError = ''
     try {
-      let sent = 0
       for (const member of crew) {
         const user = personOf(member.user)
         const userId = idOf(user)
         if (!userId) continue
-        const chat = await chatApi.create(userId)
-        const chatId = idOf(chat.data.chat)
-        if (!chatId) throw new Error('Could not open a crew conversation')
-        await chatApi.send(chatId, crewMsg.trim())
-        sent++
+        try {
+          const chat = await chatApi.create(userId)
+          const chatId = idOf(chat.data.chat)
+          if (!chatId) throw new Error('Could not open a crew conversation')
+          await chatApi.send(chatId, crewMsg.trim())
+          sent++
+        } catch (e) {
+          failed++
+          firstError ||= e instanceof Error ? e.message : ''
+        }
       }
-      toast(translatePortalText(sent ? `Dock crew notified (${sent})` : 'Nobody to notify'), sent ? 'success' : 'warn')
-      setNotifying(false)
-    } catch (e) {
-      toast(translatePortalText(e instanceof Error ? e.message : 'Could not reach the crew'), 'warn')
+      if (failed && sent) toast(translatePortalText(`Dock crew notified (${sent}) · ${failed} could not be reached`), 'warn')
+      else if (failed) toast(translatePortalText(firstError || 'Could not reach the crew'), 'warn')
+      else toast(translatePortalText(sent ? `Dock crew notified (${sent})` : 'Nobody to notify'), sent ? 'success' : 'warn')
+      if (sent) setNotifying(false)
     } finally { setSending(false) }
   }
 
@@ -156,10 +179,16 @@ export default function LiveMap() {
           sub="Real-time marina map — berth status, boat locations & dock traffic. Click any slip for details."
           actions={
             <div className="flex items-center gap-2">
-              <span className="chip bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200">
-                <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse-soft" /> {translatePortalText("LIVE · updated")}{' '}
-                {translatePortalText(ago < 5 ? 'just now' : `${ago}s ago`)}
-              </span>
+              {syncFailed ? (
+                <span className="chip bg-amber-50 text-amber-700 ring-1 ring-amber-200">
+                  {translatePortalText("Refresh failed — data from")} {translatePortalText(`${ago}s ago`)}
+                </span>
+              ) : (
+                <span className="chip bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200">
+                  <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse-soft" /> {translatePortalText("LIVE · updated")}{' '}
+                  {translatePortalText(ago < 5 ? 'just now' : `${ago}s ago`)}
+                </span>
+              )}
               <button className="btn-secondary flex items-center gap-1.5" onClick={() => setDockModalOpen(true)}>
                 <Anchor size={15} /> {translatePortalText("Add Dock\r\n              ")}</button>
               <button className="btn-primary flex items-center gap-1.5" onClick={() => openAddBerth()}>
@@ -185,7 +214,9 @@ export default function LiveMap() {
       )}
 
       <AsyncBlock state={state} loadingLabel="Loading the dock map…"
-        empty={d => d.berths.length === 0 ? { icon: '🅿️', text: 'No berths configured yet — add your pontoons on the Berth Management page.' } : null}>
+        // Empty only when there is nothing to draw at all: a dock with no berths
+        // yet still renders, with its "+ Add Berth to Dock" placeholder.
+        empty={d => d.berths.length === 0 && d.pontoons.length === 0 ? { icon: '🅿️', text: 'No docks or berths yet — use “Add Dock” to lay out your first pontoon.' } : null}>
         {(data) => (
           /* ── Full Screen Marina Map ── */
           <motion.div initial={{ opacity: 0, scale: 0.99 }} animate={{ opacity: 1, scale: 1 }}
@@ -299,16 +330,36 @@ export default function LiveMap() {
             {sel.reservation && (() => {
               const r = sel.reservation!
               const owner = personOf(r.subscriber)
+              // The berth map hands back whatever reservation holds the berth —
+              // an unanswered request, an unpaid lease, a lease whose boat has
+              // not arrived. All of them were headed "Current Occupant".
+              const alongside = (r as { isAlongside?: boolean }).isAlongside === true
+              const heading = alongside
+                ? 'Current Occupant'
+                : r.status === 'active'
+                  ? 'Berth held — boat not checked in'
+                  : `Reservation · ${RESERVATION_LABELS[r.status] ?? humanize(r.status)}`
+              // LOA is metres on the berth, feet on the booking.
+              const boatM = r.lengthFt ? r.lengthFt * 0.3048 : null
+              const tooLong = boatM != null && sel.maxLength != null && sel.maxLength > 0 && boatM > sel.maxLength
               return (
-                <div className="flex items-center gap-3 rounded-2xl bg-sand p-3.5 border border-slate-100">
-                  <img src={fileUrl(owner?.avatar) ?? `https://ui-avatars.com/api/?name=${encodeURIComponent(owner?.name ?? r.boatName)}&background=e2e8f0&color=475569`}
-                    className="h-12 w-12 rounded-full object-cover shadow-sm" alt="" />
-                  <div>
-                    <p className="text-xs font-bold uppercase tracking-wider text-slate-400">{translatePortalText("Current Occupant")}</p>
-                    <p className="text-sm font-bold text-deep-900">{r.boatName}</p>
-                <p className="text-xs text-slate-500">{owner?.name ?? r.plate} · {formatPortalNumber(r.lengthFt)} {translatePortalText("ft ")}{translatePortalText(boatTypeLabel(r.boatType))}</p>
-                    <p className="mt-0.5 text-[11px] text-slate-400">{translatePortalText("Until ")}{fmtDate(r.endDate)} · {formatMoney(r.totalSar, currency)}</p>
+                <div className="rounded-2xl bg-sand p-3.5 border border-slate-100">
+                  <div className="flex items-center gap-3">
+                    <img src={fileUrl(owner?.avatar) ?? `https://ui-avatars.com/api/?name=${encodeURIComponent(owner?.name ?? r.boatName)}&background=e2e8f0&color=475569`}
+                      className="h-12 w-12 rounded-full object-cover shadow-sm" alt="" />
+                    <div>
+                      <p className="text-xs font-bold uppercase tracking-wider text-slate-400">{translatePortalText(heading)}</p>
+                      <p className="text-sm font-bold text-deep-900">{r.boatName}</p>
+                      <p className="text-xs text-slate-500">{owner?.name ?? r.plate} · {formatPortalNumber(r.lengthFt)} {translatePortalText("ft ")}{translatePortalText(boatTypeLabel(r.boatType))}</p>
+                      {/* `totalSar` is riyals whatever the marina's display currency. */}
+                      <p className="mt-0.5 text-[11px] text-slate-400">{fmtDate(r.startDate)} → {fmtDate(r.endDate)} · {formatMoney(r.totalSar, 'SAR')}</p>
+                    </div>
                   </div>
+                  {tooLong && (
+                    <p className="mt-2 rounded-xl bg-amber-50 px-3 py-1.5 text-[11px] font-semibold text-amber-700 ring-1 ring-amber-200">
+                      {translatePortalText(`Boat length ${formatPortalNumber(Math.round(boatM! * 10) / 10)} m exceeds this berth's ${formatPortalNumber(sel.maxLength!)} m limit`)}
+                    </p>
+                  )}
                 </div>
               )
             })()}
@@ -389,6 +440,7 @@ export default function LiveMap() {
         pontoons={pontoons}
         docks={docks}
         initialDock={initialDockForBerth}
+        berths={berths}
         onSaved={handleBerthSaved}
       />
 
@@ -421,7 +473,7 @@ export default function LiveMap() {
         </div>
       )}
 
-      {!isFull && berths.length === 0 && state.data && <EmptyState icon="🅿️" text="No berths to plot yet" />}
+      {!isFull && berths.length === 0 && pontoons.length > 0 && state.data && <EmptyState icon="🅿️" text="No berths to plot yet" />}
     </div>
   )
 }

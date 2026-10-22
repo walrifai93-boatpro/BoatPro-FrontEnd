@@ -445,12 +445,12 @@ export function FuelNotificationsPage() {
 // ═════════════════════════════════════════════════════════════
 
 const NOTIF_ROWS = [
-  'New fuel order', 'Delivery assigned / completed', 'Low fuel stock & refill reminders',
+  'New fuel order', 'Order scheduled / completed', 'Low fuel stock & refill reminders',
   'Marketing & product updates', 'Payment received', 'Safety & weather alerts',
 ]
 const PAY_ROWS = [
   '💳 Credit / debit cards', '👛 BoatPro wallet', '🏦 Bank transfer / wire',
-  '💵 Cash on delivery', '📒 Commercial credit accounts',
+  '💵 Cash at the fuel dock', '📒 Commercial credit accounts',
 ]
 
 /** Which roles map to which coarse permission summary in the roster. */
@@ -496,12 +496,9 @@ export function FuelSettings() {
     email: '',
     website: '',
     vhf: '',
-    radius: 25,
     city: '',
     region: '',
     open24h: false,
-    deliveryFeeSar: 0,
-    emergencyDeliveryFeeSar: 0,
     emergencyEmail: '',
     emergencyProceduresText: '',
     bank: {
@@ -557,12 +554,9 @@ export function FuelSettings() {
       email: s.email ?? '',
       website: s.website ?? '',
       vhf: s.vhfChannel ?? '',
-      radius: parseInt(String(s.serviceRadius ?? '').match(/\d+/)?.[0] ?? '25', 10),
       city: s.city ?? '',
       region: s.region ?? '',
       open24h: s.open24h ?? false,
-      deliveryFeeSar: s.deliveryFeeSar ?? 0,
-      emergencyDeliveryFeeSar: s.emergencyDeliveryFeeSar ?? 0,
       emergencyEmail: s.emergencyEmail ?? '',
       emergencyProceduresText: s.emergencyProceduresText ?? '',
       bank: {
@@ -611,15 +605,12 @@ export function FuelSettings() {
           email: form.email.trim() || undefined,
           website: form.website.trim() || undefined,
           vhfChannel: form.vhf.trim() || undefined,
-          serviceRadius: `${form.radius} nm service radius`,
           city: form.city.trim() || undefined,
           region: form.region.trim() || undefined,
           address: point.address.trim() || undefined,
           latitude: point.latitude,
           longitude: point.longitude,
           open24h: form.open24h,
-          deliveryFeeSar: Number(form.deliveryFeeSar) || 0,
-          emergencyDeliveryFeeSar: Number(form.emergencyDeliveryFeeSar) || 0,
           emergencyEmail: form.emergencyEmail.trim() || undefined,
           emergencyProceduresText: form.emergencyProceduresText.trim() || undefined,
           // `bankPayload` normalises and fills the bank name / SWIFT from the
@@ -687,7 +678,7 @@ export function FuelSettings() {
 
   return (
     <div className="space-y-5">
-      <FuelHeader title={translatePortalText("Settings")} sub={translatePortalText("Business profile, fuels, hours, service radius, payments, roles & localization")}
+      <FuelHeader title={translatePortalText("Settings")} sub={translatePortalText("Business profile, fuels, hours, payments, roles & localization")}
         icon={<span className="text-2xl">⚙️</span>}
         actions={<button className="btn-fuel" disabled={busy} onClick={saveAll}>{busy ? translatePortalText("Saving...") : translatePortalText("Save all")}</button>} />
 
@@ -745,12 +736,6 @@ export function FuelSettings() {
                 <label className="label">{translatePortalText("VHF channel")}</label>
                 <input id="vhf" className="input font-mono" placeholder={translatePortalText("Ch 16, Ch 68")} value={form.vhf} onChange={e => setForm(f => ({ ...f, vhf: e.target.value }))} />
               </div>
-            </div>
-            <div>
-              <label className="label">{translatePortalText("Service radius")}</label>
-              <input id="radius" type="range" min={5} max={50} value={form.radius} className="w-full accent-amber-500"
-                onChange={e => setForm(f => ({ ...f, radius: +e.target.value }))} />
-              <p className="text-[11px] font-bold text-slate-400">{translatePortalText("Currently ")}{form.radius}{translatePortalText(" nm")}{form.city ? ` ${translatePortalText(`— around ${form.city}`)}` : translatePortalText("")}</p>
             </div>
           </div>
         </Section>
@@ -831,29 +816,6 @@ export function FuelSettings() {
                   value={form.emergencyEmail}
                   onChange={e => setForm(f => ({ ...f, emergencyEmail: e.target.value }))}
                 />
-              </div>
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="label">{translatePortalText("Standard Delivery Fee (SAR)")}</label>
-                  <input
-                    type="number"
-                    min="0"
-                    className="input font-mono"
-                    value={form.deliveryFeeSar}
-                    onChange={e => setForm(f => ({ ...f, deliveryFeeSar: parseFloat(e.target.value) || 0 }))}
-                  />
-                </div>
-                <div>
-                  <label className="label">{translatePortalText("Emergency Delivery Fee (SAR)")}</label>
-                  <input
-                    id="emergencyDeliveryFee"
-                    type="number"
-                    min="0"
-                    className="input font-mono"
-                    value={form.emergencyDeliveryFeeSar}
-                    onChange={e => setForm(f => ({ ...f, emergencyDeliveryFeeSar: parseFloat(e.target.value) || 0 }))}
-                  />
-                </div>
               </div>
               <div>
                 <label className="label">{translatePortalText("Spill Response Protocol & SOP")}</label>

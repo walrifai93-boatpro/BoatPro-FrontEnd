@@ -8,22 +8,64 @@ import { boatTypeLabel,
 } from '../live'
 import { reservationsApi, fileUrl, type ApiReservation, type ReservationStatus } from '../api'
 import VendorLogoBadge from '../components/VendorLogoBadge'
-import { formatPortalDate, formatPortalNumber, isPortalArabic, localizedField, translatePortalText } from '../i18n/runtime'
+import { formatPortalDate, formatPortalNumber, isPortalArabic, localizedField, translatePortalText, translatePortalTemplate } from '../i18n/runtime'
 
+
+/** Legacy `pending` rows are requests awaiting review, as the server treats them. */
+const statusOf = (r: ApiReservation): ReservationStatus =>
+  (r.status as string) === 'pending' ? 'pending_approval' : r.status
+
+/**
+ * `expired` is two different things: a paid lease that ran out, and a request
+ * that lapsed before anyone paid. Only the first is a finished stay.
+ */
+const lapsedUnpaid = (r: ApiReservation) => statusOf(r) === 'expired' && !r.paidAt
+
+const statusLabel = (r: ApiReservation) =>
+  lapsedUnpaid(r) ? 'Lapsed — never paid' : RESERVATION_LABELS[statusOf(r)] ?? r.status
 
 // The filter chips, in the operator's language.
 const STATUS_FILTERS: { key: string; label: string; match: (r: ApiReservation) => boolean }[] = [
   { key: 'All', label: 'All', match: () => true },
-  { key: 'Accepted', label: 'Accepted', match: r => r.status === 'active' || r.status === 'pending_payment' },
-  { key: 'active', label: 'Active', match: r => r.status === 'active' },
-  { key: 'pending_payment', label: 'Awaiting payment', match: r => r.status === 'pending_payment' },
-  { key: 'pending_approval', label: 'Requests', match: r => r.status === 'pending_approval' },
-  { key: 'completed', label: 'Completed', match: r => r.status === 'completed' || r.status === 'expired' },
-  { key: 'cancelled', label: 'Cancelled', match: r => r.status === 'cancelled' },
-  { key: 'declined', label: 'Declined', match: r => r.status === 'declined' },
+  { key: 'Accepted', label: 'Accepted', match: r => statusOf(r) === 'active' || statusOf(r) === 'pending_payment' },
+  { key: 'active', label: 'Active', match: r => statusOf(r) === 'active' },
+  { key: 'pending_payment', label: 'Awaiting payment', match: r => statusOf(r) === 'pending_payment' },
+  { key: 'pending_approval', label: 'Requests', match: r => statusOf(r) === 'pending_approval' },
+  { key: 'completed', label: 'Completed', match: r => statusOf(r) === 'completed' || (statusOf(r) === 'expired' && !!r.paidAt) },
+  { key: 'lapsed', label: 'Lapsed unpaid', match: lapsedUnpaid },
+  { key: 'cancelled', label: 'Cancelled', match: r => statusOf(r) === 'cancelled' },
+  { key: 'declined', label: 'Declined', match: r => statusOf(r) === 'declined' },
 ]
 
-const PAID: ReservationStatus[] = ['active', 'completed', 'expired']
+/**
+ * Whether the lease's money was kept. This used to be "status is active,
+ * completed or expired", which counted requests that lapsed unpaid as revenue
+ * (the expiry sweep expires those too) and showed them as "Paid".
+ */
+const KEPT: ReservationStatus[] = ['active', 'completed', 'expired']
+const keptPaid = (r: ApiReservation) => !!r.paidAt && KEPT.includes(statusOf(r))
+
+/** Where the money stands on one reservation, for the detail card and the CSV. */
+function paymentState(r: ApiReservation): { label: string; dot: string } {
+  const s = statusOf(r)
+  if (r.paidAt && (s === 'cancelled' || s === 'declined')) return { label: 'Paid, then called off — refund and credit note in Billing', dot: '🟠' }
+  if (r.paidAt) return { label: 'Paid', dot: '🟢' }
+  if (s === 'pending_approval' && r.cardHold?.status === 'held') return { label: 'Card on hold', dot: '🟡' }
+  if (s === 'pending_approval' || s === 'pending_payment') return { label: 'Not paid yet', dot: '🟡' }
+  return { label: 'Never paid', dot: '⚪' }
+}
+
+/**
+ * A lease date (`YYYY-MM-DD`, the marina's own calendar day) for display.
+ * `new Date('2026-10-15')` is UTC midnight, which a browser west of UTC shows
+ * as the 14th; pinning noon UTC keeps the day the marina booked.
+ */
+const fmtDay = (d?: string | null) =>
+  d ? formatPortalDate(new Date(`${d.slice(0, 10)}T12:00:00Z`), { year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' }) : '—'
+
+/** Names and notes go into printed HTML — a "<" in a boat name must not become markup. */
+const HTML_ESCAPES: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }
+const esc = (v: unknown) => String(v ?? '').replace(/[&<>"']/g, c => HTML_ESCAPES[c] ?? c)
 
 const avatarFor = (name?: string, avatar?: string) =>
   fileUrl(avatar) ?? `https://ui-avatars.com/api/?name=${encodeURIComponent(name ?? '?')}&background=e2e8f0&color=475569`
@@ -41,20 +83,31 @@ export default function ReservationTable() {
 
   const filteredRows = useMemo(() => {
     const filter = STATUS_FILTERS.find(f => f.key === statusFilter) ?? STATUS_FILTERS[0]
+    // Old records can lack a total or a start date; they sort as 0 / first.
     return list.filter(filter.match).sort((a, b) => {
-      if (sortBy === 'amount') return sortOrder === 'desc' ? b.totalSar - a.totalSar : a.totalSar - b.totalSar
+      if (sortBy === 'amount') return sortOrder === 'desc' ? (b.totalSar ?? 0) - (a.totalSar ?? 0) : (a.totalSar ?? 0) - (b.totalSar ?? 0)
       if (sortBy === 'guest') {
         const nameA = personOf(a.subscriber)?.name ?? '', nameB = personOf(b.subscriber)?.name ?? ''
         return sortOrder === 'desc' ? nameB.localeCompare(nameA) : nameA.localeCompare(nameB)
       }
-      return sortOrder === 'desc' ? b.startDate.localeCompare(a.startDate) : a.startDate.localeCompare(b.startDate)
+      const da = a.startDate ?? '', db = b.startDate ?? ''
+      return sortOrder === 'desc' ? db.localeCompare(da) : da.localeCompare(db)
     })
   }, [list, statusFilter, sortBy, sortOrder])
 
-  // Summary metrics — from settled reservations only, so the revenue is real.
-  const totalRevenue = useMemo(() => list.filter(r => PAID.includes(r.status)).reduce((sum, r) => sum + r.totalSar, 0), [list])
-  const activeCount = useMemo(() => list.filter(r => r.status === 'active').length, [list])
-  const pendingCount = useMemo(() => list.filter(r => r.status === 'pending_approval' || r.status === 'pending_payment').length, [list])
+  /*
+    Summary metrics. The list is the newest 100 (the API's cap), so the counts
+    come from the server's `statusCounts` and the total from its pagination;
+    the receipts figure can only cover the rows in hand and says so.
+  */
+  const counts = state.data?.statusCounts
+  const serverTotal = state.data?.pagination?.total ?? list.length
+  const truncated = serverTotal > list.length
+  const totalRevenue = useMemo(() => list.filter(keptPaid).reduce((sum, r) => sum + (r.totalSar ?? 0), 0), [list])
+  const activeCount = counts && !q.trim() ? counts.active ?? 0 : list.filter(r => statusOf(r) === 'active').length
+  const pendingCount = counts && !q.trim()
+    ? (counts.pending_approval ?? 0) + (counts.pending_payment ?? 0)
+    : list.filter(r => statusOf(r) === 'pending_approval' || statusOf(r) === 'pending_payment').length
 
   const toggleSort = (field: 'date' | 'amount' | 'guest') => {
     if (sortBy === field) setSortOrder(o => (o === 'asc' ? 'desc' : 'asc'))
@@ -81,15 +134,18 @@ export default function ReservationTable() {
         [translatePortalText('Check-In')]: r.startDate,
         [translatePortalText('Check-Out')]: r.endDate,
         [translatePortalText('Months')]: r.months,
+        // `currency` is the marina's own (the one these amounts are stored in), not the display switch.
         [`${translatePortalText('Fee')} (${currency})`]: r.priceSar,
         [`${translatePortalText('VAT')} (${currency})`]: r.vatSar,
         [`${translatePortalText('Total')} (${currency})`]: r.totalSar,
-        [translatePortalText('Status')]: translatePortalText(RESERVATION_LABELS[r.status] ?? r.status),
+        [translatePortalText('Status')]: translatePortalText(statusLabel(r)),
+        [translatePortalText('Payment')]: translatePortalText(paymentState(r).label),
         [translatePortalText('Paid')]: r.paidAt ?? '',
       }
     }))
     const filename = isPortalArabic() ? `جدول_الحجوزات_${todayIso()}.csv` : `Reservation_Master_Table_${todayIso()}.csv`
-    download(filename, csv, 'text/csv;charset=utf-8')
+    // The BOM is what makes Excel read the Arabic headers and names as UTF-8.
+    download(filename, `﻿${csv}`, 'text/csv;charset=utf-8')
     toast(translatePortalText('Reservation data exported to CSV file!'), 'info')
   }
 
@@ -97,13 +153,14 @@ export default function ReservationTable() {
     const c = personOf(r.subscriber)
     const marinaName = localizedField(marina, 'name') || translatePortalText('Marina')
     printDoc(`${translatePortalText('Reservation')} ${r.reservationNo}`, `
-      <h1>${translatePortalText('Reservation')} ${r.reservationNo}</h1><p class="sub">${marinaName} · ${translatePortalText('booking summary')}</p>
-      <div class="row"><span>${translatePortalText('Guest')}</span><span>${c?.name ?? '—'}</span></div>
-      <div class="row"><span>${translatePortalText('Contact')}</span><span>${c?.email ?? '—'}${c?.phone ? ` · ${c.phone}` : ''}</span></div>
-      <div class="row"><span>${translatePortalText('Vessel')}</span><span>${r.boatName} · ${r.plate} · ${formatPortalNumber(r.lengthFt)} ${translatePortalText('ft')} ${translatePortalText(boatTypeLabel(r.boatType))}</span></div>
+      <h1>${translatePortalText('Reservation')} ${esc(r.reservationNo)}</h1><p class="sub">${esc(marinaName)} · ${translatePortalText('booking summary')}</p>
+      <div class="row"><span>${translatePortalText('Guest')}</span><span>${esc(c?.name ?? '—')}</span></div>
+      <div class="row"><span>${translatePortalText('Contact')}</span><span>${esc(c?.email ?? '—')}${c?.phone ? ` · ${esc(c.phone)}` : ''}</span></div>
+      <div class="row"><span>${translatePortalText('Vessel')}</span><span>${esc(r.boatName)} · ${esc(r.plate)} · ${formatPortalNumber(r.lengthFt)} ${translatePortalText('ft')} ${translatePortalText(boatTypeLabel(r.boatType))}</span></div>
       <div class="row"><span>${translatePortalText('Berth')}</span><span>${berthLabel(r.pontoon, r.slot)}</span></div>
-      <div class="row"><span>${translatePortalText('Dates')}</span><span>${formatPortalDate(r.startDate)} → ${formatPortalDate(r.endDate)} (${formatPortalNumber(r.months)} ${translatePortalText(r.months === 1 ? 'month' : 'months')})</span></div>
-      <div class="row"><span>${translatePortalText('Status')}</span><span>${translatePortalText(RESERVATION_LABELS[r.status] ?? r.status)}</span></div>
+      <div class="row"><span>${translatePortalText('Dates')}</span><span>${fmtDay(r.startDate)} → ${fmtDay(r.endDate)} (${formatPortalNumber(r.months)} ${translatePortalText(r.months === 1 ? 'month' : 'months')})</span></div>
+      <div class="row"><span>${translatePortalText('Status')}</span><span>${translatePortalText(statusLabel(r))}</span></div>
+      <div class="row"><span>${translatePortalText('Payment')}</span><span>${translatePortalText(paymentState(r).label)}</span></div>
       <div class="row"><span>${translatePortalText('Berth fee')}</span><span>${formatMoney(r.priceSar, currency)}</span></div>
       <div class="row"><span>${translatePortalText('VAT')}</span><span>${formatMoney(r.vatSar, currency)}</span></div>
       <div class="row tot"><span>${translatePortalText('Total')}</span><span>${formatMoney(r.totalSar, currency)}</span></div>`,
@@ -121,12 +178,12 @@ export default function ReservationTable() {
         sub="Complete tabular view of all marina reservations, guest profiles, berth assignments & payment records"
         actions={
           <div className="flex items-center gap-2">
-            <button className="btn-ghost" onClick={() => printDoc(translatePortalText('Reservation Master Table'), `
-              <h1>${translatePortalText('Reservation Master Table')}</h1><p class="sub">${localizedField(marina, 'name') || translatePortalText('Marina')} · ${formatPortalNumber(filteredRows.length)} ${translatePortalText('records')}</p>
+            <button className="btn-ghost" onClick={() => !filteredRows.length ? toast(translatePortalText('Nothing to print'), 'warn') : printDoc(translatePortalText('Reservation Master Table'), `
+              <h1>${translatePortalText('Reservation Master Table')}</h1><p class="sub">${esc(localizedField(marina, 'name') || translatePortalText('Marina'))} · ${formatPortalNumber(filteredRows.length)} ${translatePortalText('records')}</p>
               <table><thead><tr><th>${translatePortalText('Booking')}</th><th>${translatePortalText('Guest')}</th><th>${translatePortalText('Vessel')}</th><th>${translatePortalText('Berth')}</th><th>${translatePortalText('Dates')}</th><th>${translatePortalText('Total')}</th><th>${translatePortalText('Status')}</th></tr></thead><tbody>
               ${filteredRows.map(r => {
                 const c = personOf(r.subscriber)
-                return `<tr><td>${r.reservationNo}</td><td>${c?.name ?? '—'}</td><td>${r.boatName}</td><td>${berthLabel(r.pontoon, r.slot)}</td><td>${formatPortalDate(r.startDate)} → ${formatPortalDate(r.endDate)}</td><td>${formatMoney(r.totalSar, currency)}</td><td>${translatePortalText(RESERVATION_LABELS[r.status] ?? r.status)}</td></tr>`
+                return `<tr><td>${esc(r.reservationNo)}</td><td>${esc(c?.name ?? '—')}</td><td>${esc(r.boatName)}</td><td>${berthLabel(r.pontoon, r.slot)}</td><td>${fmtDay(r.startDate)} → ${fmtDay(r.endDate)}</td><td>${formatMoney(r.totalSar, currency)}</td><td>${translatePortalText(statusLabel(r))}</td></tr>`
               }).join('')}
               </tbody></table>`, localizedField(marina, 'name') || translatePortalText('Marina'), '⚓')}>
               <Printer size={15} /> {translatePortalText("Print table\r\n            ")}</button>
@@ -139,10 +196,12 @@ export default function ReservationTable() {
       {/* KPI Cards */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         {[
-          { label: 'Total Reservations', val: formatPortalNumber(list.length), sub: 'All recorded bookings', color: 'text-deep-900', bg: 'bg-white' },
-          { label: 'Active Berths', val: formatPortalNumber(activeCount), sub: 'Paid & alongside', color: 'text-ocean-600', bg: 'bg-ocean-50/60' },
+          { label: 'Total Reservations', val: formatPortalNumber(serverTotal), sub: 'All recorded bookings', color: 'text-deep-900', bg: 'bg-white' },
+          // `active` is paid and live — the boat may not have arrived yet.
+          { label: 'Active Berths', val: formatPortalNumber(activeCount), sub: 'Paid & live', color: 'text-ocean-600', bg: 'bg-ocean-50/60' },
           { label: 'Pending Requests', val: formatPortalNumber(pendingCount), sub: 'Awaiting review or payment', color: 'text-amber-600', bg: 'bg-amber-50/60' },
-          { label: 'Total Revenue', val: formatMoney(totalRevenue, currency), sub: 'Settled booking receipts', color: 'text-emerald-600', bg: 'bg-emerald-50/60' },
+          // Lease value incl. VAT, before commission and card fees — Billing has the net.
+          { label: 'Total Revenue', val: formatMoney(totalRevenue, currency), sub: truncated ? 'Paid leases incl. VAT · newest 100 only' : 'Paid leases incl. VAT · net is in Billing', color: 'text-emerald-600', bg: 'bg-emerald-50/60' },
         ].map((k, i) => (
           <motion.div key={k.label} initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: i * 0.05 }}
             className={`card p-4 border border-slate-100 ${k.bg}`}>
@@ -156,7 +215,10 @@ export default function ReservationTable() {
       {/* Filter and Search Bar */}
       <div className="card p-4 space-y-3 shadow-soft">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="max-w-md flex-1"><SearchInput value={q} onChange={setQ} placeholder={translatePortalText("Search guest name, vessel, registration or booking ID...")} /></div>
+          {/* The server searches boat name, registration and booking/subscription
+              numbers only — a guest's name or email finds nothing, so the
+              placeholder no longer offers it. */}
+          <div className="max-w-md flex-1"><SearchInput value={q} onChange={setQ} placeholder={translatePortalText("Search vessel, registration or booking ID...")} /></div>
 
           {/* Filters */}
           <div className="flex flex-wrap items-center gap-2 text-xs">
@@ -169,6 +231,17 @@ export default function ReservationTable() {
             ))}
           </div>
         </div>
+        {truncated && (
+          <p className="text-xs font-semibold text-amber-700">
+            {translatePortalTemplate('Showing the newest {{shown}} of {{total}} — search by boat, registration or booking number to find older ones.', { shown: formatPortalNumber(list.length), total: formatPortalNumber(serverTotal) })}
+          </p>
+        )}
+        {state.error && state.data && (
+          <p className="text-xs font-semibold text-rose-600">
+            {translatePortalText('Could not refresh reservations — showing the last list loaded.')}{' '}
+            <button className="underline" onClick={() => state.reload()}>{translatePortalText('Retry')}</button>
+          </p>
+        )}
       </div>
 
       {/* Master Data Table */}
@@ -236,14 +309,14 @@ export default function ReservationTable() {
                         </span>
                       </td>
                       <td className="py-3 px-4 font-semibold text-slate-600 whitespace-nowrap">
-                        <p className="text-xs text-deep-900 font-bold">{formatPortalDate(r.startDate)}</p>
-                        <p className="text-[11px] text-slate-400">{translatePortalText("to ")}{formatPortalDate(r.endDate)}</p>
+                        <p className="text-xs text-deep-900 font-bold">{fmtDay(r.startDate)}</p>
+                        <p className="text-[11px] text-slate-400">{translatePortalText("to ")}{fmtDay(r.endDate)}</p>
                       </td>
                       <td className="py-3 px-4 text-right font-display font-extrabold text-sm text-deep-900">
                         {formatMoney(r.totalSar, currency)}
                       </td>
                       <td className="py-3 px-4">
-                        <Badge dot={r.status === 'active'}>{translatePortalText(RESERVATION_LABELS[r.status] ?? r.status)}</Badge>
+                        <Badge dot={statusOf(r) === 'active'}>{translatePortalText(statusLabel(r))}</Badge>
                       </td>
                       <td className="py-3 px-4 text-right">
                         <div className="flex items-center justify-end gap-1.5">
@@ -285,11 +358,18 @@ export default function ReservationTable() {
                   ['Vessel', `${detail.boatName} · ${detail.plate}`],
                   ['Vessel Type', `${formatPortalNumber(detail.lengthFt)} ${translatePortalText('ft')} ${translatePortalText(boatTypeLabel(detail.boatType))}`],
                   ['Berth Slip', berthLabel(detail.pontoon, detail.slot)],
-                  ['Dates', `${formatPortalDate(detail.startDate)} → ${formatPortalDate(detail.endDate)}`],
-                  ['Monthly Rate', formatMoney(Math.round(detail.priceSar / Math.max(1, detail.months)), currency)],
-                  ['Total Receipts', formatMoney(detail.totalSar, currency)],
-                  ['Payment Status', `${translatePortalText(PAID.includes(detail.status) ? 'Paid' : 'Pending')} ${PAID.includes(detail.status) ? '🟢' : '🟡'}`],
-                  ['Booking Status', translatePortalText(RESERVATION_LABELS[detail.status] ?? detail.status)],
+                  ['Dates', `${fmtDay(detail.startDate)} → ${fmtDay(detail.endDate)}`],
+                  // A plan lease is booked in days (`months: 0`) — price it per 30 days, not as one "month".
+                  ['Monthly Rate', formatMoney(
+                    detail.months > 0
+                      ? Math.round((detail.priceSar ?? 0) / detail.months)
+                      : Math.round(((detail.priceSar ?? 0) / Math.max(1, (detail as ApiReservation & { days?: number }).days ?? 30)) * 30),
+                    currency)],
+                  // The lease price incl. VAT — not what was kept after a refund.
+                  ['Lease Total', formatMoney(detail.totalSar, currency)],
+                  // BK-12 for reservations: a paid-then-cancelled lease read "Pending" here.
+                  ['Payment Status', `${translatePortalText(paymentState(detail).label)} ${paymentState(detail).dot}`],
+                  ['Booking Status', translatePortalText(statusLabel(detail))],
                 ].map(([l, v]) => (
                   <div key={l as string} className="rounded-xl border border-slate-100 bg-white p-3 text-center shadow-sm">
                     <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-1">{translatePortalText(l)}</p>

@@ -51,8 +51,11 @@ const WINDOW_LABEL: Record<string, string> = {
 const SERVICE_NAME: Record<string, string> = {
   boat: 'Boat rentals',
   marina: 'Marina berths',
-  fuel: 'Fuel delivery',
+  // Fuel is station-only since 2026-10-12 — the boat goes to the pump.
+  fuel: 'Fuel orders',
   maintenance: 'Maintenance',
+  // Charges with no service type (legacy rows); berths are in the marina line.
+  other: 'Other charges',
 }
 
 export function AdminReportsSnapshot() {
@@ -107,15 +110,36 @@ export function AdminReportsSnapshot() {
   ]
 
   // ── charts ────────────────────────────────────────────
+  /**
+   * The four service lines, plus whatever they leave out.
+   *
+   * The endpoint builds its lines from `trip`, `dock`, `service`, `fuel` and
+   * `maintenance` charges only. Transient berth bookings (`bookingType: 'berth'`)
+   * and older charges with no type are inside Gross revenue but in no line — so
+   * the lines summed to less than the KPI above them, and berth income vanished
+   * from "Marina berths". Until the server files them, the gap is shown as its own
+   * row, computed from the same window's totals, so the breakdown adds up.
+   */
+  const lines = React.useMemo(() => {
+    const raw = (data?.serviceLines ?? []).map(s => ({ key: s.key, bookings: s.bookings, revenue: s.revenue }))
+    const gross = payments?.gross ?? 0
+    const count = payments?.count ?? 0
+    const otherRevenue = gross - raw.reduce((n, s) => n + s.revenue, 0)
+    const otherBookings = count - raw.reduce((n, s) => n + s.bookings, 0)
+    // Half a riyal of float noise is not a service line.
+    if (otherRevenue > 0.5 || otherBookings > 0) raw.push({ key: 'other', bookings: Math.max(0, otherBookings), revenue: Math.max(0, otherRevenue) })
+    return raw
+  }, [data, payments?.gross, payments?.count])
+
   const services = React.useMemo(
-    () => (data?.serviceLines ?? []).map(s => ({
+    () => lines.map(s => ({
       name: translatePortalText(SERVICE_NAME[s.key] ?? s.key),
       bookings: s.bookings,
       revenue: toDisplayMoney(s.revenue),
     })),
     // `currency` re-runs the conversion when the portal's display currency flips.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [data, currency]
+    [lines, currency]
   )
 
   const months: TrendRow[] = React.useMemo(() => {
@@ -134,6 +158,8 @@ export function AdminReportsSnapshot() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data, currency])
 
+  // Hours of the platform clock: the endpoint buckets `$hour` on `paidAt` with
+  // the LOCAL_TZ_OFFSET timezone (it used to be UTC, three hours behind Riyadh).
   const hours: TrendRow[] = (data?.bookingsByHour ?? []).map(b => ({
     x: formatPortalNumber(b.h, { minimumIntegerDigits: 2 }),
     xFull: `${formatPortalNumber(b.h, { minimumIntegerDigits: 2 })}:00`,
@@ -227,7 +253,7 @@ export function AdminReportsSnapshot() {
       ['Currency', BASE_CURRENCY],
       [],
       ['Service line', 'Bookings', `Revenue (${BASE_CURRENCY})`],
-      ...(data.serviceLines ?? []).map(l => [SERVICE_NAME[l.key] ?? l.key, l.bookings, l.revenue]),
+      ...lines.map(l => [SERVICE_NAME[l.key] ?? l.key, l.bookings, l.revenue]),
       [],
       ['Hour of day', 'Bookings'],
       ...(data.bookingsByHour ?? []).map(h => [`${String(h.h).padStart(2, '0')}:00`, h.count]),

@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { TableToolbar, TablePagination, useTableFilters, type TableFiltersConfig } from '../../shared/TableFilters'
 import { motion } from 'framer-motion'
 import {
@@ -7,8 +7,9 @@ import {
 import { money } from '../adminData'
 import { adminPortalApi, type ApiAdminPayment, type ApiReview } from '../../api'
 import { PageWrap, BOOKING_TYPE_META, PAYMENT_STATUS_META as STATUS_META, seededAvatar, personName, earnedCommission, platformCut, paymentProviderLabel, paymentTitle } from './_shared'
-import { ReviewStatCards, ReviewsBoard, useReviewModeration } from './AdminEngage'
+import { ReviewStatCards, ReviewsBoard, useReviewModeration, loadAllReviews, ReviewsTruncatedNote } from './AdminEngage'
 import { Modal, toast, Counter, downloadCsv } from '../../ui'
+import { errorMessage } from '../../async'
 import { AdminHeader, ABadge, ViewToggle } from '../adminUi'
 import { BASE_CURRENCY } from '../../currency'
 import { translatePortalText  , formatPortalDate, formatPortalNumber} from '../../i18n/runtime'
@@ -22,8 +23,38 @@ export function CustomerBookings() {
   const [status, setStatus] = useState<'All' | ApiAdminPayment['status']>('All')
   const [view, setView] = useState<'card' | 'table'>('table')
   const [sel, setSel] = useState<ApiAdminPayment | null>(null)
+  /*
+    Server pages. Only the newest 100 payments were ever fetched — search,
+    the filters, the pagination below and the CSV export all ran over those
+    100, so an older booking could not be found and nothing said the list
+    stopped there. `total` is the ledger's count for this status; "Load more"
+    fetches the next server page onto the end.
+  */
+  const [total, setTotal] = useState(0)
+  const [page, setPage] = useState(1)
+  const [loadingMore, setLoadingMore] = useState(false)
+  const [reloadKey, setReloadKey] = useState(0)
 
   const statuses: ('All' | ApiAdminPayment['status'])[] = ['All', 'paid', 'pending', 'failed', 'refunded', 'partially_refunded']
+  const query = (s: typeof status) => ({ limit: 100, customerRole: 'customer', ...(s === 'All' ? {} : { status: s }) })
+
+  const statusRef = useRef(status)
+  statusRef.current = status
+  const loadMore = () => {
+    if (loadingMore) return
+    const want = status
+    setLoadingMore(true)
+    adminPortalApi.payments({ ...query(want), page: page + 1 })
+      .then(res => {
+        // The tab may have changed while this was in flight.
+        if (want !== statusRef.current) return
+        setItems(list => [...list, ...res.data.items.filter(p => !list.some(x => x._id === p._id))])
+        setTotal(res.data.pagination?.total ?? total)
+        setPage(page + 1)
+      })
+      .catch(e => toast(`${translatePortalText('Could not load more bookings')}: ${errorMessage(e)}`, 'warn'))
+      .finally(() => setLoadingMore(false))
+  }
 
   useEffect(() => {
     /*
@@ -42,16 +73,18 @@ export function CustomerBookings() {
     // fuel or a repair is on that vertical's pages. The tiles are what was
     // collected (`earned`): `totals` follows the status tab, so under "All" it
     // added pending and failed charges into a "gross booking volume".
-    adminPortalApi.payments({ limit: 100, customerRole: 'customer', ...(status === 'All' ? {} : { status }) })
+    adminPortalApi.payments({ ...query(status), page: 1 })
       .then(res => {
         if (!alive) return
         setItems(res.data.items)
         setTotals(res.data.earned ?? res.data.totals)
+        setTotal(res.data.pagination?.total ?? res.data.items.length)
+        setPage(1)
       })
-      .catch(() => { if (alive) setError('Could not load bookings.') })
+      .catch(e => { if (alive) setError(`${translatePortalText('Could not load bookings.')} ${errorMessage(e)}`) })
       .finally(() => { if (alive) setLoading(false) })
     return () => { alive = false }
-  }, [status])
+  }, [status, reloadKey])
 
   /**
    * What an operator asks of a payment ledger.
@@ -220,7 +253,10 @@ export function CustomerBookings() {
       {loading ? (
         <div className="card py-14 text-center text-sm text-slate-400">{translatePortalText("Loading bookings…")}</div>
       ) : error ? (
-        <div className="card py-14 text-center text-sm text-rose-500">{error}</div>
+        <div className="card py-14 text-center text-sm text-rose-500">
+          {error}{' '}
+          <button className="font-bold underline" onClick={() => setReloadKey(k => k + 1)}>{translatePortalText('Retry')}</button>
+        </div>
       ) : view === 'table' ? (
         <div className="card overflow-hidden">
           <div className="overflow-x-auto custom-scrollbar">
@@ -354,6 +390,16 @@ export function CustomerBookings() {
 
       {/* 100 payments in one scroll was the previous behaviour. */}
       {!loading && list.length > 0 && <TablePagination state={tf} noun="payments" />}
+      {!loading && !error && items.length < total && (
+        <div className="mt-4 flex flex-col items-center gap-2">
+          <p className="text-xs font-semibold text-amber-700">
+            {translatePortalText('Loaded the newest')} {formatPortalNumber(items.length)} {translatePortalText('of')} {formatPortalNumber(total)} {translatePortalText('payments — search, filters and export cover only these.')}
+          </p>
+          <button className="btn-ghost" disabled={loadingMore} onClick={loadMore}>
+            {loadingMore ? translatePortalText('Loading…') : translatePortalText('Load older payments')}
+          </button>
+        </div>
+      )}
 
       <Modal open={!!sel} onClose={() => setSel(null)} title={sel ? `📋 ${paymentTitle(sel)}` : ''}>
         {sel && (
@@ -425,18 +471,22 @@ export function CustomerBookings() {
  */
 export function CustomerReviews() {
   const [reviews, setReviews] = useState<ApiReview[]>([])
+  const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const moderation = useReviewModeration(setReviews)
 
-  useEffect(() => {
+  // Every page, not the first 100: the tiles and tab counts were computed off
+  // one page, sorted most-reported first, so past 100 they described a sample.
+  const load = () => {
     setLoading(true)
     setError(null)
-    adminPortalApi.reviews({ authorRole: 'customer', limit: 100 })
-      .then(res => setReviews(res.data.items))
-      .catch(() => setError(translatePortalText('Could not load reviews.')))
+    loadAllReviews({ authorRole: 'customer' })
+      .then(res => { setReviews(res.items); setTotal(res.total) })
+      .catch(e => setError(`${translatePortalText('Could not load reviews.')} ${errorMessage(e)}`))
       .finally(() => setLoading(false))
-  }, [])
+  }
+  useEffect(() => { load() }, [])
 
   return (
     <PageWrap>
@@ -448,10 +498,14 @@ export function CustomerReviews() {
       {loading ? (
         <div className="card py-14 text-center text-sm text-slate-400">{translatePortalText("Loading reviews…")}</div>
       ) : error ? (
-        <div className="card py-14 text-center text-sm text-rose-500">{error}</div>
+        <div className="card py-14 text-center text-sm text-rose-500">
+          {error}{' '}
+          <button className="font-bold underline" onClick={load}>{translatePortalText('Retry')}</button>
+        </div>
       ) : (<>
         <ReviewStatCards reviews={reviews} />
-        <ReviewsBoard reviews={reviews} emptyLabel={translatePortalText("No customer reviews match this filter.")} {...moderation.boardProps} />
+        <ReviewsTruncatedNote shown={reviews.length} total={total} />
+        <ReviewsBoard reviews={reviews} emptyLabel={translatePortalText(reviews.length ? "No customer reviews match this filter." : "Customers have not written any reviews yet.")} {...moderation.boardProps} />
       </>)}
       {moderation.modals}
     </PageWrap>

@@ -6,6 +6,7 @@ import { Send, Search, MessageSquarePlus, Inbox, RefreshCw, CornerDownRight, X }
 import {
   adminPortalApi,
   chatApi,
+  fileUrl,
   type AdminPortalUser,
   type ApiChat,
   type ApiMessage,
@@ -65,6 +66,9 @@ export function AdminOutreach() {
 
   const [threads, setThreads] = useState<ApiChat[]>([])
   const [loadingThreads, setLoadingThreads] = useState(true)
+  // A failed load used to fall through to "No conversations yet", which reads as
+  // a fact about the inbox rather than about the request.
+  const [threadsError, setThreadsError] = useState('')
   const [activeId, setActiveId] = useState<string | null>(null)
   const [messages, setMessages] = useState<ApiMessage[]>([])
   const [loadingThread, setLoadingThread] = useState(false)
@@ -87,11 +91,16 @@ export function AdminOutreach() {
       const res = await chatApi.myDirectChats()
       const direct = res.data.items.filter(c => c.type === 'direct')
       setThreads(direct)
+      setThreadsError('')
       if (!keepActive || !direct.some(c => (c.id ?? c._id) === activeId)) {
         setActiveId(direct[0] ? (direct[0].id ?? direct[0]._id) : null)
       }
     } catch (e) {
-      toast(translatePortalText(e instanceof Error ? e.message : 'Could not load conversations'), 'warn')
+      const message = translatePortalText(e instanceof Error ? e.message : 'Could not load conversations')
+      // Only an empty list is replaced by the error; a failed refresh keeps the
+      // threads already on screen and says so in a toast.
+      if (!threads.length) setThreadsError(message)
+      toast(message, 'warn')
     } finally {
       setLoadingThreads(false)
     }
@@ -181,7 +190,8 @@ export function AdminOutreach() {
 
   const send = async () => {
     const text = draft.trim()
-    if (!text || !activeId) return
+    // Enter bypasses the disabled send button, so a quick double Enter sent twice.
+    if (!text || !activeId || sending) return
     setSending(true)
     try {
       const res = await chatApi.send(activeId, text, {
@@ -250,6 +260,13 @@ export function AdminOutreach() {
         <div className="h-[70vh] min-h-[420px] max-h-[720px] overflow-y-auto rounded-xl border border-slate-100">
           {loadingThreads ? (
             <div className="flex justify-center py-12"><Spinner /></div>
+          ) : threadsError && !threads.length ? (
+            <div className="px-4 py-12 text-center text-xs text-rose-600">
+              <p className="mb-3 font-semibold">{threadsError}</p>
+              <button onClick={() => void loadThreads(false)} className="btn-ghost !py-1.5 !px-3 !text-[11px]">
+                <RefreshCw size={12} /> {translatePortalText('Try again')}
+              </button>
+            </div>
           ) : !threads.length ? (
             <div className="px-4 py-12 text-center text-xs text-slate-400">
               <Inbox size={20} className="mx-auto mb-2 text-slate-300" />
@@ -267,7 +284,7 @@ export function AdminOutreach() {
                     id === activeId ? 'bg-ocean-50/70' : 'hover:bg-slate-50'
                   }`}
                 >
-                  <Avatar name={displayName(other)} src={other?.avatar} size={30} />
+                  <Avatar name={displayName(other)} src={fileUrl(other?.avatar)} size={30} />
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center justify-between gap-2">
                       <p className="truncate text-[12px] font-bold text-deep-900">{displayName(other)}</p>
@@ -311,7 +328,7 @@ export function AdminOutreach() {
                 <Avatar name={displayName(counterpart(active))} src={counterpart(active)?.avatar} size={30} />
                 <div className="min-w-0">
                   <p className="truncate text-[13px] font-bold text-deep-900">{displayName(counterpart(active))}</p>
-                  <p className="text-[10.5px] text-slate-400">{counterpart(active)?.role ?? 'Direct conversation'}</p>
+                  <p className="text-[10.5px] text-slate-400">{translatePortalText(counterpart(active)?.role ?? 'Direct conversation')}</p>
                 </div>
               </div>
 
@@ -465,6 +482,9 @@ function Directory({
   const [query, setQuery] = useState('')
   const [debounced, setDebounced] = useState('')
   const [results, setResults] = useState<AdminPortalUser[]>([])
+  // How many matched across the roles asked, against how many came back — the
+  // directory takes 25 a role, and a list that stops silently reads as everyone.
+  const [matched, setMatched] = useState(0)
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
@@ -484,11 +504,18 @@ function Directory({
       request per provider role, so there is more in flight than it looks.
     */
     let alive = true
-    Promise.all(roles.map(r => adminPortalApi.users({ role: r, q: debounced || undefined, limit: 25 })))
-      .then(pages => { if (alive) setResults(pages.flatMap(p => p.data.items)) })
+    // Active accounts only: the server refuses a thread with a deactivated one
+    // ("User not found"), so listing them offered a click that could only fail.
+    Promise.all(roles.map(r => adminPortalApi.users({ role: r, q: debounced || undefined, limit: 25, active: true })))
+      .then(pages => {
+        if (!alive) return
+        setResults(pages.flatMap(p => p.data.items))
+        setMatched(pages.reduce((n, p) => n + (p.data.pagination?.total ?? p.data.items.length), 0))
+      })
       .catch(e => {
         if (!alive) return
         setResults([])
+        setMatched(0)
         toast(translatePortalText(e instanceof Error ? e.message : 'Could not load the directory'), 'warn')
       })
       .finally(() => { if (alive) setLoading(false) })
@@ -531,8 +558,13 @@ function Directory({
           <div className="flex justify-center py-12"><Spinner /></div>
         ) : !results.length ? (
           <p className="px-4 py-12 text-center text-xs text-slate-400">{translatePortalText("Nobody matches that.")}</p>
-        ) : (
-          results.map(u => {
+        ) : (<>
+          {matched > results.length && (
+            <p className="border-b border-slate-50 bg-sand/60 px-3 py-1.5 text-[10.5px] text-slate-500">
+              {translatePortalText('Showing')} {formatPortalNumber(results.length)} {translatePortalText('of')} {formatPortalNumber(matched)} — {translatePortalText('search to narrow the list')}
+            </p>
+          )}
+          {results.map(u => {
             const id = u.id ?? (u as unknown as { _id: string })._id
             return (
               <button
@@ -541,7 +573,7 @@ function Directory({
                 disabled={busyId !== null}
                 className="flex w-full items-center gap-2.5 border-b border-slate-50 px-3 py-2 text-start transition last:border-0 hover:bg-slate-50 disabled:opacity-50"
               >
-                <Avatar name={u.business?.businessName || u.name} src={u.avatar} size={28} />
+                <Avatar name={u.business?.businessName || u.name} src={fileUrl(u.avatar)} size={28} />
                 <div className="min-w-0 flex-1">
                   <p className="truncate text-[12px] font-bold text-deep-900">
                     {u.business?.businessName || u.name}
@@ -551,8 +583,8 @@ function Directory({
                 {busyId === id ? <Spinner size={12} /> : <MessageSquarePlus size={13} className="shrink-0 text-slate-300" />}
               </button>
             )
-          })
-        )}
+          })}
+        </>)}
       </div>
     </div>
   )

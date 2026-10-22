@@ -2,7 +2,7 @@ import React, { useMemo, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { CalendarDays, Check, X, Eye, Lock, Bell, CreditCard, CheckCircle2 } from 'lucide-react'
 import {
-  money, toBooking, BOOKING_ACTION, METHOD_LABELS, METHOD_VALUE,
+  money, toBooking, BOOKING_ACTION,
   type BookingStatus, type FuelBooking,
 } from '../fuelData'
 import { fuelApi } from '../fuelApi'
@@ -52,7 +52,7 @@ export function FuelBookings() {
   const isUnapproved = !isAllStations && isStationUnapproved(currentStation)
 
   const [orderForm, setOrderForm] = useState({
-    customer: '', email: '', boat: '', fuel: '', qty: '', method: 'Dockside' as (typeof METHOD_LABELS)[number],
+    customer: '', email: '', boat: '', fuel: '', qty: '',
     location: '', date: '', time: '', emergency: false,
   })
 
@@ -159,13 +159,13 @@ export function FuelBookings() {
         customerName: orderForm.customer.trim(),
         customerEmail: orderForm.email.trim() || undefined,
         boatName: orderForm.boat.trim(),
-        method: METHOD_VALUE[orderForm.method],
+        // Every order is filled here at the fuel dock — there is no delivery to choose.
         emergency: orderForm.emergency,
         location: orderForm.location.trim() || undefined,
         scheduledAt: toIso(orderForm.date, orderForm.time),
       })
       setNewOrder(false)
-      setOrderForm({ customer: '', email: '', boat: '', fuel: '', qty: '', method: 'Dockside', location: '', date: '', time: '', emergency: false })
+      setOrderForm({ customer: '', email: '', boat: '', fuel: '', qty: '', location: '', date: '', time: '', emergency: false })
       await res.reload()
       void refresh()
       toast(translatePortalText(`Order ${data.booking.bookingNo ?? ''} created`.trim()))
@@ -299,7 +299,7 @@ export function FuelBookings() {
             <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
               <Metric icon={fuelByKey(sel.fuel).icon} label={translatePortalText("Fuel")} value={fuelByKey(sel.fuel).name.split(' ')[0]} />
               <Metric icon="🔢" label={translatePortalText("Quantity")} value={`${sel.qty.toLocaleString(portalLocale())} ${fuelByKey(sel.fuel).unit}`} />
-              <Metric icon="🚚" label={translatePortalText("Method")} value={translatePortalText(sel.method)} />
+              <Metric icon="⚓" label={translatePortalText("Where")} value={translatePortalText(sel.method)} />
               <Metric icon="💵" label={translatePortalText("Amount")} value={money(sel.amount)} />
             </div>
             {sel.notes && <div className="rounded-xl border border-amber-100 bg-amber-50 p-3 text-xs font-semibold text-amber-700">📝 {sel.notes}</div>}
@@ -339,7 +339,7 @@ export function FuelBookings() {
                   maxLength={500}
                   value={editReason}
                   onChange={e => setEditReason(e.target.value)}
-                  placeholder={translatePortalText("e.g. the barge is in dry dock that morning")}
+                  placeholder={translatePortalText("e.g. the fuel dock is closed for maintenance that morning")}
                 />
                 <p className="mt-1 text-[11px] text-slate-400">{translatePortalText("The booking keeps its current time until the owner accepts.")}</p>
               </div>
@@ -376,12 +376,8 @@ export function FuelBookings() {
               </select></div>
             <div><label className="label">{translatePortalText("Quantity")}</label>
               <input className="input" type="number" placeholder="200" value={orderForm.qty} onChange={e => setOrderForm(s => ({ ...s, qty: e.target.value }))} /></div>
-            <div><label className="label">{translatePortalText("Method")}</label>
-              <select className="input" value={orderForm.method} onChange={e => setOrderForm(s => ({ ...s, method: e.target.value as typeof orderForm.method }))}>
-                {METHOD_LABELS.map(m => <option key={m} value={m}>{translatePortalText(m)}</option>)}
-              </select></div>
-            <div><label className="label">{translatePortalText("Location")}</label>
-              <input className="input" placeholder={'Azure Bay · Fuel Dock 1'} value={orderForm.location} onChange={e => setOrderForm(s => ({ ...s, location: e.target.value }))} /></div>
+            <div><label className="label">{translatePortalText("Fuel dock / pump")}</label>
+              <input className="input" placeholder={translatePortalText("Fuel Dock 1")} value={orderForm.location} onChange={e => setOrderForm(s => ({ ...s, location: e.target.value }))} /></div>
             <div><label className="label">{translatePortalText("Date")}</label>
               <input className="input" placeholder={translatePortalText("Jul 22")} value={orderForm.date} onChange={e => setOrderForm(s => ({ ...s, date: e.target.value }))} /></div>
             <div><label className="label">{translatePortalText("Time")}</label>
@@ -390,6 +386,7 @@ export function FuelBookings() {
               <input type="checkbox" checked={orderForm.emergency} onChange={e => setOrderForm(s => ({ ...s, emergency: e.target.checked }))} />{translatePortalText("🚨 Emergency request")}</label>
           </div>
           <div className="rounded-xl bg-sand p-3 text-xs text-slate-500">{translatePortalText("Estimated amount: ")}<b className="text-deep-900">{money(quoted)}</b>
+            <p className="mt-1">{translatePortalText("The boat comes alongside your fuel dock — fuel is not delivered to berths.")}</p>
           </div>
           <LoadingButton loading={busy} className="btn-fuel w-full !justify-center !py-2.5" onClick={submitNewOrder}>{translatePortalText("Create order")}</LoadingButton>
         </div>
@@ -569,7 +566,7 @@ export function FuelDeliveries() {
                           <button
                             className={`btn-fuel !py-1.5 !px-2.5 !text-[11px] ${!b.paid ? '!bg-amber-600 hover:!bg-amber-700' : '!bg-emerald-600 hover:!bg-emerald-700'}`}
                             disabled={busy || (!b.paid && b.amount > 0)}
-                            title={translatePortalText(!b.paid && b.amount > 0 ? 'Customer payment required via HyperPay before delivery completion' : undefined)}
+                            title={translatePortalText(!b.paid && b.amount > 0 ? 'Customer payment required via HyperPay before the fill is completed' : undefined)}
                             onClick={() => act(b, 'Completed', `Order ${b.ref} completed`)}
                           >
                             {!b.paid && b.amount > 0 ? <span className="flex items-center gap-1"><Lock size={11} />{translatePortalText(" Complete")}</span> : translatePortalText("Complete")}
@@ -602,7 +599,7 @@ export function FuelDeliveries() {
             <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
               <Metric icon={fuelByKey(sel.fuel).icon} label={translatePortalText("Fuel")} value={fuelByKey(sel.fuel).name.split(' ')[0]} />
               <Metric icon="🔢" label={translatePortalText("Quantity")} value={`${sel.qty.toLocaleString(portalLocale())} ${fuelByKey(sel.fuel).unit}`} />
-              <Metric icon="🚚" label={translatePortalText("Method")} value={translatePortalText(sel.method)} />
+              <Metric icon="⚓" label={translatePortalText("Where")} value={translatePortalText(sel.method)} />
               <Metric icon="💵" label={translatePortalText("Amount")} value={money(sel.amount)} />
             </div>
 
@@ -628,14 +625,14 @@ export function FuelDeliveries() {
                   >
                     <Bell size={12} />{translatePortalText(" Send Payment Reminder")}</button>
                 </div>
-                <p className="mt-1 text-[11px] text-amber-700 font-medium">{translatePortalText("Delivery completion is locked until the customer pays ")}{money(sel.amount)}{translatePortalText(" via HyperPay in the app.")}</p>
+                <p className="mt-1 text-[11px] text-amber-700 font-medium">{translatePortalText("Completing the fill is locked until the customer pays ")}{money(sel.amount)}{translatePortalText(" via HyperPay in the app.")}</p>
               </div>
             )}
 
             {sel.paid && sel.amount > 0 && (
               <div className="flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 p-2.5 text-xs font-bold text-emerald-800">
                 <CheckCircle2 size={16} className="text-emerald-600 shrink-0" />
-                <span>{translatePortalText("Payment settled via HyperPay (")}{money(sel.amount)}{translatePortalText(") · Fuel delivery is authorized for completion")}</span>
+                <span>{translatePortalText("Payment settled via HyperPay (")}{money(sel.amount)}{translatePortalText(") · The fill can be completed")}</span>
               </div>
             )}
 
@@ -651,13 +648,13 @@ export function FuelDeliveries() {
                 <button
                   className={`btn-fuel flex-1 !justify-center ${!sel.paid && sel.amount > 0 ? '!bg-amber-600 hover:!bg-amber-700' : '!bg-emerald-600 hover:!bg-emerald-700'}`}
                   disabled={busy || (!sel.paid && sel.amount > 0)}
-                  title={translatePortalText(!sel.paid && sel.amount > 0 ? 'Customer payment required via HyperPay before delivery' : undefined)}
+                  title={translatePortalText(!sel.paid && sel.amount > 0 ? 'Customer payment required via HyperPay before the fill is completed' : undefined)}
                   onClick={() => act(sel, 'Completed', `Order ${sel.ref} completed`)}
                 >
                   {!sel.paid && sel.amount > 0 ? (
-                    <span className="flex items-center gap-1.5"><Lock size={13} />{translatePortalText(" Complete Delivery (Payment Required)")}</span>
+                    <span className="flex items-center gap-1.5"><Lock size={13} />{translatePortalText(" Complete fill (Payment Required)")}</span>
                   ) : (
-                    translatePortalText('Complete Delivery')
+                    translatePortalText('Complete fill')
                   )}
                 </button>
               )}

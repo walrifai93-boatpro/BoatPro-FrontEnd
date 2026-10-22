@@ -30,6 +30,8 @@ import {
 import { PageWrap } from './_shared';
 import { AdminHeader } from '../adminUi';
 import { Modal, toast, Counter, CardGridSkeleton } from '../../ui';
+import { confirm } from '../../async';
+import { money } from '../../format';
 import { translatePortalText  , formatPortalDate, formatPortalNumber, formatPortalPercent, isPortalArabic} from '../../i18n/runtime'
 import { adminApi, fileUrl, type AdminMarinaApproval } from '../../api';
 
@@ -70,6 +72,16 @@ function approvalBadgeLabel(m: AdminMarinaApproval): string {
   return translatePortalText('Draft')
 }
 
+/**
+ * Read off `expiresAt`: the approvals endpoint sends the raw MarinaDocument rows,
+ * which carry no computed `status` — the type's `status` is never set here.
+ */
+function isExpired(doc: { expiresAt?: string }): boolean {
+  if (!doc.expiresAt) return false;
+  const t = new Date(doc.expiresAt).getTime();
+  return !Number.isNaN(t) && t < Date.now();
+}
+
 function marinaId(m?: AdminMarinaApproval | null): string {
   if (!m) return '';
   return m._id || m.id || '';
@@ -91,11 +103,19 @@ export default function AdminMarinaApprovals() {
     setLoading(true);
     setError(null);
     try {
-      // 100, the API's cap. Without a limit it served its default of 20, so
-      // the 21st pending marina was never on screen though the tab counted it.
-      const res = await adminApi.listMarinaApprovals({ limit: 100, ...(tab ? { approvalStatus: tab } : {}) });
-      setMarinas(res.data?.marinas || []);
-      setCounts(res.data?.statusCounts || {});
+      // 100 a page, the API's cap. Without a limit it served its default of 20,
+      // so the 21st pending marina was never on screen though the tab counted
+      // it — and a single page of 100 had the same problem at the 101st.
+      const all: AdminMarinaApproval[] = [];
+      let statusCounts: Record<string, number> = {};
+      for (let page = 1; page <= 50; page++) {
+        const res = await adminApi.listMarinaApprovals({ limit: 100, page, ...(tab ? { approvalStatus: tab } : {}) });
+        all.push(...(res.data?.marinas || []));
+        statusCounts = res.data?.statusCounts || {};
+        if (!res.data?.marinas?.length || all.length >= (res.data?.total ?? 0)) break;
+      }
+      setMarinas(all);
+      setCounts(statusCounts);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load marinas');
     } finally {
@@ -124,18 +144,42 @@ export default function AdminMarinaApprovals() {
     }
   };
 
-  const doApprove = (marina: AdminMarinaApproval) => {
+  /**
+   * Approve and publish, after naming what the admin is approving past.
+   *
+   * The server only refuses a marina with critical readiness gaps. It publishes
+   * one with no compliance paperwork at all, with an expired licence, or one
+   * still in draft that its owner never submitted — and the button did that in
+   * one click.
+   */
+  const doApprove = async (marina: AdminMarinaApproval) => {
     const id = marinaId(marina);
-    if (!id) return;
+    if (!id || busyId) return;
     if (marina.completeness && !marina.completeness.isComplete) {
       toast(translatePortalText(`Cannot approve: ${formatPortalNumber(marina.completeness.criticalCount)} critical requirements are missing.`), 'warn');
       return;
     }
+    const docs = marina.complianceDocs ?? [];
+    const expired = docs.filter(isExpired);
+    const warningItems = marina.completeness?.missingItems?.filter((it) => it.severity !== 'critical') ?? [];
+    const warnings: string[] = [];
+    if ((marina.approvalStatus || 'draft') === 'draft') warnings.push(translatePortalText('This marina is still a draft — the owner has not submitted it for review.'));
+    if (docs.length === 0) warnings.push(translatePortalText('No compliance documents are on file.'));
+    if (expired.length) warnings.push(translatePortalText(`Expired: ${expired.map((d) => d.name).join(', ')}.`));
+    if (warningItems.length) warnings.push(translatePortalText(`${warningItems.length} readiness warning${warningItems.length === 1 ? '' : 's'} open.`));
+    const ok = await confirm({
+      title: `Approve and publish "${marina.name}"?`,
+      body: [...warnings, translatePortalText('It becomes visible to boaters straight away.')].join(' '),
+      confirmLabel: warnings.length ? 'Publish anyway' : 'Approve & publish',
+      danger: warnings.length > 0,
+    });
+    if (!ok) return;
+    setDetail(null);
     act(marina, () => adminApi.approveMarina(id), `"${marina.name}" approved and published live! ✅`);
   };
 
   const doReject = () => {
-    if (!rejecting) return;
+    if (!rejecting || busyId) return;
     const id = marinaId(rejecting);
     if (!id) {
       toast(translatePortalText('Invalid marina ID'), 'warn');
@@ -356,11 +400,15 @@ export default function AdminMarinaApprovals() {
                     {/* Owner info */}
                     {m.owner && (
                       <div className="flex items-center gap-2.5 rounded-xl bg-slate-50 dark:bg-slate-800/60 p-2.5 text-xs">
-                        <img
-                          src={fileUrl(m.owner.avatar) || `https://ui-avatars.com/api/?name=${encodeURIComponent(m.owner.name || 'Owner')}&background=0d9488&color=fff`}
-                          alt=""
-                          className="h-7 w-7 rounded-full object-cover"
-                        />
+                        {/* Initials drawn here, not by ui-avatars.com: that sent each
+                            owner's name to a third-party server on every render. */}
+                        {fileUrl(m.owner.avatar) ? (
+                          <img src={fileUrl(m.owner.avatar)} alt="" className="h-7 w-7 rounded-full object-cover" />
+                        ) : (
+                          <span aria-hidden className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-teal-600 text-[10px] font-bold text-white">
+                            {(m.owner.name || 'O').trim().split(/\s+/).slice(0, 2).map((w: string) => w[0]?.toUpperCase() ?? '').join('')}
+                          </span>
+                        )}
                         <div className="truncate">
                           <p className="font-bold text-deep-900 dark:text-white leading-tight truncate">
                             {m.owner.business?.businessName || m.owner.name}
@@ -382,7 +430,7 @@ export default function AdminMarinaApprovals() {
                         <p className="text-[10px] font-bold text-slate-500 uppercase">{translatePortalText("Min Rate")}</p>
                         <p className="font-display font-extrabold text-teal-600 dark:text-teal-400">
                           {/* The lowest monthly slot rate — the only rate the readiness check reads. */}
-                          {m.minPrice ? `${formatPortalNumber(m.minPrice)} ${translatePortalText('SAR')} / ${translatePortalText('month')}` : translatePortalText('None')}
+                          {m.minPrice ? `${money(m.minPrice)} / ${translatePortalText('month')}` : translatePortalText('None')}
                         </p>
                       </div>
                       <div className="rounded-xl border border-slate-100 bg-slate-50/70 p-2 dark:border-slate-800 dark:bg-slate-900/50">
@@ -454,7 +502,7 @@ export default function AdminMarinaApprovals() {
                     {status !== 'approved' && (
                       <button
                         disabled={isBusy || (completeness && !completeness.isComplete)}
-                        onClick={() => doApprove(m)}
+                        onClick={() => void doApprove(m)}
                         title={translatePortalText(completeness && !completeness.isComplete ? 'Cannot approve: critical items missing' : 'Approve and publish marina')}
                         className={`btn-primary !py-1.5 !px-3 !text-xs font-extrabold inline-flex items-center gap-1 shadow-sm ${
                           completeness && !completeness.isComplete
@@ -482,16 +530,23 @@ export default function AdminMarinaApprovals() {
             <label className="label">{translatePortalText("Rejection / Change Request Reason *")}</label>
             <textarea
               value={reason}
+              dir="auto"
               onChange={(e) => setReason(e.target.value)}
               placeholder={translatePortalText("e.g. Please update the physical street address, configure at least 2 berth slots with monthly pricing, and provide an emergency VHF channel.")}
               className="input min-h-[100px] text-xs"
             />
           </div>
 
+          {rejecting?.approvalStatus === 'approved' && (
+            <p className="rounded-lg bg-amber-50 px-2.5 py-1.5 text-[11px] font-semibold text-amber-800">
+              {translatePortalText("This marina is approved. Rejecting it unpublishes it — boaters stop seeing it straight away.")}
+            </p>
+          )}
+
           <div className="flex justify-end gap-2 pt-2">
             <button className="btn-ghost" onClick={() => setRejecting(null)}>
               {translatePortalText("\n              Cancel\n            ")}</button>
-            <button className="btn-primary !bg-rose-600 hover:!bg-rose-700 !text-white font-bold" onClick={doReject}>
+            <button className="btn-primary !bg-rose-600 hover:!bg-rose-700 !text-white font-bold disabled:opacity-60" disabled={!!busyId || reason.trim().length < 3} onClick={doReject}>
               {translatePortalText("\n              Confirm Rejection\n            ")}</button>
           </div>
         </div>
@@ -632,12 +687,15 @@ export default function AdminMarinaApprovals() {
                       <div className="min-w-0 flex-1">
                         <p className="truncate font-bold text-deep-900 dark:text-white text-xs">{doc.name}</p>
                         <p className="text-[10px] text-slate-400 capitalize">
-                          {translatePortalText(doc.type.replace(/_/g, ' '))} {doc.reference ? `· ${translatePortalText('Ref: ')}${doc.reference}` : ''}
+                          {translatePortalText(String(doc.type || 'other').replace(/_/g, ' '))} {doc.reference ? `· ${translatePortalText('Ref: ')}${doc.reference}` : ''}
                         </p>
                         {doc.expiresAt && (
-                          <p className="text-[10px] text-slate-500">
-                            {translatePortalText("\n                            Expires: ")}{formatPortalDate(new Date(doc.expiresAt))}
+                          <p className={`text-[10px] ${isExpired(doc) ? 'font-bold text-rose-600' : 'text-slate-500'}`}>
+                            {translatePortalText(isExpired(doc) ? 'Expired: ' : 'Expires: ')}{formatPortalDate(new Date(doc.expiresAt))}
                           </p>
+                        )}
+                        {!doc.fileUrl && (
+                          <p className="text-[10px] font-bold text-amber-600">{translatePortalText('No file attached')}</p>
                         )}
                       </div>
                       {doc.fileUrl && (
@@ -707,12 +765,9 @@ export default function AdminMarinaApprovals() {
               )}
               {detail.approvalStatus !== 'approved' && (
                 <button
-                  disabled={detail.completeness && !detail.completeness.isComplete}
-                  className="btn-primary !bg-emerald-600 hover:!bg-emerald-700 !text-white font-bold"
-                  onClick={() => {
-                    doApprove(detail);
-                    setDetail(null);
-                  }}
+                  disabled={!!busyId || (detail.completeness && !detail.completeness.isComplete)}
+                  className="btn-primary !bg-emerald-600 hover:!bg-emerald-700 !text-white font-bold disabled:opacity-60"
+                  onClick={() => void doApprove(detail)}
                 >
                   {translatePortalText("\n                  Approve & Publish\n                ")}</button>
               )}

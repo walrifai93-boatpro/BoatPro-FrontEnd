@@ -32,7 +32,17 @@ const KIND_STYLE: Record<FuelEventKind, string> = {
 }
 
 const KIND_ICON: Record<FuelEventKind, string> = {
-  barge: '⚓', truck: '🚚', refill: '🛢️', pricing: '🏷️', maintenance: '🔧',
+  barge: '⛽', truck: '🚚', refill: '🛢️', pricing: '🏷️', maintenance: '🔧',
+}
+
+/**
+ * What each bucket holds. The stored kind names are historical: `barge` is
+ * where fuel orders land, and `truck` only holds dispatch runs from when fuel
+ * was still delivered to boats — fuel is served at the station only now, so
+ * nothing new is filed there.
+ */
+const KIND_LABEL: Record<FuelEventKind, string> = {
+  barge: 'Fuel orders', truck: 'Past dispatches', refill: 'Tank refills', pricing: 'Price changes', maintenance: 'Maintenance',
 }
 
 interface CalCell {
@@ -129,7 +139,7 @@ export default function FuelCalendar() {
     <div className="space-y-5">
       <FuelHeader
         title={translatePortalText("Fuel Station Calendar")}
-        sub={translatePortalText(`${monthTitle} — scheduled barge deliveries, truck dispatches, tank refills & station maintenance`)}
+        sub={translatePortalText(`${monthTitle} — fuel dock orders, tank refills, price changes & station maintenance`)}
         icon={<CalendarDays className="text-amber-500" />}
         actions={
           <>
@@ -149,7 +159,7 @@ export default function FuelCalendar() {
             onClick={() => setFilters(f => ({ ...f, [k]: !f[k] }))}
             className={`chip ring-1 capitalize transition ${filters[k] ? KIND_STYLE[k] : 'bg-white text-slate-300 ring-slate-100'}`}
           >
-            {KIND_ICON[k]} {translatePortalText(k)}
+            {KIND_ICON[k]} {translatePortalText(KIND_LABEL[k])}
           </button>
         ))}
       </div>
@@ -269,7 +279,7 @@ export default function FuelCalendar() {
               className="input"
               value={form.label}
               onChange={e => setForm(f => ({ ...f, label: e.target.value }))}
-              placeholder={translatePortalText("e.g. Bulk Fuel Delivery Dock B")}
+              placeholder={translatePortalText("e.g. Fleet fill-up at Dock B")}
             />
           </div>
           <div className="grid grid-cols-2 gap-3">
@@ -291,8 +301,7 @@ export default function FuelCalendar() {
                 value={form.kind}
                 onChange={e => setForm(f => ({ ...f, kind: e.target.value as FuelEventKind }))}
               >
-                <option value="barge">{translatePortalText("⚓ Barge Delivery")}</option>
-                <option value="truck">{translatePortalText("🚚 Truck Dispatch")}</option>
+                <option value="barge">{translatePortalText("⛽ Fuel dock booking")}</option>
                 <option value="refill">{translatePortalText("🛢️ Tank Refill")}</option>
                 <option value="pricing">{translatePortalText("🏷️ Price Change")}</option>
                 <option value="maintenance">{translatePortalText("🔧 Station Maintenance")}</option>

@@ -5,13 +5,15 @@ import { Anchor, Plus, Pencil, Trash2, Droplets, Zap, Wifi, Camera, AlertTriangl
 import { PageHeader, Badge, Modal, toast, SearchInput, ViewToggle, AsyncBlock, EmptyState } from '../ui'
 import { TablePagination, useTableFilters, type TableFiltersConfig } from '../shared/TableFilters'
 import { confirmAndRun } from '../async'
-import { useAsync, useMarina, berthLabel, fmtDate, formatMoney, humanize } from '../live'
+import { useAsync, useMarina, berthLabel, fmtDate, formatMoney, humanize, RESERVATION_LABELS } from '../live'
 import { useOps } from '../opsStore'
 import { marinaApi, portalApi, type ApiBerthMapEntry, type SlotCategory, type SlotStatus, type DockPlan } from '../api'
 import { useLimitAwareAction, usePackageUsage, UsageMeter } from '../shared/packageLimit'
 import BerthModal from '../components/BerthModal'
+import { useMarinaPermissions } from '../auth'
+import { StaffAccessNote } from '../components/StaffAccessNote'
 import DockModal from '../components/DockModal'
-import { canonicalField, formatPortalNumber, translatePortalText } from '../i18n/runtime'
+import { canonicalField, formatPortalNumber, meterUnit, translatePortalText } from '../i18n/runtime'
 
 
 // The five berth states, in the operator's language.
@@ -27,6 +29,32 @@ const POWER = ['16A', '32A', '63A', '3-phase 125A']
 
 /** "A-01" — how the crew writes a berth. */
 const code = (b: ApiBerthMapEntry) => `${b.pontoon}-${String(b.number).padStart(2, '0')}`
+
+/**
+ * Who is on the berth, in words that match what is actually happening there.
+ *
+ * The berth map attaches whichever reservation holds the berth — a request the
+ * marina has not answered, a lease waiting on payment, a paid lease whose boat
+ * has not arrived — and every one of them used to read "⛵ <boat> docked". Only
+ * a boat the server reports as checked in and not since checked out is.
+ */
+function holdOf(b: ApiBerthMapEntry): { icon: string; boat: string; state: string } | null {
+  const r = b.reservation
+  if (!r) return null
+  if ((r as { isAlongside?: boolean }).isAlongside === true) return { icon: '⛵', boat: r.boatName, state: 'alongside' }
+  if (r.status === 'active') return { icon: '⚓', boat: r.boatName, state: 'held — not checked in' }
+  return { icon: '⏳', boat: r.boatName, state: RESERVATION_LABELS[r.status] ?? humanize(r.status) }
+}
+
+/** "12.5 m" in the portal's numerals and unit — the bare "m" stayed Latin in Arabic. */
+const metres = (v?: number | null) => (v != null ? `${formatPortalNumber(v)} ${meterUnit()}` : '—')
+
+/**
+ * The two states bookings set. Choosing "Occupied" by hand on an empty berth
+ * printed a boat-shaped hole into occupancy, and the next booking change
+ * overwrote it anyway — so they are shown, but only bookings move a berth into them.
+ */
+const DERIVED_STATUSES: SlotStatus[] = ['reserved', 'booked']
 
 export default function Berths() {
   const location = useLocation()
@@ -46,6 +74,9 @@ export default function Berths() {
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [managingDocks, setManagingDocks] = useState(false)
   const [addingDock, setAddingDock] = useState(false)
+  // Docks and berths are berth configuration (`manage_slots`); a pricing-only staff member re-prices, nothing more.
+  const canConfigure = useMarinaPermissions().can('manage_slots')
+  const noConfigure = canConfigure ? undefined : translatePortalText('Needs “Berths & live map” access')
   const [edit, setEdit] = useState<ApiBerthMapEntry | null>(null)
   const [adding, setAdding] = useState(false)
   const [view, setView] = useState<'card' | 'table'>('table')
@@ -100,13 +131,42 @@ export default function Berths() {
     setAdding(true)
   }
 
+  // The berth whose status is being written — its dropdown is disabled until
+  // the server answers, so a second pick can't race the first.
+  const [statusBusy, setStatusBusy] = useState<string | null>(null)
+
   const setBerthStatus = async (b: ApiBerthMapEntry, next: SlotStatus) => {
+    if (next === b.status) return
+    const label = STATUSES.find(s => s.value === next)?.label ?? next
+    const r = b.reservation
+    // Taking a held berth out of service doesn't move or cancel the lease — the
+    // server allows it, and the boat (or the boat on its way) keeps its booking
+    // on a berth nobody can use. Make the operator say so.
+    if (r && (next === 'maintenance' || next === 'blocked')) {
+      setStatusBusy(b.id)
+      try {
+        await confirmAndRun({
+          title: `Mark ${code(b)} as ${label}?`,
+          body: `${r.boatName} holds this berth (${r.reservationNo}). Its reservation is not moved or cancelled — transfer it from Reservations first if the boat must go elsewhere.`,
+          confirmLabel: label,
+          busyLabel: 'Saving…',
+          danger: true,
+          // Confirmed above, so tell the server it was meant (409 BERTH_HELD otherwise).
+          run: async () => { await marinaApi.setSlotStatus(b.id, next, undefined, true); await refresh() },
+          success: `${code(b)} → ${translatePortalText(label)}`,
+        })
+      } finally { setStatusBusy(null) }
+      return
+    }
+    setStatusBusy(b.id)
     try {
       await marinaApi.setSlotStatus(b.id, next)
-      toast(`${code(b)} → ${translatePortalText(STATUSES.find(s => s.value === next)?.label ?? next)}`)
+      toast(`${code(b)} → ${translatePortalText(label)}`)
       await refresh()
     } catch (e) {
       toast(translatePortalText(e instanceof Error ? e.message : 'Could not change the berth status'), 'warn')
+    } finally {
+      setStatusBusy(null)
     }
   }
 
@@ -114,10 +174,21 @@ export default function Berths() {
   // through the delete *and* the refetch → success/failure toast. The refresh is
   // inside `run` on purpose, so "Deleting…" persists until the list actually
   // reflects the deletion rather than ending on a stale grid.
-  const remove = (b: ApiBerthMapEntry) =>
-    confirmAndRun({
+  const remove = (b: ApiBerthMapEntry) => {
+    // The server refuses while any reservation holds the berth; say who, before
+    // asking for a confirmation that can only end in an error toast.
+    if (b.reservation) {
+      toast(translatePortalText(`${b.reservation.boatName} holds berth ${code(b)} (${b.reservation.reservationNo}) — cancel, complete or move that reservation first`), 'warn')
+      return
+    }
+    // Deleting a dock's last berth deletes the dock too (server-side); that was
+    // nowhere in the dialog.
+    const lastOnDock = berths.filter(x => x.pontoon === b.pontoon).length === 1
+    return confirmAndRun({
       title: `Delete berth ${code(b)}?`,
-      body: 'This cannot be undone.',
+      body: lastOnDock
+        ? `This is the last berth on Dock ${b.pontoon} — the dock is removed with it. This cannot be undone.`
+        : 'This cannot be undone.',
       confirmLabel: 'Delete',
       busyLabel: 'Deleting…',
       danger: true,
@@ -129,6 +200,7 @@ export default function Berths() {
       success: translatePortalText(`Berth ${code(b)} deleted successfully`),
       error: translatePortalText('Could not delete the berth. Please try again.'),
     })
+  }
 
   const toggleSelect = (id: string) => {
     const next = new Set(selected)
@@ -147,9 +219,14 @@ export default function Berths() {
 
   const bulkDelete = () => {
     const ids = Array.from(selected)
+    // "Select all" picks every filtered berth, not just the visible page — so
+    // name them, and say up front which ones the server will refuse.
+    const picked = berths.filter(b => selected.has(b.id))
+    const names = picked.slice(0, 8).map(code).join(', ') + (picked.length > 8 ? ` +${picked.length - 8}` : '')
+    const held = picked.filter(b => b.reservation).length
     return confirmAndRun({
       title: `Delete ${formatPortalNumber(ids.length)} ${ids.length === 1 ? 'berth' : 'berths'}?`,
-      body: 'This cannot be undone.',
+      body: `${names}. ${held ? `${translatePortalText(`${held} of them hold a reservation and will not be deleted.`)} ` : ''}${translatePortalText('This cannot be undone.')}`,
       confirmLabel: 'Delete',
       busyLabel: `Deleting ${formatPortalNumber(ids.length)}…`,
       danger: true,
@@ -180,6 +257,12 @@ export default function Berths() {
     const pontoon = pontoons.find(p => p.code === dockCode)
     const berthsInDock = berths.filter(b => b.pontoon === dockCode)
     const count = berthsInDock.length
+    // The server refuses a dock with any held berth; name them up front.
+    const heldHere = berthsInDock.filter(b => b.reservation)
+    if (heldHere.length) {
+      toast(translatePortalText(`Dock ${dockCode} still has reservations on ${heldHere.map(code).join(', ')} — cancel, complete or move them first`), 'warn')
+      return
+    }
 
     return confirmAndRun({
       title: `Delete Dock ${dockCode}?`,
@@ -219,10 +302,11 @@ export default function Berths() {
         sub={`${formatPortalNumber(berths.length)} slips across ${formatPortalNumber(docks.length)} dock${docks.length === 1 ? '' : 's'} · pricing, specs, connections & availability`}
         actions={<>
           <ViewToggle view={view} onChange={setView} />
-          <button className="btn-secondary flex items-center gap-1.5" onClick={() => setAddingDock(true)}><Anchor size={15} /> {translatePortalText("Add dock")}</button>
-          <button className="btn-secondary" onClick={() => setManagingDocks(true)}>{translatePortalText("Manage docks")}</button>
-          <button className="btn-primary" onClick={openAdd}><Plus size={16} /> {translatePortalText("Add berth")}</button>
+          <button className="btn-secondary flex items-center gap-1.5" disabled={!canConfigure} title={noConfigure} onClick={() => setAddingDock(true)}><Anchor size={15} /> {translatePortalText("Add dock")}</button>
+          <button className="btn-secondary" disabled={!canConfigure} title={noConfigure} onClick={() => setManagingDocks(true)}>{translatePortalText("Manage docks")}</button>
+          <button className="btn-primary" disabled={!canConfigure} title={noConfigure} onClick={openAdd}><Plus size={16} /> {translatePortalText("Add berth")}</button>
         </>} />
+      <StaffAccessNote need={['manage_slots']} action="Adding, editing or blocking berths and docks" />
 
       <div className="mb-4 flex gap-1.5 rounded-2xl bg-white p-1.5 shadow-soft w-fit">
         {(['berths', 'plans'] as const).map(t => (
@@ -302,6 +386,7 @@ export default function Berths() {
             <div className="grid grid-cols-1 items-start gap-4 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">
               {berthTf.pagedRows.map((b, i) => {
                 const boat = b.reservation
+                const hold = holdOf(b)
                 return (
                   <motion.div key={b.id} initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: Math.min(i * 0.03, 0.4) }}
                     className="card card-hover group relative overflow-hidden p-5">
@@ -324,11 +409,11 @@ export default function Berths() {
                       </div>
                       <Badge dot={b.status === 'booked'}>{translatePortalText(STATUSES.find(s => s.value === b.status)?.label ?? b.status)}</Badge>
                     </div>
-                    {boat && <p className="mt-2 truncate rounded-xl bg-ocean-50 px-3 py-1.5 text-xs font-bold text-ocean-700">⛵ {boat.boatName} {translatePortalText("docked")}</p>}
+                    {hold && <p className="mt-2 truncate rounded-xl bg-ocean-50 px-3 py-1.5 text-xs font-bold text-ocean-700">{hold.icon} {hold.boat} · {translatePortalText(hold.state)}</p>}
                     {!boat && b.workOrder && <p className="mt-2 truncate rounded-xl bg-amber-50 px-3 py-1.5 text-xs font-bold text-amber-700">🔧 {b.workOrder.title}</p>}
                     <div className="mt-3 grid grid-cols-3 gap-1.5 text-center text-[11px]">
                       {[['LOA', b.maxLength], ['Beam', b.maxWidth], ['Draft', b.maxDepth]].map(([l, v]) => (
-                        <div key={l as string} className="rounded-lg bg-sand py-1.5"><p className="font-extrabold text-deep-900">{v != null ? `${v} m` : '—'}</p><p className="text-slate-400">{l}</p></div>
+                        <div key={l as string} className="rounded-lg bg-sand py-1.5"><p className="font-extrabold text-deep-900">{metres(v as number | undefined)}</p><p className="text-slate-400">{translatePortalText(l as string)}</p></div>
                       ))}
                     </div>
                     <div className="mt-3 flex items-center gap-2 text-slate-400">
@@ -348,8 +433,13 @@ export default function Berths() {
                     </div>
                     <div className="mt-3 flex gap-2 border-t border-slate-100 pt-3">
                       <select value={b.status} onChange={e => setBerthStatus(b, e.target.value as SlotStatus)}
+                        disabled={statusBusy === b.id}
                         className="input !w-auto flex-1 !py-1.5 text-xs font-semibold">
-                        {STATUSES.map(s => <option key={s.value} value={s.value}>{translatePortalText(s.label)}</option>)}
+                        {STATUSES.map(s => (
+                          <option key={s.value} value={s.value} disabled={DERIVED_STATUSES.includes(s.value) && s.value !== b.status}>
+                            {translatePortalText(s.label)}{DERIVED_STATUSES.includes(s.value) && s.value !== b.status ? ` (${translatePortalText('set by bookings')})` : ''}
+                          </option>
+                        ))}
                       </select>
                       <button className="btn-ghost !p-2" title={translatePortalText("Edit")} onClick={() => openEdit(b)}><Pencil size={14} /></button>
                       <button className="btn-ghost !p-2 hover:!bg-rose-50 hover:!border-rose-200 hover:text-rose-500" title={translatePortalText("Delete")} onClick={() => remove(b)}><Trash2 size={14} /></button>
@@ -370,11 +460,12 @@ export default function Berths() {
                         checked={rows.length > 0 && selected.size === rows.length}
                         onChange={toggleSelectAll} />
                     </th>
-                    <th className="th">{translatePortalText("Berth")}</th><th className="th">{translatePortalText("Boat docked")}</th><th className="th">{translatePortalText("Specs (LOA/beam/draft)")}</th><th className="th">{translatePortalText("Connections")}</th><th className="th text-right">{translatePortalText("Monthly rate")}</th><th className="th">{translatePortalText("Status")}</th><th className="th text-right">{translatePortalText("Actions")}</th>
+                    <th className="th">{translatePortalText("Berth")}</th><th className="th">{translatePortalText("Boat & reservation")}</th><th className="th">{translatePortalText("Specs (LOA/beam/draft)")}</th><th className="th">{translatePortalText("Connections")}</th><th className="th text-right">{translatePortalText("Monthly rate")}</th><th className="th">{translatePortalText("Status")}</th><th className="th text-right">{translatePortalText("Actions")}</th>
                   </tr></thead>
                   <tbody>
                     {berthTf.pagedRows.map((b, i) => {
                       const boat = b.reservation
+                      const hold = holdOf(b)
                       return (
                         <motion.tr key={b.id} layout initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: Math.min(i * 0.03, 0.4) }}
                           className={`border-b transition ${selected.has(b.id) ? 'bg-ocean-50/50 border-ocean-100' : 'border-slate-50 hover:bg-sand/60'}`}>
@@ -395,10 +486,10 @@ export default function Berths() {
                             <p className="text-[11px] text-slate-400">{translatePortalText(humanize(b.category))} {translatePortalText("· Dock ")}{b.pontoon}</p>
                           </td>
                           <td className="td text-xs text-slate-500">
-                            {boat ? <>⛵ {boat.boatName}<p className="text-[11px] text-slate-400">{translatePortalText("until ")}{fmtDate(boat.endDate)}</p></> : b.workOrder ? <span className="text-amber-600">🔧 {b.workOrder.title}</span> : '—'}
+                            {boat && hold ? <>{hold.icon} {hold.boat}<p className="text-[11px] text-slate-400">{translatePortalText(hold.state)} · {fmtDate(boat.startDate)} → {fmtDate(boat.endDate)}</p></> : b.workOrder ? <span className="text-amber-600">🔧 {b.workOrder.title}</span> : '—'}
                           </td>
                           <td className="td whitespace-nowrap text-xs text-slate-500">
-                            {[b.maxLength, b.maxWidth, b.maxDepth].map(v => (v != null ? `${v}m` : '—')).join(' / ')}
+                            {[b.maxLength, b.maxWidth, b.maxDepth].map(metres).join(' / ')}
                           </td>
                           <td className="td">
                             <span className="flex items-center gap-2 text-slate-400">
@@ -420,8 +511,13 @@ export default function Berths() {
                           </td>
                           <td className="td">
                             <select value={b.status} onChange={e => setBerthStatus(b, e.target.value as SlotStatus)}
+                              disabled={statusBusy === b.id}
                               className="input !w-auto !py-1.5 text-xs font-semibold">
-                              {STATUSES.map(s => <option key={s.value} value={s.value}>{translatePortalText(s.label)}</option>)}
+                              {STATUSES.map(s => (
+                                <option key={s.value} value={s.value} disabled={DERIVED_STATUSES.includes(s.value) && s.value !== b.status}>
+                                  {translatePortalText(s.label)}{DERIVED_STATUSES.includes(s.value) && s.value !== b.status ? ` (${translatePortalText('set by bookings')})` : ''}
+                                </option>
+                              ))}
                             </select>
                           </td>
                           <td className="td">
@@ -447,6 +543,7 @@ export default function Berths() {
           berth={edit}
           pontoons={pontoons}
           docks={docks}
+          berths={berths}
           onSaved={refresh}
         />
 
@@ -527,16 +624,28 @@ function DockPlansPanel({ onChanged }: { onChanged?: () => void }) {
     }
   }, [location.hash])
 
+  // The Save button had no busy state: a double click created the plan twice,
+  // and boat owners then saw two identical "Monthly" options.
+  const [saving, setSaving] = useState(false)
+  const [toggling, setToggling] = useState<string | null>(null)
+
   const save = async () => {
+    if (saving) return
     if (!form.name.trim() || !form.days || form.days < 1) { toast(translatePortalText('Give the plan a name and a duration in days'), 'warn'); return }
+    // The server takes whole days, 1–1000; say so here rather than relaying its validation error.
+    if (!Number.isInteger(form.days) || form.days > 1000) { toast(translatePortalText('Duration must be a whole number of days, from 1 to 1000'), 'warn'); return }
+    setSaving(true)
     try {
-      if (editing) await marinaApi.dockPlans.update(editing.id, form)
-      else await marinaApi.dockPlans.create(form)
+      const body = { ...form, name: form.name.trim() }
+      if (editing) await marinaApi.dockPlans.update(editing.id, body)
+      else await marinaApi.dockPlans.create(body)
       await reload()
       setModalOpen(false)
       toast(translatePortalText(editing ? 'Plan updated' : 'Plan created'))
     } catch (e) {
       toast(translatePortalText(e instanceof Error ? e.message : 'Could not save the plan'), 'warn')
+    } finally {
+      setSaving(false)
     }
   }
 
@@ -556,11 +665,17 @@ function DockPlansPanel({ onChanged }: { onChanged?: () => void }) {
     })
 
   const toggleActive = async (p: DockPlan) => {
+    if (toggling) return
+    setToggling(p.id)
     try {
       await marinaApi.dockPlans.update(p.id, { isActive: !p.isActive })
       await reload()
+      // It changed what boat owners can book — confirm it, like every other write here.
+      toast(translatePortalText(p.isActive ? 'Plan hidden from boat owners' : 'Plan visible to boat owners'))
     } catch (e) {
       toast(translatePortalText(e instanceof Error ? e.message : 'Could not update the plan'), 'warn')
+    } finally {
+      setToggling(null)
     }
   }
 
@@ -586,7 +701,7 @@ function DockPlansPanel({ onChanged }: { onChanged?: () => void }) {
                       <td className="td font-semibold text-deep-900">{p.name}</td>
                       <td className="td text-slate-500">{translatePortalText(`${p.days} ${p.days === 1 ? 'day' : 'days'}`)}{p.days % 30 === 0 ? ` (${translatePortalText(`${p.days / 30} ${p.days / 30 === 1 ? 'month' : 'months'}`)})` : ''}</td>
                       <td className="td">
-                        <button onClick={() => toggleActive(p)} className={`chip ${p.isActive ? 'bg-emerald-50 text-emerald-600 ring-1 ring-emerald-200' : 'bg-slate-100 text-slate-400 ring-1 ring-slate-200'}`}>
+                        <button onClick={() => toggleActive(p)} disabled={toggling === p.id} className={`chip disabled:opacity-50 ${p.isActive ? 'bg-emerald-50 text-emerald-600 ring-1 ring-emerald-200' : 'bg-slate-100 text-slate-400 ring-1 ring-slate-200'}`}>
                           {translatePortalText(p.isActive ? 'Visible to boat owners' : 'Hidden')}
                         </button>
                       </td>
@@ -608,12 +723,12 @@ function DockPlansPanel({ onChanged }: { onChanged?: () => void }) {
       <Modal open={modalOpen} onClose={() => setModalOpen(false)} title={editing ? translatePortalText(`✏️ Edit ${editing.name}`) : translatePortalText("➕ Add dock plan")}>
         <div className="grid gap-4">
           <div><label className="label">{translatePortalText("Plan name")}</label><input id="plan_name" className="input" value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder={translatePortalText("e.g. Monthly, 20-Day Flex")} /></div>
-          <div><label className="label">{translatePortalText("Duration (days)")}</label><input type="number" min={1} className="input" value={form.days} onChange={e => setForm(f => ({ ...f, days: Math.max(1, Number(e.target.value)) }))} /></div>
+          <div><label className="label">{translatePortalText("Duration (days)")}</label><input type="number" min={1} max={1000} step={1} className="input" value={form.days} onChange={e => setForm(f => ({ ...f, days: Math.max(1, Number(e.target.value)) }))} /></div>
           <label className="flex items-center gap-2 text-sm font-semibold text-slate-500"><input type="checkbox" checked={form.isActive} onChange={e => setForm(f => ({ ...f, isActive: e.target.checked }))} /> {translatePortalText("Visible to boat owners")}</label>
         </div>
         <div className="mt-6 flex justify-end gap-2">
-          <button className="btn-ghost" onClick={() => setModalOpen(false)}>{translatePortalText("Cancel")}</button>
-          <button className="btn-primary" onClick={save}>{translatePortalText(editing ? 'Save changes' : 'Create plan')}</button>
+          <button className="btn-ghost" onClick={() => setModalOpen(false)} disabled={saving}>{translatePortalText("Cancel")}</button>
+          <button className="btn-primary" onClick={save} disabled={saving}>{translatePortalText(saving ? 'Saving…' : editing ? 'Save changes' : 'Create plan')}</button>
         </div>
       </Modal>
     </div>

@@ -63,6 +63,7 @@ export function ProviderReport({ tone }: { tone: Tone }) {
 
   const [options, setOptions] = React.useState<Option[] | null>(null)
   const [optionsError, setOptionsError] = React.useState('')
+  const [optionsAttempt, setOptionsAttempt] = React.useState(0)
   const [picking, setPicking] = React.useState(!providerId)
   const [period, setPeriod] = React.useState<ProviderPeriod>('all')
 
@@ -74,6 +75,7 @@ export function ProviderReport({ tone }: { tone: Tone }) {
 
   React.useEffect(() => {
     let alive = true
+    setOptionsError('')
     reportApi
       .filters(KEY)
       .then(res => {
@@ -82,7 +84,7 @@ export function ProviderReport({ tone }: { tone: Tone }) {
       })
       .catch(e => { if (alive) setOptionsError(errorMessage(e) || translatePortalText('Could not load the provider list')) })
     return () => { alive = false }
-  }, [])
+  }, [optionsAttempt])
 
   const range = React.useMemo(
     () => (period === 'all' ? { from: ALL_TIME_FROM, to: isoDay(new Date()) } : resolvePeriod(period)),
@@ -160,7 +162,7 @@ export function ProviderReport({ tone }: { tone: Tone }) {
             <DownloadMenu
               tone={tone}
               disabled={!run || !run.rows.length}
-              disabledReason={translatePortalText('Pick a provider first')}
+              disabledReason={translatePortalText(run ? 'Nothing to download for this provider' : 'Pick a provider first')}
               downloading={downloading}
               onPick={download}
             />
@@ -172,7 +174,8 @@ export function ProviderReport({ tone }: { tone: Tone }) {
       <section aria-label={translatePortalText('Report settings')} className="card relative mb-5 p-4">
         {busy && <span className="rv-progress" />}
         {optionsError ? (
-          <ErrorNotice message={optionsError} />
+          // With no retry the picker was gone until a full page reload.
+          <ErrorNotice message={optionsError} onRetry={() => setOptionsAttempt(n => n + 1)} />
         ) : picking || !providerId ? (
           <ProviderPicker
             options={options}
@@ -463,11 +466,18 @@ function FactCard({ section }: { section: Section }) {
 
 function ListCard({ section }: { section: Section }) {
   const hasDetail = section.rows.some(r => r.detail)
+  /*
+    The server caps each list and closes it with an "…and N more" row. Counting
+    only the rows sent put "20" beside a list of fifty; the closing row carries the
+    rest, so the heading adds it back and shows the real size.
+  */
+  const shown = section.rows.filter(r => !r.item.startsWith('…')).length
+  const more = Number(section.rows.find(r => r.item.startsWith('…'))?.item.match(/(\d+)\s+more/)?.[1] ?? 0)
   return (
     <section className="card overflow-hidden">
       <header className="flex items-baseline gap-2 border-b border-slate-100 px-4 py-3">
         <h2 className="font-display text-[15px] font-bold text-deep-900">{translatePortalText(section.name)}</h2>
-        <span className="text-xs font-semibold text-slate-500">{formatPortalNumber(section.rows.filter(r => !r.item.startsWith('…')).length)}</span>
+        <span className="text-xs font-semibold text-slate-500">{formatPortalNumber(shown + more)}</span>
       </header>
       {/* Fixed columns, so the status sits in the same place in every list on the
           page. On a phone the details move under the name instead of a third column. */}

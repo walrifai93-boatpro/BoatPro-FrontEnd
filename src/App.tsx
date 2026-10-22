@@ -3,7 +3,8 @@ import { HashRouter, Routes, Route, Navigate, useLocation } from 'react-router-d
 import { MarinaProvider } from './live'
 import { CurrencyProvider } from './currency'
 import { OpsProvider } from './opsStore'
-import { AuthProvider, useAuth, roleAllowsPortal, needsOnboarding, type PortalRole } from './auth'
+import { AuthProvider, useAuth, useMarinaPermissions, roleAllowsPortal, needsOnboarding, type PortalRole } from './auth'
+import { marinaRouteAllowed } from './marinaAccess'
 import type { FuelWorkerPermission } from './fuel/fuelApi'
 import type { MaintenanceWorkerPermission } from './api'
 import { CFGS } from './admin/pages/ProviderDomainConfig'
@@ -58,6 +59,7 @@ const Settings = lazyPage(() => import('./pages/Admin').then(m => ({ default: m.
 const Emergency = lazyPage(() => import('./pages/Admin').then(m => ({ default: m.Emergency })))
 const Integrations = lazyPage(() => import('./pages/Admin').then(m => ({ default: m.Integrations })))
 const DocumentVault = lazyPage(() => import('./pages/DocumentVault').then(m => ({ default: m.DocumentVault })))
+const MarinaStaff = lazyPage(() => import('./pages/MarinaStaff'))
 const ProviderInbox = lazyPage(() => import('./shared/ProviderInbox'))
 // Risk score, the events behind it, decisions and appeals — the same page in every provider console.
 const AccountStanding = lazyPage(() => import('./shared/AccountStanding'))
@@ -73,7 +75,6 @@ const FuelDeliveries = lazyPage(() => import('./fuel/pages/FuelOps').then(m => (
 const FuelPricing = lazyPage(() => import('./fuel/pages/FuelMoney').then(m => ({ default: m.FuelPricing })))
 const FuelBilling = lazyPage(() => import('./fuel/pages/FuelMoney').then(m => ({ default: m.FuelBilling })))
 const FuelReports = lazyPage(() => import('./fuel/pages/FuelMoney').then(m => ({ default: m.FuelReports })))
-const FuelTracking = lazyPage(() => import('./fuel/pages/FuelEngage').then(m => ({ default: m.FuelTracking })))
 const FuelNotificationsPage = lazyPage(() => import('./fuel/pages/FuelEngage').then(m => ({ default: m.FuelNotificationsPage })))
 const FuelSettings = lazyPage(() => import('./fuel/pages/FuelEngage').then(m => ({ default: m.FuelSettings })))
 const FuelWorkers = lazyPage(() => import('./fuel/pages/FuelWorkers'))
@@ -167,9 +168,22 @@ function RequireRole({ role, children }: { role: PortalRole; children: React.Rea
     if (user.role === 'fuel_provider' || user.role === 'fuel_worker') return <Navigate to="/fuel" replace />
     if (user.role === 'maintenance_provider' || user.role === 'maintenance_worker') return <Navigate to="/maint" replace />
     if (user.role === 'boat_provider') return <Navigate to="/boat" replace />
-    if (user.role === 'marina_provider') return <Navigate to="/" replace />
+    if (user.role === 'marina_provider' || user.role === 'marina_worker') return <Navigate to="/" replace />
     return <Navigate to="/login" replace />
   }
+  return <>{children}</>
+}
+
+// Deep-link guard for a marina-console page, from the one route → permission
+// table in marinaAccess.ts (the sidebar reads the same table). The owner opens
+// everything; a staff member is sent to the dashboard from a page their owner
+// did not grant. The API enforces the same permissions — this is UX only — so
+// it waits for my-access rather than bouncing a staff member who just signed in.
+function RequireMarinaPermission({ children }: { children: React.ReactNode }) {
+  const { pathname } = useLocation()
+  const access = useMarinaPermissions()
+  if (!access.loaded) return <RouteLoading />
+  if (!marinaRouteAllowed(pathname, access)) return <Navigate to="/" replace />
   return <>{children}</>
 }
 
@@ -283,37 +297,39 @@ export default function App() {
           </RequireRole>
         }>
           <Route path="/" element={<Dashboard />} />
-          <Route path="/live" element={<LiveMap />} />
-          <Route path="/fleet-map" element={<FleetTracker />} />
-          <Route path="/calendar" element={<Calendar />} />
-          <Route path="/reservations" element={<Reservations />} />
-          <Route path="/reservation-table" element={<ReservationTable />} />
-          <Route path="/movements" element={<Movements />} />
-          <Route path="/services" element={<Services />} />
-          <Route path="/maintenance" element={<Maintenance />} />
-          <Route path="/facilities" element={<Facilities />} />
-          <Route path="/utilities" element={<Utilities />} />
-          <Route path="/emergency" element={<Emergency />} />
-          <Route path="/integrations" element={<Integrations />} />
-          <Route path="/berths" element={<Berths />} />
-          <Route path="/profile" element={<Profile />} />
-          <Route path="/customers" element={<Customers />} />
-          <Route path="/boats" element={<Boats />} />
-          <Route path="/billing" element={<Billing />} />
-          <Route path="/reports" element={<Reports />} />
+          <Route path="/live" element={<RequireMarinaPermission><LiveMap /></RequireMarinaPermission>} />
+          <Route path="/fleet-map" element={<RequireMarinaPermission><FleetTracker /></RequireMarinaPermission>} />
+          <Route path="/calendar" element={<RequireMarinaPermission><Calendar /></RequireMarinaPermission>} />
+          <Route path="/reservations" element={<RequireMarinaPermission><Reservations /></RequireMarinaPermission>} />
+          <Route path="/reservation-table" element={<RequireMarinaPermission><ReservationTable /></RequireMarinaPermission>} />
+          <Route path="/movements" element={<RequireMarinaPermission><Movements /></RequireMarinaPermission>} />
+          <Route path="/services" element={<RequireMarinaPermission><Services /></RequireMarinaPermission>} />
+          <Route path="/maintenance" element={<RequireMarinaPermission><Maintenance /></RequireMarinaPermission>} />
+          <Route path="/facilities" element={<RequireMarinaPermission><Facilities /></RequireMarinaPermission>} />
+          <Route path="/utilities" element={<RequireMarinaPermission><Utilities /></RequireMarinaPermission>} />
+          <Route path="/emergency" element={<RequireMarinaPermission><Emergency /></RequireMarinaPermission>} />
+          <Route path="/integrations" element={<RequireMarinaPermission><Integrations /></RequireMarinaPermission>} />
+          <Route path="/berths" element={<RequireMarinaPermission><Berths /></RequireMarinaPermission>} />
+          <Route path="/profile" element={<RequireMarinaPermission><Profile /></RequireMarinaPermission>} />
+          <Route path="/customers" element={<RequireMarinaPermission><Customers /></RequireMarinaPermission>} />
+          <Route path="/boats" element={<RequireMarinaPermission><Boats /></RequireMarinaPermission>} />
+          <Route path="/billing" element={<RequireMarinaPermission><Billing /></RequireMarinaPermission>} />
+          <Route path="/reports" element={<RequireMarinaPermission><Reports /></RequireMarinaPermission>} />
           {/* A report has its own address — /reports/berth-revenue — so it can be
               linked, bookmarked and reached with the back button. */}
-          <Route path="/reports/:reportKey" element={<Reports />} />
+          <Route path="/reports/:reportKey" element={<RequireMarinaPermission><Reports /></RequireMarinaPermission>} />
           <Route path="/inbox" element={<ProviderInbox />} />
-          <Route path="/standing" element={<AccountStanding />} />
+          <Route path="/standing" element={<RequireMarinaPermission><AccountStanding /></RequireMarinaPermission>} />
           <Route path="/messages" element={<Navigate to="/inbox?view=messages" replace />} />
           <Route path="/support" element={<Navigate to="/inbox?view=help" replace />} />
           <Route path="/reviews" element={<Reviews />} />
           <Route path="/notifications" element={<NotificationsPage />} />
-          <Route path="/documents" element={<Documents />} />
-          <Route path="/documents/vault" element={<DocumentVault />} />
-          <Route path="/vault" element={<DocumentVault />} />
-          <Route path="/settings" element={<Settings />} />
+          <Route path="/documents" element={<RequireMarinaPermission><Documents /></RequireMarinaPermission>} />
+          <Route path="/documents/vault" element={<RequireMarinaPermission><DocumentVault /></RequireMarinaPermission>} />
+          <Route path="/vault" element={<RequireMarinaPermission><DocumentVault /></RequireMarinaPermission>} />
+          <Route path="/settings" element={<RequireMarinaPermission><Settings /></RequireMarinaPermission>} />
+          {/* The marina's team: the owner, or staff holding manage_staff. */}
+          <Route path="/staff" element={<RequireMarinaPermission><MarinaStaff /></RequireMarinaPermission>} />
         </Route>
 
         {/* ── Fuel Provider portal ── */}
@@ -328,7 +344,8 @@ export default function App() {
           <Route path="billing" element={<RequireFuelPermission perm="billing"><FuelBilling /></RequireFuelPermission>} />
           <Route path="reports" element={<RequireFuelPermission perm="reports"><FuelReports /></RequireFuelPermission>} />
           <Route path="reports/:reportKey" element={<RequireFuelPermission perm="reports"><FuelReports /></RequireFuelPermission>} />
-          <Route path="tracking" element={<RequireFuelPermission perm="tracking"><FuelTracking /></RequireFuelPermission>} />
+          {/* Fuel is served at the station only — no fleet out on the water to track. */}
+          <Route path="tracking" element={<Navigate to="/fuel" replace />} />
           <Route path="inbox" element={<ProviderInbox />} />
           <Route path="standing" element={<AccountStanding />} />
           <Route path="messages" element={<Navigate to="/fuel/inbox?view=messages" replace />} />

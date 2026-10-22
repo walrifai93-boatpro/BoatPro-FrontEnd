@@ -108,7 +108,10 @@ export function HyperpayCheckoutModal({
           </div>
         </>
       )}
-      {onPayWithTamara && tamaraUnavailable && (
+      {/* Only a reason the payer can act on (amount range, missing mobile). "Not
+          configured on this server" is a fact about our deployment, not advice
+          (QA W-13) — every caller showed it to every provider. */}
+      {onPayWithTamara && tamaraUnavailable && !/not configured|not available for this charge/i.test(tamaraUnavailable) && (
         <p className="mb-4 text-xs text-slate-400">{translatePortalText(tamaraUnavailable)}</p>
       )}
 

@@ -24,6 +24,8 @@ import {
 import { PageWrap } from './_shared'
 import { AdminHeader } from '../adminUi'
 import { Modal, toast, Counter, CardGridSkeleton } from '../../ui'
+import { confirm } from '../../async'
+import { money } from '../../format'
 import { formatPortalNumber, formatPortalPercent, translatePortalText } from '../../i18n/runtime'
 import { adminApi, fileUrl, type AdminMaintShopApproval } from '../../api'
 
@@ -113,14 +115,23 @@ export default function AdminMaintShopApprovals() {
     setLoading(true)
     setError(null)
     try {
-      // 100, the API's cap — without it the queue served its default of 20.
-      const res = await adminApi.listMaintShopApprovals({
-        limit: 100,
-        ...(tab ? { approvalStatus: tab } : {}),
-        ...(serviceType ? { serviceType: serviceType as 'maintenance' | 'boat_ramp' } : {}),
-      })
-      setShops(res.data?.shops || [])
-      setCounts(res.data?.statusCounts || {})
+      // 100 a page, the API's cap — without a limit the queue served its
+      // default of 20, and one page of 100 still dropped the 101st vendor.
+      const all: AdminMaintShopApproval[] = []
+      let statusCounts: Record<string, number> = {}
+      for (let page = 1; page <= 50; page++) {
+        const res = await adminApi.listMaintShopApprovals({
+          limit: 100,
+          page,
+          ...(tab ? { approvalStatus: tab } : {}),
+          ...(serviceType ? { serviceType: serviceType as 'maintenance' | 'boat_ramp' } : {}),
+        })
+        all.push(...(res.data?.shops || []))
+        statusCounts = res.data?.statusCounts || {}
+        if (!res.data?.shops?.length || all.length >= (res.data?.total ?? 0)) break
+      }
+      setShops(all)
+      setCounts(statusCounts)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load maintenance vendors')
     } finally {
@@ -146,20 +157,32 @@ export default function AdminMaintShopApprovals() {
     }
   }
 
-  const doApprove = (shop: AdminMaintShopApproval) => {
+  const doApprove = async (shop: AdminMaintShopApproval) => {
     const id = shopId(shop)
-    if (!id) return
+    if (!id || busyId) return
     // The server refuses an incomplete shop too; checking here turns that 400
     // into a sentence naming what is missing, before the round trip.
     if (shop.completeness && !shop.completeness.isComplete) {
       toast(translatePortalText(`Cannot approve: ${formatPortalNumber(shop.completeness.criticalCount)} critical requirements are missing.`), 'warn')
       return
     }
-    act(shop, () => adminApi.approveMaintShop(id), `"${shop.nameEn}" approved and published live! ✅`)
+    // It publishes a draft its owner never submitted, and one with open
+    // warnings, without a word — so say so before the click lands.
+    const warningItems = shop.completeness?.missingItems?.filter((it) => it.severity !== 'critical') ?? []
+    const warnings: string[] = []
+    if ((shop.approvalStatus || 'draft') === 'draft') warnings.push(translatePortalText('This vendor is still a draft — the owner has not submitted it for review.'))
+    if (warningItems.length) warnings.push(translatePortalText(`Open: ${warningItems.map((it) => it.title).join(', ')}.`))
+    const ok = await confirm({
+      title: `Approve and publish "${shop.nameEn}"?`,
+      body: [...warnings, translatePortalText('It goes live in the catalogue and takes bookings straight away.')].join(' '),
+      confirmLabel: warnings.length ? 'Publish anyway' : 'Approve & publish',
+      danger: warnings.length > 0,
+    })
+    if (ok) act(shop, () => adminApi.approveMaintShop(id), `"${shop.nameEn}" approved and published live! ✅`)
   }
 
   const doReject = () => {
-    if (!rejecting) return
+    if (!rejecting || busyId) return
     const id = shopId(rejecting)
     if (!id) { toast(translatePortalText('Invalid vendor ID'), 'warn'); return }
     if (reason.trim().length < 3) {
@@ -427,7 +450,7 @@ export default function AdminMaintShopApprovals() {
                     {status !== 'approved' && (
                       <button
                         disabled={isBusy || (!!completeness && !completeness.isComplete)}
-                        onClick={() => doApprove(s)}
+                        onClick={() => void doApprove(s)}
                         title={translatePortalText(completeness && !completeness.isComplete ? 'Cannot approve: critical items missing' : 'Approve and publish vendor')}
                         className={`btn-primary !py-1.5 !px-3 !text-xs font-extrabold inline-flex items-center gap-1 shadow-sm ${
                           completeness && !completeness.isComplete
@@ -473,8 +496,8 @@ export default function AdminMaintShopApprovals() {
                   ['Contact', detail.contactNumber],
                   ['Email', detail.email],
                   ['Website', detail.website],
-                  ['Hourly rate', detail.hourlyRateSar != null ? `SAR ${detail.hourlyRateSar}` : undefined],
-                  ['Inspection fee', detail.inspectionFeeSar != null ? `SAR ${detail.inspectionFeeSar}` : undefined],
+                  ['Hourly rate', detail.hourlyRateSar != null ? money(detail.hourlyRateSar) : undefined],
+                  ['Inspection fee', detail.inspectionFeeSar != null ? money(detail.inspectionFeeSar) : undefined],
                   ['Coordinates', detail.latitude && detail.longitude ? `${formatPortalNumber(detail.latitude, { minimumFractionDigits: 5, maximumFractionDigits: 5 })}, ${formatPortalNumber(detail.longitude, { minimumFractionDigits: 5, maximumFractionDigits: 5 })}` : undefined],
                 ] as [string, string | undefined][])
                   .filter(([, v]) => !!v)
@@ -554,14 +577,20 @@ export default function AdminMaintShopApprovals() {
             <label className="label">{translatePortalText("Rejection / Change Request Reason *")}</label>
             <textarea
               value={reason}
+              dir="auto"
               onChange={(e) => setReason(e.target.value)}
               placeholder={translatePortalText("e.g. Set the workshop's map pin to its real location, add at least one technician on duty, and publish an hourly rate.")}
               className="input min-h-[100px] text-xs"
             />
           </div>
+          {rejecting?.approvalStatus === 'approved' && (
+            <p className="rounded-lg bg-amber-50 px-2.5 py-1.5 text-[11px] font-semibold text-amber-800">
+              {translatePortalText("This vendor is live. Rejecting it unpublishes it from the catalogue straight away.")}
+            </p>
+          )}
           <div className="flex justify-end gap-2 pt-2">
             <button className="btn-ghost" onClick={() => setRejecting(null)}>{translatePortalText("Cancel")}</button>
-            <button className="btn-primary !bg-rose-600 hover:!bg-rose-700" onClick={doReject} disabled={!!busyId}>
+            <button className="btn-primary !bg-rose-600 hover:!bg-rose-700 disabled:opacity-60" onClick={doReject} disabled={!!busyId || reason.trim().length < 3}>
               <X size={14} /> {translatePortalText(" Confirm rejection\n            ")}</button>
           </div>
         </div>

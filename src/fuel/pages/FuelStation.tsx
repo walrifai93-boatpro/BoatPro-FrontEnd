@@ -22,7 +22,9 @@ import { formatPortalNumber, localizedField, portalLocale, translatePortalText }
 
 // Same gallery sections offered in the registration wizard, so photos taken
 // there and photos added later on this page live in one consistent layout.
-const PHOTO_CATEGORIES = ['cover', 'logo', 'fuel_pumps', 'storage_area', 'delivery_vehicle', 'office', 'safety_equipment']
+// No 'delivery_vehicle' section: fuel is served at the station only. Its label
+// stays below so photos filed there before still show a heading.
+const PHOTO_CATEGORIES = ['cover', 'logo', 'fuel_pumps', 'storage_area', 'office', 'safety_equipment']
 const PHOTO_CATEGORY_LABELS: Record<string, string> = {
   cover: 'Cover', logo: 'Logo', fuel_pumps: 'Fuel pumps', storage_area: 'Storage area',
   delivery_vehicle: 'Delivery vehicle', office: 'Office', safety_equipment: 'Safety equipment',
@@ -42,12 +44,8 @@ interface StationDraft {
   region: string
   latitude: number
   longitude: number
-  delivery: boolean
-  deliveryFeeSar: number
-  emergencyDeliveryFeeSar: number
   open24h: boolean
   hours: { label: string; hours: string }[]
-  serviceRadius: string
   emergencyEmail: string
   emergencyProceduresText: string
 }
@@ -60,7 +58,6 @@ export default function FuelStation() {
     () => fuelApi.station(currentStationId && !isAllStations ? { stationId: currentStationId } : undefined).then(r => r.data),
     [currentStationId, isAllStations],
   )
-  const fleetRes = useFuelResource(() => fuelApi.vehicles().then(r => r.data.vehicles), [])
   const overviewRes = useFuelResource(
     () => (isAllStations ? fuelApi.stationsOverview().then(r => r.data) : Promise.resolve(null)),
     [isAllStations],
@@ -175,12 +172,8 @@ export default function FuelStation() {
     region: '',
     latitude: DEFAULT_COORDS.latitude,
     longitude: DEFAULT_COORDS.longitude,
-    delivery: false,
-    deliveryFeeSar: 0,
-    emergencyDeliveryFeeSar: 0,
     open24h: false,
     hours: [],
-    serviceRadius: '25 nm service radius',
     emergencyEmail: '',
     emergencyProceduresText: '',
   })
@@ -213,8 +206,6 @@ export default function FuelStation() {
     city: localizedField<string>(station, 'city', station?.city) ?? '',
     latitude: station?.latitude ?? DEFAULT_COORDS.latitude,
     longitude: station?.longitude ?? DEFAULT_COORDS.longitude,
-    delivery: station?.delivery ?? false,
-    deliveryFeeSar: station?.deliveryFeeSar ?? 0,
     open24h: station?.open24h ?? false,
   }), [station])
 
@@ -261,12 +252,8 @@ export default function FuelStation() {
       region: station.region || '',
       latitude: station.latitude ?? DEFAULT_COORDS.latitude,
       longitude: station.longitude ?? DEFAULT_COORDS.longitude,
-      delivery: station.delivery ?? false,
-      deliveryFeeSar: station.deliveryFeeSar ?? 0,
-      emergencyDeliveryFeeSar: station.emergencyDeliveryFeeSar ?? 0,
       open24h: station.open24h ?? false,
       hours: station.hours ? station.hours.map(h => ({ ...h })) : [],
-      serviceRadius: station.serviceRadius || '25 nm service radius',
       emergencyEmail: station.emergencyEmail || '',
       emergencyProceduresText: station.emergencyProceduresText || '',
     })
@@ -295,12 +282,8 @@ export default function FuelStation() {
         region: draft.region.trim() || undefined,
         latitude: draft.latitude,
         longitude: draft.longitude,
-        delivery: draft.delivery,
-        deliveryFeeSar: Number(draft.deliveryFeeSar) || 0,
-        emergencyDeliveryFeeSar: Number(draft.emergencyDeliveryFeeSar) || 0,
         open24h: draft.open24h,
         hours: draft.hours,
-        serviceRadius: draft.serviceRadius.trim() || undefined,
         emergencyEmail: draft.emergencyEmail.trim() || undefined,
         emergencyProceduresText: draft.emergencyProceduresText.trim() || undefined,
       },
@@ -720,10 +703,10 @@ export default function FuelStation() {
             ))}
           </div>
           <div className="mt-4 grid grid-cols-2 gap-2.5">
-            <Metric icon="🚤" label={translatePortalText("Delivery Fee")} value={station.deliveryFeeSar ? `${station.currency || 'SAR'} ${formatPortalNumber(station.deliveryFeeSar)}` : translatePortalText("Free / Included")} />
+            <Metric icon="⚓" label={translatePortalText("Fuel service")} value={translatePortalText("At the fuel dock")} />
             <Metric icon="⭐" label={translatePortalText("Public Rating")} value={res.data?.stats?.rating ? `${res.data.stats.rating.toFixed(1)} (${formatPortalNumber(res.data.stats.ratingCount)})` : translatePortalText("New Station")} />
             <Metric icon="⛽" label={translatePortalText("Active Pumps & Tanks")} value={`${formatPortalNumber(res.data?.stats?.pumps || 0)} ${translatePortalText("Pumps")} · ${formatPortalNumber(res.data?.stats?.tanks || 0)} ${translatePortalText("Tanks")}`} />
-            <Metric icon="🚦" label={translatePortalText("Delivery Support")} value={translatePortalText(station.delivery ? "Barge & Mobile" : "Dockside Only")} />
+            <Metric icon="📻" label={translatePortalText("VHF Channel")} value={station.vhfChannel || translatePortalText("—")} />
           </div>
         </Section>
       </div>
@@ -789,7 +772,7 @@ export default function FuelStation() {
               <p className="text-xs font-bold text-deep-900 dark:text-white">
                 {station.logo || station.imagesCategorized?.find(i => i.category === 'logo')?.url ? translatePortalText("Brand Logo Active ✨") : translatePortalText("No Brand Logo Uploaded Yet")}
               </p>
-              <p className="text-[11px] text-slate-400 mt-0.5">{translatePortalText("Upload a transparent logo (.png/.webp) for recognition across boat delivery maps.")}</p>
+              <p className="text-[11px] text-slate-400 mt-0.5">{translatePortalText("Upload a transparent logo (.png/.webp) so boaters recognise your station on the map.")}</p>
             </div>
           </div>
         </Section>
@@ -936,7 +919,7 @@ export default function FuelStation() {
                 editTab === 'hours' ? 'bg-white shadow-xs text-amber-900 border border-slate-100' : 'text-slate-500 hover:text-deep-900'
               }`}
             >
-              <span>⏱️</span>{translatePortalText(" Operations & Delivery")}</button>
+              <span>⏱️</span>{translatePortalText(" Operations")}</button>
           </div>
 
           {/* TAB 1: General & Contact */}
@@ -970,7 +953,6 @@ export default function FuelStation() {
                     <option value="Marine Fuel Station">{translatePortalText("Marine Fuel Station")}</option>
                     <option value="Floating Fuel Barge">{translatePortalText("Floating Fuel Barge")}</option>
                     <option value="Dockside Fuel Pier">{translatePortalText("Dockside Fuel Pier")}</option>
-                    <option value="Mobile Fuel Fleet">{translatePortalText("Mobile Fuel Fleet")}</option>
                     <option value="Harbor Depot">{translatePortalText("Harbor Depot")}</option>
                   </select>
                 </div>
@@ -989,7 +971,7 @@ export default function FuelStation() {
                   <input
                     id="tagline"
                     className="input"
-                    placeholder={translatePortalText("e.g. High-speed commercial diesel & marine gas dispensing with 25nm mobile barge coverage")}
+                    placeholder={translatePortalText("e.g. High-speed commercial diesel & marine gas dispensing at our fuel dock")}
                     value={draft.tagline}
                     onChange={e => setDraft({ ...draft, tagline: e.target.value })}
                   />
@@ -1095,7 +1077,7 @@ export default function FuelStation() {
             </div>
           )}
 
-          {/* TAB 3: Operations & Delivery */}
+          {/* TAB 3: Operations */}
           {editTab === 'hours' && (
             <div className="space-y-4">
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -1107,13 +1089,6 @@ export default function FuelStation() {
                   <Toggle on={draft.open24h} onChange={(v) => setDraft({ ...draft, open24h: v })} />
                 </div>
 
-                <div className="rounded-2xl border border-slate-100 bg-sand/40 p-3.5 flex items-center justify-between">
-                  <div>
-                    <p className="text-xs font-extrabold text-deep-900">{translatePortalText("Mobile & Barge Delivery")}</p>
-                    <p className="text-[11px] text-slate-400">{translatePortalText("Supports off-dock dispatch orders")}</p>
-                  </div>
-                  <Toggle on={draft.delivery} onChange={(v) => setDraft({ ...draft, delivery: v })} />
-                </div>
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -1125,44 +1100,6 @@ export default function FuelStation() {
                     placeholder={translatePortalText("e.g. Ch 16, Ch 68, Ch 09")}
                     value={draft.vhf}
                     onChange={e => setDraft({ ...draft, vhf: e.target.value })}
-                  />
-                </div>
-                <div>
-                  <label className="label">{translatePortalText("Service Coverage Radius")}</label>
-                  <input
-                    id="radius"
-                    className="input"
-                    placeholder={translatePortalText("e.g. 25 nm service radius")}
-                    value={draft.serviceRadius}
-                    onChange={e => setDraft({ ...draft, serviceRadius: e.target.value })}
-                  />
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div>
-                  <label className="label">{translatePortalText("Standard Delivery Fee (")}{station.currency || 'SAR'})</label>
-                  <input
-                    className="input"
-                    type="number"
-                    min="0"
-                    step="1"
-                    placeholder={translatePortalText("0 for free delivery")}
-                    value={draft.deliveryFeeSar}
-                    onChange={e => setDraft({ ...draft, deliveryFeeSar: parseFloat(e.target.value) || 0 })}
-                  />
-                </div>
-                <div>
-                  <label className="label">{translatePortalText("Emergency Urgent Callout Fee (")}{station.currency || 'SAR'})</label>
-                  <input
-                    id="emergencyDeliveryFee"
-                    className="input"
-                    type="number"
-                    min="0"
-                    step="1"
-                    placeholder={translatePortalText("e.g. 250")}
-                    value={draft.emergencyDeliveryFeeSar}
-                    onChange={e => setDraft({ ...draft, emergencyDeliveryFeeSar: parseFloat(e.target.value) || 0 })}
                   />
                 </div>
               </div>

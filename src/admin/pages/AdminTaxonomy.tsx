@@ -4,7 +4,8 @@ import { Check, X, Plus, Tags, EyeOff, Eye, RefreshCw, ImageUp, RotateCcw } from
 import { PageWrap } from './_shared'
 import { AdminHeader, ABadge } from '../adminUi'
 import { Modal, toast, Spinner } from '../../ui'
-import { translatePortalText, formatPortalDate } from '../../i18n/runtime'
+import { confirm } from '../../async'
+import { translatePortalText, formatPortalDate, formatPortalNumber } from '../../i18n/runtime'
 import { fileUrl, taxonomyAdminApi, type ApiTaxonomyManaged, type ApiTaxonomyRow, type HullFormKey, type TaxonomyListType } from '../../api'
 import { LogoUploadModal } from '../LogoUploadModal'
 import { BOAT_CATEGORIES, TRIP_TYPES } from '../../constants/vesselTaxonomy'
@@ -36,6 +37,14 @@ const HULL_FORMS: { key: HullFormKey; label: string }[] = [
 
 type Tab = 'vessels' | 'trips' | 'pending' | 'approved' | 'rejected'
 
+/**
+ * The Arabic name has to be Arabic. Only length and "differs from English"
+ * were checked, so any Latin-script text passed as the Arabic name and the
+ * Arabic apps would show it untranslated.
+ */
+const isArabicName = (ar: string, en: string) =>
+  ar.trim().length >= 2 && ar.trim() !== en.trim() && /[؀-ۿ]/.test(ar)
+
 const slug = (s: string) => s.trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 60)
 
 function requester(r: ApiTaxonomyRow): string {
@@ -49,6 +58,10 @@ export function AdminTaxonomy() {
   const [rows, setRows] = useState<ApiTaxonomyRow[]>([])
   const [pendingCount, setPendingCount] = useState(0)
   const [loading, setLoading] = useState(true)
+  // A failed load used to fall through to "No requests waiting" — an empty queue
+  // and a broken one looked the same.
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [togglingId, setTogglingId] = useState<string | null>(null)
   const [approving, setApproving] = useState<ApiTaxonomyRow | null>(null)
   const [rejecting, setRejecting] = useState<ApiTaxonomyRow | null>(null)
   const [adding, setAdding] = useState(false)
@@ -63,11 +76,14 @@ export function AdminTaxonomy() {
       return
     }
     setLoading(true)
+    setLoadError(null)
     try {
       const res = await taxonomyAdminApi.list(tab)
       setRows(res.data.items)
       setPendingCount(res.data.counts.pending)
     } catch (e) {
+      setRows([])
+      setLoadError(e instanceof Error ? e.message : 'Could not load the list')
       toast(translatePortalText(e instanceof Error ? e.message : 'Could not load the list'), 'warn')
     } finally {
       setLoading(false)
@@ -85,12 +101,24 @@ export function AdminTaxonomy() {
   ]
 
   const toggleActive = async (r: ApiTaxonomyRow) => {
+    if (togglingId) return
+    if (r.isActive) {
+      const ok = await confirm({
+        title: `Hide "${r.labelEn}"?`,
+        body: 'Providers can no longer pick it. Only the list changes — boats and trips already saved with it are not modified.',
+        confirmLabel: 'Hide',
+      })
+      if (!ok) return
+    }
+    setTogglingId(r._id)
     try {
       await taxonomyAdminApi.setActive(r._id, !r.isActive)
       toast(translatePortalText(r.isActive ? `"${r.labelEn}" hidden — providers can no longer pick it` : `"${r.labelEn}" restored`))
       await load()
     } catch (e) {
       toast(translatePortalText(e instanceof Error ? e.message : 'Could not update'), 'warn')
+    } finally {
+      setTogglingId(null)
     }
   }
 
@@ -121,6 +149,11 @@ export function AdminTaxonomy() {
         <ManagedList key={`${tab}-${listVersion}`} type={tab === 'vessels' ? 'boat_category' : 'trip_type'} />
       ) : loading ? (
         <div className="card grid place-items-center p-10"><Spinner size={22} /></div>
+      ) : loadError ? (
+        <div className="card p-10 text-center text-sm">
+          <p className="font-bold text-rose-600">{translatePortalText('Couldn’t load this list: ')}{loadError}</p>
+          <button className="btn-ghost mt-3" onClick={() => void load()}><RefreshCw size={14} /> {translatePortalText('Retry')}</button>
+        </div>
       ) : rows.length === 0 ? (
         <div className="card p-10 text-center text-sm text-slate-500">
           {translatePortalText(tab === 'pending' ? 'No requests waiting. Providers ask for missing types from the boat and trip forms.' : 'Nothing here yet.')}
@@ -158,7 +191,7 @@ export function AdminTaxonomy() {
                           <button className="btn-ghost !py-1.5 !text-[12px] !text-rose-500" onClick={() => setRejecting(r)}><X size={13} /> {translatePortalText('Decline')}</button>
                         </>)}
                         {tab === 'approved' && (
-                          <button className="btn-ghost !py-1.5 !text-[12px]" onClick={() => void toggleActive(r)}>
+                          <button className="btn-ghost !py-1.5 !text-[12px] disabled:opacity-50" disabled={togglingId === r._id} onClick={() => void toggleActive(r)}>
                             {r.isActive ? <><EyeOff size={13} /> {translatePortalText('Hide')}</> : <><Eye size={13} /> {translatePortalText('Restore')}</>}
                           </button>
                         )}
@@ -199,12 +232,17 @@ function ManagedList({ type }: { type: 'boat_category' | 'trip_type' }) {
   const [items, setItems] = useState<ApiTaxonomyManaged[] | null>(null)
   const [uploading, setUploading] = useState<ApiTaxonomyManaged | null>(null)
   const [stamp, setStamp] = useState(0)
+  const [error, setError] = useState<string | null>(null)
+  const [busyKey, setBusyKey] = useState<string | null>(null)
 
   const load = async () => {
+    setError(null)
     try {
       const res = await taxonomyAdminApi.manage(type)
       setItems(res.data.items)
     } catch (e) {
+      // An empty grid with no message read as "this list has no entries".
+      setError(e instanceof Error ? e.message : 'Could not load the list')
       toast(translatePortalText(e instanceof Error ? e.message : 'Could not load the list'), 'warn')
       setItems([])
     }
@@ -220,26 +258,51 @@ function ManagedList({ type }: { type: 'boat_category' | 'trip_type' }) {
   }
 
   const resetLogo = async (e: ApiTaxonomyManaged) => {
+    if (busyKey) return
+    setBusyKey(e.key)
     try {
       await taxonomyAdminApi.removeLogo(type, e.key)
       toast(translatePortalText(`"${e.labelEn}" uses the app's own artwork again`))
       await load()
     } catch (err) {
       toast(translatePortalText(err instanceof Error ? err.message : 'Could not reset'), 'warn')
+    } finally {
+      setBusyKey(null)
     }
   }
   const toggle = async (e: ApiTaxonomyManaged) => {
-    if (!e.id) return
+    if (!e.id || busyKey) return
+    if (e.isActive) {
+      // The card already knows how many listings use it — say so before hiding.
+      const noun = type === 'boat_category' ? (e.usage === 1 ? 'boat' : 'boats') : (e.usage === 1 ? 'trip' : 'trips')
+      const ok = await confirm({
+        title: `Hide "${e.labelEn}"?`,
+        body: `${e.usage ? `${e.usage} ${noun} use it today. ` : ''}Providers can no longer pick it. Only the list changes — listings already saved with it are not modified.`,
+        confirmLabel: 'Hide',
+      })
+      if (!ok) return
+    }
+    setBusyKey(e.key)
     try {
       await taxonomyAdminApi.setActive(e.id, !e.isActive)
       toast(translatePortalText(e.isActive ? `"${e.labelEn}" hidden — providers can no longer pick it` : `"${e.labelEn}" restored`))
       await load()
     } catch (err) {
       toast(translatePortalText(err instanceof Error ? err.message : 'Could not update'), 'warn')
+    } finally {
+      setBusyKey(null)
     }
   }
 
   if (!items) return <div className="card grid place-items-center p-10"><Spinner size={22} /></div>
+  if (error) {
+    return (
+      <div className="card p-10 text-center text-sm">
+        <p className="font-bold text-rose-600">{translatePortalText('Couldn’t load this list: ')}{error}</p>
+        <button className="btn-ghost mt-3" onClick={() => { setItems(null); void load() }}><RefreshCw size={14} /> {translatePortalText('Retry')}</button>
+      </div>
+    )
+  }
 
   return (
     <>
@@ -261,15 +324,15 @@ function ManagedList({ type }: { type: 'boat_category' | 'trip_type' }) {
               <div className="flex flex-wrap gap-1.5 text-[11px] font-semibold">
                 <span className={`rounded-full px-2 py-0.5 ${e.source === 'built_in' ? 'bg-slate-100 text-slate-600' : 'bg-emerald-50 text-emerald-700'}`}>{translatePortalText(e.source === 'built_in' ? 'Built-in' : 'Added')}</span>
                 {e.hullForm && <span className="rounded-full bg-sky-50 px-2 py-0.5 text-sky-700">{translatePortalText(HULL_FORMS.find((h) => h.key === e.hullForm)?.label || e.hullForm)}</span>}
-                <span className="rounded-full bg-slate-50 px-2 py-0.5 text-slate-500">{e.usage} {translatePortalText(type === 'boat_category' ? (e.usage === 1 ? 'boat' : 'boats') : (e.usage === 1 ? 'trip' : 'trips'))}</span>
+                <span className="rounded-full bg-slate-50 px-2 py-0.5 text-slate-500">{formatPortalNumber(e.usage ?? 0)} {translatePortalText(type === 'boat_category' ? (e.usage === 1 ? 'boat' : 'boats') : (e.usage === 1 ? 'trip' : 'trips'))}</span>
                 {e.logoUrl && <span className="rounded-full bg-violet-50 px-2 py-0.5 text-violet-700">{translatePortalText('Custom logo')}</span>}
                 {!e.isActive && <span className="rounded-full bg-amber-50 px-2 py-0.5 text-amber-700">{translatePortalText('Hidden')}</span>}
               </div>
               <div className="mt-auto flex flex-wrap gap-1.5">
                 <button className="btn-admin !py-1.5 !text-[12px]" onClick={() => setUploading(e)}><ImageUp size={13} /> {translatePortalText(e.logoUrl ? 'Replace logo' : 'Upload logo')}</button>
-                {e.logoUrl && <button className="btn-ghost !py-1.5 !text-[12px]" onClick={() => void resetLogo(e)}><RotateCcw size={13} /> {translatePortalText('Reset')}</button>}
+                {e.logoUrl && <button className="btn-ghost !py-1.5 !text-[12px] disabled:opacity-50" disabled={busyKey === e.key} onClick={() => void resetLogo(e)}><RotateCcw size={13} /> {translatePortalText('Reset')}</button>}
                 {e.source === 'approved' && (
-                  <button className="btn-ghost !py-1.5 !text-[12px]" onClick={() => void toggle(e)}>
+                  <button className="btn-ghost !py-1.5 !text-[12px] disabled:opacity-50" disabled={busyKey === e.key} onClick={() => void toggle(e)}>
                     {e.isActive ? <><EyeOff size={13} /> {translatePortalText('Hide')}</> : <><Eye size={13} /> {translatePortalText('Restore')}</>}
                   </button>
                 )}
@@ -348,12 +411,21 @@ function ApproveModal({ row, onClose, onDone }: { row: ApiTaxonomyRow | null; on
     setKey(row.key)
     setHullForm(row.hullForm ?? 'power')
   }, [row])
-  const valid = labelEn.trim().length >= 2 && labelAr.trim().length >= 2 && labelAr.trim() !== labelEn.trim() && slug(key).length > 0
+  const valid = labelEn.trim().length >= 2 && isArabicName(labelAr, labelEn) && slug(key).length > 0
   const submit = async () => {
-    if (!row || !valid) return
+    if (!row || !valid || busy) return
     setBusy(true)
     try {
       const res = await taxonomyAdminApi.approve(row._id, { labelEn: labelEn.trim(), labelAr: labelAr.trim(), key: slug(key), ...(row.type === 'boat_category' ? { hullForm } : {}) })
+      // The server answers with the row that is already in the list when this
+      // key exists there — the request is merged into it, nothing new is added,
+      // and the names typed here are not used. The toast said "added" anyway.
+      const merged = res.data.item && String(res.data.item._id) !== String(row._id)
+      if (merged) {
+        toast(translatePortalText(`Already in the list as "${res.data.item.labelEn}" — the request was merged into it and the provider notified`), 'warn')
+        onDone()
+        return
+      }
       if (logo && hasLogo(row.type)) {
         try {
           await taxonomyAdminApi.uploadLogo(row.type, res.data.item.key, logo)
@@ -379,6 +451,7 @@ function ApproveModal({ row, onClose, onDone }: { row: ApiTaxonomyRow | null; on
           </label>
           <label className="block text-xs font-bold text-slate-500">{translatePortalText('Arabic name (required)')}
             <input className="input mt-1" dir="rtl" value={labelAr} onChange={(e) => setLabelAr(e.target.value)} maxLength={60} />
+            {labelAr.trim() !== '' && !isArabicName(labelAr, labelEn) && <span className="mt-1 block text-[11px] font-semibold text-rose-500">{translatePortalText('Write the name in Arabic script, different from the English name.')}</span>}
           </label>
           <label className="block text-xs font-bold text-slate-500">{translatePortalText('Key (stored on listings — cannot change later)')}
             <input className="input mt-1 font-mono" value={key} onChange={(e) => setKey(e.target.value)} />
@@ -439,9 +512,9 @@ function AddModal({ open, initialType = 'boat_category', onClose, onDone }: { op
   const [logo, setLogo] = useState<Blob | null>(null)
   const [busy, setBusy] = useState(false)
   useEffect(() => { if (open) { setType(initialType); setLabelEn(''); setLabelAr(''); setHullForm('power'); setLogo(null) } }, [open, initialType])
-  const valid = useMemo(() => labelEn.trim().length >= 2 && labelAr.trim().length >= 2 && labelAr.trim() !== labelEn.trim(), [labelEn, labelAr])
+  const valid = useMemo(() => labelEn.trim().length >= 2 && isArabicName(labelAr, labelEn), [labelEn, labelAr])
   const submit = async () => {
-    if (!valid) return
+    if (!valid || busy) return
     setBusy(true)
     try {
       const res = await taxonomyAdminApi.create({ type, labelEn: labelEn.trim(), labelAr: labelAr.trim(), ...(type === 'boat_category' ? { hullForm } : {}) })
@@ -476,8 +549,9 @@ function AddModal({ open, initialType = 'boat_category', onClose, onDone }: { op
         <label className="block text-xs font-bold text-slate-500">{translatePortalText('English name')}
           <input className="input mt-1" value={labelEn} onChange={(e) => setLabelEn(e.target.value)} maxLength={60} />
         </label>
-        <label className="block text-xs font-bold text-slate-500">{translatePortalText('Arabic name')}
+        <label className="block text-xs font-bold text-slate-500">{translatePortalText('Arabic name (required)')}
           <input className="input mt-1" dir="rtl" value={labelAr} onChange={(e) => setLabelAr(e.target.value)} maxLength={60} />
+          {labelAr.trim() !== '' && !isArabicName(labelAr, labelEn) && <span className="mt-1 block text-[11px] font-semibold text-rose-500">{translatePortalText('Write the name in Arabic script, different from the English name.')}</span>}
         </label>
         {type === 'boat_category' && (
           <label className="block text-xs font-bold text-slate-500">{translatePortalText('Hull form (how marinas berth it)')}

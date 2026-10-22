@@ -3,6 +3,7 @@ import { Headset, RefreshCw } from 'lucide-react'
 import { supportApi, type ApiSupportAgent, type ApiSupportApproval, type ApiSupportScope,
   type SupportDesk, type ApiSubscriber, idOf } from '../../api'
 import { toast, Spinner } from '../../ui'
+import { confirmAndRun } from '../../async'
 import { translatePortalText, isPortalArabic } from '../../i18n/runtime'
 
 const DESKS: SupportDesk[] = ['admin', 'boat', 'marina', 'fuel', 'maintenance']
@@ -49,6 +50,12 @@ export default function AdminSupportAgents() {
   const [otherScopes, setOtherScopes] = useState<ApiSupportScope[]>([])
   const [saving, setSaving] = useState(false)
   const [inviteUrl, setInviteUrl] = useState('')
+  // A failed load toasted and then rendered "No support agents yet. Invite an
+  // agent…" and "No pending actions." — an empty roster and an empty approval
+  // queue, both untrue. It now says the page could not be read.
+  const [loadError, setLoadError] = useState<string | null>(null)
+  /** The agent or approval a request is running for — one at a time. */
+  const [busyId, setBusyId] = useState<string | null>(null)
 
   const load = async () => {
     setLoading(true)
@@ -57,7 +64,12 @@ export default function AdminSupportAgents() {
       setAgents(a.data.items)
       setPending(p.data.items)
       setMetrics(m.data)
-    } catch (err) { toast(err instanceof Error ? err.message : 'Support staff could not be loaded', 'warn') }
+      setLoadError(null)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Support staff could not be loaded'
+      setLoadError(msg)
+      toast(msg, 'warn')
+    }
     finally { setLoading(false) }
   }
   useEffect(() => { void load() }, [])
@@ -93,8 +105,8 @@ export default function AdminSupportAgents() {
 
   const selectAgent = (agent: ApiSupportAgent) => {
     setEditing(agent)
-    setName(agent.user.name)
-    setEmail(agent.user.email)
+    setName(agent.user?.name || '')
+    setEmail(agent.user?.email || '')
     const scope = agent.scopes[0]
     const firstGrants = scope?.grants ?? []
     const firstLimit = scope?.refundLimit ?? 0
@@ -146,25 +158,72 @@ export default function AdminSupportAgents() {
     } catch (err) { toast(err instanceof Error ? err.message : 'Agent could not be saved', 'warn') }
     finally { setSaving(false) }
   }
+  /*
+    Disabling was one click with no question — and it does more than the
+    word says: the server also deactivates the agent's sign-in and hands every
+    case they hold back to the queue. Both directions now confirm and say so.
+  */
   const changeStatus = async (agent: ApiSupportAgent) => {
+    if (busyId) return
+    const disabling = agent.status === 'active'
+    const who = agent.user?.name || translatePortalText('this agent')
+    setBusyId(agent._id)
     try {
-      await supportApi.updateAgent(agent._id, { status: agent.status === 'active' ? 'disabled' : 'active' })
+      await confirmAndRun({
+        title: disabling ? `Disable ${who}?` : `Enable ${who}?`,
+        body: disabling
+          ? 'Their account is deactivated, so they cannot use the support desk, and every case they hold goes back to the queue for another agent.'
+          : 'They can sign in again and receive cases once they switch on availability.',
+        confirmLabel: disabling ? 'Disable' : 'Enable',
+        busyLabel: disabling ? 'Disabling…' : 'Enabling…',
+        danger: disabling,
+        success: disabling ? `${who} disabled` : `${who} enabled`,
+        run: async () => {
+          await supportApi.updateAgent(agent._id, { status: disabling ? 'disabled' : 'active' })
+        },
+      })
+    } finally {
+      setBusyId(null)
       await load()
-    } catch (err) { toast(err instanceof Error ? err.message : 'Status could not be updated', 'warn') }
+    }
   }
   const resend = async (agent: ApiSupportAgent) => {
+    if (busyId) return
+    setBusyId(agent._id)
     try {
       const r = await supportApi.resendAgentInvite(agent._id)
       setInviteUrl(r.data.inviteUrl || '')
       toast(r.data.emailSent ? 'Invitation resent' : 'Copy the invitation link below')
     } catch (err) { toast(err instanceof Error ? err.message : 'Invitation could not be resent', 'warn') }
+    finally { setBusyId(null) }
   }
+  /*
+    Approve executes the agent's action for real — a refund among them — and
+    was a bare button: no question, no busy state, so a double-click sent two
+    decisions. It now confirms with the action, record and amount in front of
+    the admin, and the list is re-read whatever happened, so an approval
+    another admin already decided drops out instead of lingering.
+  */
   const decide = async (item: ApiSupportApproval, approve: boolean) => {
+    if (busyId) return
+    const amount = typeof item.input?.amount === 'number' ? ` — ${item.input.amount} SAR` : ''
+    setBusyId(item._id)
     try {
-      await supportApi.decideAction(item._id, approve)
-      toast(approve ? 'Action approved and processed' : 'Action rejected')
+      await confirmAndRun({
+        title: approve ? `Approve "${item.action}"${amount}?` : `Reject "${item.action}"?`,
+        body: approve
+          ? `It runs immediately on record ${item.entityId}, requested by ${item.actor?.name || 'an agent'}. This cannot be undone from here.`
+          : `Nothing is changed on record ${item.entityId}.`,
+        confirmLabel: approve ? 'Approve and run' : 'Reject',
+        busyLabel: approve ? 'Processing…' : 'Rejecting…',
+        danger: approve,
+        success: approve ? 'Action approved and processed' : 'Action rejected',
+        run: async () => { await supportApi.decideAction(item._id, approve) },
+      })
+    } finally {
+      setBusyId(null)
       await load()
-    } catch (err) { toast(err instanceof Error ? err.message : 'Decision could not be completed', 'warn') }
+    }
   }
 
   return <div className="space-y-6 p-4 md:p-6">
@@ -172,28 +231,35 @@ export default function AdminSupportAgents() {
       <div className="flex items-center gap-2"><Headset className="text-ocean-500" />
         <div><h1 className="font-display text-2xl font-bold text-deep-900">{translatePortalText('Support agents')}</h1>
           <p className="text-sm text-slate-500">Choose who each agent helps. Unanswered AI questions go to an available agent covering that business.</p></div></div>
-      <button className="btn-ghost" onClick={() => void load()}><RefreshCw size={14} /> Refresh</button>
+      <button className="btn-ghost" disabled={loading} onClick={() => void load()}><RefreshCw size={14} className={loading ? 'animate-spin' : ''} /> Refresh</button>
     </div>
+
+    {loadError && <div className="card !border-rose-200 !bg-rose-50 p-3 text-sm text-rose-600">
+      {translatePortalText('Support staff could not be loaded')}: {loadError}{' '}
+      <button className="font-bold underline" onClick={() => void load()}>{translatePortalText('Retry')}</button></div>}
 
     {metrics && <div className="grid gap-3 sm:grid-cols-4 text-sm">
       <div className="card p-3"><strong>{metrics.unassigned}</strong><p className="text-slate-500">Unassigned cases</p></div>
-      <div className="card p-3"><strong>{metrics.avgAssignmentMins} min</strong><p className="text-slate-500">Average assignment time today</p></div>
-      <div className="card p-3"><strong>{metrics.failedActions}</strong><p className="text-slate-500">Failed actions today</p></div>
+      {/* Both are trailing 24 hours server-side (`Date.now() - 86_400_000`), not since midnight. */}
+      <div className="card p-3"><strong>{metrics.avgAssignmentMins} min</strong><p className="text-slate-500">Average assignment time · last 24h</p></div>
+      <div className="card p-3"><strong>{metrics.failedActions}</strong><p className="text-slate-500">Failed actions · last 24h</p></div>
       <div className="card p-3"><strong>{metrics.incompleteAudits}</strong><p className="text-slate-500">Actions needing audit review</p></div>
     </div>}
 
     <div className="grid items-start gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(340px,450px)]">
       <section className="card p-4">
         <h2 className="mb-3 font-bold text-deep-900">Staff</h2>
-        {loading ? <Spinner /> : agents.length === 0 ? <p className="text-sm text-slate-500">No support agents yet. Invite an agent, choose the businesses they cover, then ask them to switch on availability after accepting.</p> :
+        {loading && agents.length === 0 ? <Spinner /> : loadError && agents.length === 0 ? <p className="text-sm text-rose-500">{translatePortalText('The staff list could not be loaded.')}</p> : agents.length === 0 ? <p className="text-sm text-slate-500">No support agents yet. Invite an agent, choose the businesses they cover, then ask them to switch on availability after accepting.</p> :
           <div className="space-y-2">{agents.map(agent => <div key={agent._id} className="rounded-xl border border-slate-100 p-3">
-            <div className="flex items-center justify-between gap-2"><strong>{agent.user.name}</strong><span className="text-xs text-slate-500">{translatePortalText(agent.status === 'invited' ? 'Invitation pending' : agent.status === 'disabled' ? 'Disabled' : agent.available ? 'Available for cases' : 'Offline for new cases')}</span></div>
-            <p className="text-xs text-slate-500">{agent.user.email} · Up to {agent.capacity} active cases</p>
+            {/* `user` is populated and comes back null once the account is deleted —
+                `agent.user.name` then took the whole page down. */}
+            <div className="flex items-center justify-between gap-2"><strong className="min-w-0 truncate">{agent.user?.name || translatePortalText('Deleted account')}</strong><span className="shrink-0 text-xs text-slate-500">{translatePortalText(agent.status === 'invited' ? 'Invitation pending' : agent.status === 'disabled' ? 'Disabled' : agent.available ? 'Available for cases' : 'Offline for new cases')}</span></div>
+            <p className="truncate text-xs text-slate-500">{agent.user?.email || '—'} · Up to {agent.capacity} active cases</p>
             <p className="mt-1 text-xs text-slate-600">Covers: {agent.scopes.length ? agent.scopes.map(scopeLabel).join(isPortalArabic() ? '، ' : ', ') : translatePortalText('No help requests selected')}</p>
             <div className="mt-2 flex flex-wrap gap-2">
               <button className="btn-ghost !px-2 !py-1 !text-xs" onClick={() => selectAgent(agent)}>Configure</button>
-              {agent.status === 'invited' ? <button className="btn-ghost !px-2 !py-1 !text-xs" onClick={() => void resend(agent)}>Resend invite</button>
-                : <button className="btn-ghost !px-2 !py-1 !text-xs" onClick={() => void changeStatus(agent)}>
+              {agent.status === 'invited' ? <button className="btn-ghost !px-2 !py-1 !text-xs" disabled={!!busyId} onClick={() => void resend(agent)}>{busyId === agent._id ? 'Sending…' : 'Resend invite'}</button>
+                : <button className="btn-ghost !px-2 !py-1 !text-xs" disabled={!!busyId} onClick={() => void changeStatus(agent)}>
                   {translatePortalText(agent.status === 'active' ? 'Disable' : 'Enable')}</button>}
             </div>
           </div>)}</div>}
@@ -257,14 +323,14 @@ export default function AdminSupportAgents() {
     </div>
 
     <section className="card p-4"><h2 className="mb-3 font-bold text-deep-900">Actions awaiting approval</h2>
-      {pending.length === 0 ? <p className="text-sm text-slate-500">No pending actions.</p> : pending.map(item =>
+      {loadError && pending.length === 0 ? <p className="text-sm text-rose-500">{translatePortalText('Pending actions could not be loaded.')}</p> : pending.length === 0 ? <p className="text-sm text-slate-500">No pending actions.</p> : pending.map(item =>
         <div key={item._id} className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 py-3 text-sm">
           <div><strong>{item.action}</strong> · {item.actor?.name || translatePortalText('Agent')}
             <p className="text-xs text-slate-500">{item.chat?.support?.reference || translatePortalText('Case')} · {item.chat?.subject || item.chat?._id} · Record {item.entityId}</p>
             <p className="text-xs text-slate-500">{item.reason}</p>
             {typeof item.input?.amount === 'number' && <p className="text-xs">Amount: {item.input.amount} SAR</p>}</div>
-          <div className="flex gap-2"><button className="btn-ghost" onClick={() => void decide(item, false)}>Reject</button>
-            <button className="btn-admin" onClick={() => void decide(item, true)}>Approve</button></div>
+          <div className="flex gap-2"><button className="btn-ghost" disabled={!!busyId} onClick={() => void decide(item, false)}>Reject</button>
+            <button className="btn-admin disabled:opacity-50" disabled={!!busyId} onClick={() => void decide(item, true)}>{busyId === item._id ? 'Working…' : 'Approve'}</button></div>
         </div>)}</section>
   </div>
 }

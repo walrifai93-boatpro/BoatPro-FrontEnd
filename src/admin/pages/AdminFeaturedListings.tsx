@@ -17,6 +17,7 @@ import { Modal, toast } from '../../ui'
 import { money } from '../../format'
 import {
   featuredListingApi,
+  fileUrl,
   type FeaturedListingData,
   type FeaturedListingStatus,
   type FeaturedSlotState,
@@ -87,6 +88,9 @@ export default function AdminFeaturedListings() {
   const [listings, setListings] = useState<FeaturedListingData[]>([])
   const [pendingCount, setPendingCount] = useState(0)
   const [loading, setLoading] = useState(true)
+  // Shown in place of the list: a failed load used to fall through to "Nothing
+  // here", and a 0 / 0 banner read as a real, empty pool.
+  const [loadError, setLoadError] = useState<string | null>(null)
   const [busyId, setBusyId] = useState<string | null>(null)
 
   const [priceFor, setPriceFor] = useState<FeaturedListingData | null>(null)
@@ -164,12 +168,14 @@ export default function AdminFeaturedListings() {
 
   const load = useCallback(async () => {
     setLoading(true)
+    setLoadError(null)
     try {
       const res = await featuredListingApi.adminList(tab === 'all' ? undefined : { status: tab })
       setListings(res.data.listings)
       setPendingCount(res.data.pending)
       setSlots(res.data.slots ?? [])
     } catch (e) {
+      setLoadError(e instanceof Error ? e.message : 'Could not load featured listing applications')
       toast(translatePortalText(e instanceof Error ? e.message : 'Could not load featured listing applications'), 'warn')
     } finally {
       setLoading(false)
@@ -188,10 +194,13 @@ export default function AdminFeaturedListings() {
   }
 
   const submitPrice = async () => {
-    if (!priceFor) return
+    if (!priceFor || busyId) return
     const price = Number(priceDraft)
-    if (!Number.isFinite(price) || price < 0) {
-      toast(translatePortalText('Enter the price the provider will pay'), 'warn')
+    // An empty field is Number('') = 0, which passed the old `< 0` check and
+    // approved the application at 0 — and the provider's checkout refuses an
+    // application without a positive price, so the slot sat held and unpayable.
+    if (priceDraft.trim() === '' || !Number.isFinite(price) || price <= 0) {
+      toast(translatePortalText('Enter the price the provider will pay (above 0)'), 'warn')
       return
     }
     const days = Number(daysDraft)
@@ -247,15 +256,17 @@ export default function AdminFeaturedListings() {
   }
 
   const openPool = () => {
-    setCapacityDraft(String(home?.capacity ?? 100))
-    setHoldDraft(String(home?.reservationDays ?? 3))
+    // Empty, not 100 / 3, when the server sent no slot state: a prefilled guess
+    // saved as-is would overwrite the real setting.
+    setCapacityDraft(home ? String(home.capacity) : '')
+    setHoldDraft(home ? String(home.reservationDays) : '')
     setPoolOpen(true)
   }
 
   const submitPool = async () => {
     const capacity = Number(capacityDraft)
     const reservationDays = Number(holdDraft)
-    if (!Number.isFinite(capacity) || capacity < 0) {
+    if (capacityDraft.trim() === '' || !Number.isFinite(capacity) || capacity < 0) {
       toast(translatePortalText('Enter how many trips the banner should carry'), 'warn')
       return
     }
@@ -397,6 +408,13 @@ export default function AdminFeaturedListings() {
         <div className="flex items-center justify-center gap-2 rounded-2xl border border-slate-100 bg-white p-10 text-sm text-slate-400">
           <Loader2 size={16} className="animate-spin" /> {translatePortalText('Loading applications…')}
         </div>
+      ) : loadError ? (
+        <div className="rounded-2xl border border-rose-200 bg-rose-50 p-10 text-center">
+          <AlertCircle size={28} className="mx-auto text-rose-500" />
+          <p className="mt-2 text-sm font-bold text-deep-900">{translatePortalText('Couldn’t load applications')}</p>
+          <p className="text-xs text-rose-600">{loadError}</p>
+          <button onClick={() => void load()} className="btn-ghost mt-3 text-xs font-bold">{translatePortalText('Retry')}</button>
+        </div>
       ) : listings.length === 0 ? (
         <div className="rounded-2xl border border-dashed border-slate-200 bg-white p-10 text-center">
           <Megaphone size={30} className="mx-auto text-slate-300" />
@@ -431,7 +449,7 @@ export default function AdminFeaturedListings() {
               <div key={l.id} className="rounded-2xl border border-slate-100 bg-white p-4 shadow-sm">
                 <div className="flex flex-wrap items-start gap-4">
                   {cover ? (
-                    <img src={cover} alt="" className="h-20 w-28 shrink-0 rounded-xl object-cover" />
+                    <img src={fileUrl(cover)} alt="" className="h-20 w-28 shrink-0 rounded-xl object-cover" />
                   ) : (
                     <div className="flex h-20 w-28 shrink-0 items-center justify-center rounded-xl bg-sand">
                       <Sailboat size={22} className="text-slate-300" />
@@ -596,7 +614,7 @@ export default function AdminFeaturedListings() {
       <Modal open={!!priceFor} onClose={() => setPriceFor(null)} title={`${translatePortalText('Price')} · ${String(localizedField(priceFor?.trip, 'title') || priceFor?.trip?.title || '')}`}>
         <div className="space-y-4">
           <p className="text-xs text-slate-500">
-            {translatePortalText("\r\n            The provider pays this before the placement runs. Approving does not put the trip in the banner —\r\n            payment does. It does take one of the banner's places straight away\r\n            ")}{home ? ` (${formatPortalNumber(home.free)} ${translatePortalText('free of')} ${formatPortalNumber(home.capacity)})` : ''}{translatePortalText(", held for ")}{formatPortalNumber(home?.reservationDays ?? 3)} {translatePortalText(" days\r\n            while they pay.\r\n          ")}</p>
+            {translatePortalText("\r\n            The provider pays this before the placement runs. Approving does not put the trip in the banner —\r\n            payment does. It does take one of the banner's places straight away\r\n            ")}{home ? ` (${formatPortalNumber(home.free)} ${translatePortalText('free of')} ${formatPortalNumber(home.capacity)})` : ''}{translatePortalText(", held for ")}{home ? formatPortalNumber(home.reservationDays) : '—'} {translatePortalText(" days\r\n            while they pay.\r\n          ")}</p>
           <div>
             <label className="label">{translatePortalText('Price (SAR)')}</label>
             <input
@@ -637,7 +655,7 @@ export default function AdminFeaturedListings() {
               {translatePortalText('Cancel')}
             </button>
             <button
-              disabled={busyId === priceFor?.id}
+              disabled={busyId === priceFor?.id || !(Number(priceDraft) > 0)}
               onClick={submitPrice}
               className="rounded-xl bg-emerald-600 px-4 py-2 text-sm font-bold text-white shadow-sm hover:bg-emerald-700 disabled:opacity-50"
             >

@@ -26,6 +26,7 @@ import {
 import { useMarina } from '../live';
 import { marinaApi, type MissingDetailItem, type MarinaCompletenessReport } from '../api';
 import { toast, Modal } from '../ui';
+import { confirm } from '../async';
 import { localizedField, translatePortalText } from '../i18n/runtime'
 
 
@@ -50,23 +51,35 @@ export default function MarinaStatusBanner() {
   const [publishing, setPublishing] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
   const [fetchedCompleteness, setFetchedCompleteness] = useState<MarinaCompletenessReport | null>(null);
+  // A failed readiness read used to be logged and then rendered as "0% Ready,
+  // Checklist (0)" with Submit greyed out and no reason given.
+  const [completenessError, setCompletenessError] = useState(false);
+  const [completenessAttempt, setCompletenessAttempt] = useState(0);
 
   const marinaId = marina?.id || (marina as any)?._id;
 
   useEffect(() => {
     if (marinaId && !marina?.completeness) {
+      let cancelled = false;
+      setCompletenessError(false);
       marinaApi
         .getCompleteness(marinaId)
         .then((res) => {
+          if (cancelled) return;
           if (res.data?.completeness) {
             setFetchedCompleteness(res.data.completeness);
+          } else {
+            setCompletenessError(true);
           }
         })
         .catch((err) => {
+          if (cancelled) return;
           console.warn('Failed to fetch marina completeness:', err);
+          setCompletenessError(true);
         });
+      return () => { cancelled = true; };
     }
-  }, [marinaId, marina?.completeness]);
+  }, [marinaId, marina?.completeness, completenessAttempt]);
 
   if (!marina) return null;
 
@@ -80,7 +93,13 @@ export default function MarinaStatusBanner() {
   const isComplete = Boolean(completeness && (completeness.isComplete || (criticalItems.length === 0 && score >= 90)));
 
   const handleSubmitForApproval = async () => {
-    if (!marinaId) return;
+    if (!marinaId || submitting) return;
+    if (!completeness) {
+      // Nothing to judge readiness by — the checklist failed to load.
+      toast(translatePortalText("Couldn't load your readiness checklist."), 'warn');
+      setCompletenessAttempt((n) => n + 1);
+      return;
+    }
     if (!isComplete) {
       toast(translatePortalText(`Please complete the ${criticalItems.length} critical items before submitting for review.`), 'warn');
       setChecklistOpen(true);
@@ -100,7 +119,7 @@ export default function MarinaStatusBanner() {
   };
 
   const handlePublish = async () => {
-    if (!marinaId) return;
+    if (!marinaId || publishing) return;
     setPublishing(true);
     try {
       const res = await marinaApi.publish(marinaId);
@@ -115,7 +134,16 @@ export default function MarinaStatusBanner() {
   };
 
   const handleUnpublish = async () => {
-    if (!marinaId) return;
+    if (!marinaId || publishing) return;
+    // Taking the marina out of boater discovery is one quiet link in a banner;
+    // it now asks first.
+    const ok = await confirm({
+      title: 'Unpublish your marina?',
+      body: 'Boaters will no longer find your marina in BoatPro discovery until you publish it again.',
+      confirmLabel: 'Unpublish',
+      danger: true,
+    });
+    if (!ok) return;
     setPublishing(true);
     try {
       const res = await marinaApi.unpublish(marinaId);
@@ -309,7 +337,7 @@ export default function MarinaStatusBanner() {
               <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-emerald-500" />
             </span>
             <p className="text-xs font-bold text-emerald-900 dark:text-emerald-100">
-              <span className="font-extrabold text-emerald-950 dark:text-emerald-200">{marina.name}</span> {translatePortalText("is ")}<strong>{translatePortalText("Verified & Live")}</strong> {translatePortalText("on the BoatPro network.\n            ")}</p>
+              <span className="font-extrabold text-emerald-950 dark:text-emerald-200"><bdi dir="auto">{localizedField(marina, 'name') || marina.name}</bdi></span> {translatePortalText("is ")}<strong>{translatePortalText("Verified & Live")}</strong> {translatePortalText("on the BoatPro network.\n            ")}</p>
           </div>
 
           <div className="flex items-center gap-2">
@@ -317,15 +345,17 @@ export default function MarinaStatusBanner() {
               onClick={() => navigate('/profile')}
               className="text-[11px] font-bold text-ocean-700 dark:text-ocean-300 hover:underline inline-flex items-center gap-1"
             >
-              {translatePortalText("Public Profile ")}<ExternalLink size={11} />
+              {/* Opens the operator's own profile editor — there is no public page
+                  link here, so it no longer claims to be one. */}
+              {translatePortalText("Marina Profile")} <ExternalLink size={11} />
             </button>
             <span className="text-slate-300">|</span>
             <button
               disabled={publishing}
               onClick={handleUnpublish}
-              className="text-[11px] font-semibold text-slate-500 hover:text-rose-600 transition"
+              className="text-[11px] font-semibold text-slate-500 hover:text-rose-600 transition disabled:opacity-50 disabled:cursor-wait"
             >
-              {translatePortalText("Unpublish\n            ")}</button>
+              {publishing ? translatePortalText('Unpublishing…') : translatePortalText("Unpublish\n            ")}</button>
             <button
               onClick={() => setCollapsed(true)}
               className="grid h-6 w-6 place-items-center rounded-full text-slate-400 hover:text-slate-600 hover:bg-slate-100 dark:hover:bg-slate-800"
@@ -365,6 +395,14 @@ export default function MarinaStatusBanner() {
               </div>
               <p className="text-[12px] font-medium text-amber-900/85 dark:text-amber-200/85 mt-0.5 leading-relaxed">
                 {translatePortalText("Before publishing your marina, all core details must be provided and verified by platform administrators. Click any item below to resolve it.\n              ")}</p>
+              {!completeness && completenessError && (
+                <p className="mt-1 flex flex-wrap items-center gap-2 text-[12px] font-semibold text-rose-700 dark:text-rose-300">
+                  {translatePortalText("Couldn't load your readiness checklist.")}
+                  <button onClick={() => setCompletenessAttempt((n) => n + 1)} className="underline hover:no-underline">
+                    {translatePortalText('Try again')}
+                  </button>
+                </p>
+              )}
             </div>
           </div>
 

@@ -17,12 +17,15 @@ import { confirmAndRun } from '../async'
 import { Link, useLocation } from 'react-router-dom'
 import {
   API_URL, getToken, marinaApi, portalApi, marinaDocsApi, incidentsApi, earningsApi, fileUrl, profileApi,
-  type ApiIncident, type ApiMarinaDocument, type EmergencyContact, type MarinaSettings,
+  aiDocumentApi, providerRegistrationApi,
+  type ApiIncident, type ApiMarinaDocument, type EmergencyContact, type MarinaSettings, type AIDocument,
 } from '../api'
+import { getSocket } from '../socket'
 import { useAuth } from '../auth'
 import BrandLogoManager from '../components/BrandLogoManager'
 import VendorLogoBadge from '../components/VendorLogoBadge'
 import { BankDetailsFields } from '../components/BankDetailsFields'
+import { StaffAccessNote } from '../components/StaffAccessNote'
 import {
   EMPTY_BANK_DETAILS,
   bankPayload,
@@ -45,6 +48,69 @@ const PHOTO_CATEGORY_LABELS: Record<string, string> = {
   facilities: 'Facilities', washrooms: 'Washrooms', parking: 'Parking', lounge: 'Lounge',
 }
 
+/**
+ * The registration wizard asks for 5–20 gallery photos; the same bounds hold
+ * here, or a listing approved with five could be emptied out afterwards. The
+ * type and size limits are the API's own (`imageUpload`: jpeg/png/webp/gif,
+ * 8 MB each, 10 per request), checked first so a HEIC from a phone is refused
+ * with a reason instead of a bare 400.
+ */
+const MIN_GALLERY_PHOTOS = 5
+const MAX_GALLERY_PHOTOS = 20
+const PHOTO_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif']
+const PHOTO_MAX_BYTES = 8 * 1024 * 1024
+const PHOTOS_PER_UPLOAD = 10
+
+/** Compliance scans: the API's `docUpload` limits — images or PDF, 15 MB. */
+const DOC_FILE_TYPES = [...PHOTO_TYPES, 'application/pdf']
+const DOC_MAX_BYTES = 15 * 1024 * 1024
+
+/**
+ * When the reverse-geocoder is down the location picker files the pin as
+ * "21.48580, 39.19250". That is not an address a boater can read, so it is
+ * never saved as one: the city stands in for it, or "Location pinned" — the
+ * coordinates themselves are stored separately and lose nothing.
+ */
+const COORDINATE_TEXT = /^\s*-?\d{1,3}(\.\d+)?\s*,\s*-?\d{1,3}(\.\d+)?\s*$/
+const isCoordinateText = (s?: string | null) => !!s && COORDINATE_TEXT.test(s)
+const PINNED_LOCATION_LABEL = 'Location pinned'
+
+/** Loose on format (spaces, dashes, brackets), strict on being a phone number. */
+const PHONE_PATTERN = /^\+?[0-9][0-9\s\-()]{2,28}$/
+
+/** "Ch 16" was typed into a field the profile then printed as "Ch Ch 16". */
+const vhfLabel = (raw?: string | null) => {
+  const v = String(raw ?? '').trim()
+  if (!v) return ''
+  return /^ch/i.test(v) ? v : `Ch ${v}`
+}
+
+/**
+ * Marine VHF channels run 1–88 (with A/B simplex variants). A field that holds
+ * "sixteen" or "Ch 160" is shown to arriving skippers as the channel to hail.
+ */
+const vhfIsValid = (raw: string) => {
+  const parts = raw.replace(/\b(ch(annel)?)\.?/gi, ' ').split(/[,/&]|\band\b/i).map(s => s.trim()).filter(Boolean)
+  if (!parts.length) return false
+  return parts.every(p => {
+    const m = p.match(/^(\d{1,2})\s*[AB]?$/i)
+    return !!m && Number(m[1]) >= 1 && Number(m[1]) <= 88
+  })
+}
+
+/** Refuses a file the API would refuse, saying why. Returns the reason, or null. */
+const fileProblem = (file: File, types: string[], maxBytes: number): string | null => {
+  if (!types.includes(file.type)) return `"${file.name}" is not a supported file type`
+  if (file.size > maxBytes) return `"${file.name}" is larger than ${Math.round(maxBytes / (1024 * 1024))} MB`
+  return null
+}
+
+/** `datetime-local` wants local wall-clock time; `toISOString()` is UTC. */
+const localDateTimeInput = (d = new Date()) => {
+  const off = d.getTimezoneOffset() * 60000
+  return new Date(d.getTime() - off).toISOString().slice(0, 16)
+}
+
 // ===========================================================================
 // Marina profile — the listing boaters see
 // ===========================================================================
@@ -57,6 +123,7 @@ export function Profile() {
   })
   const [point, setPoint] = useState<PickedPoint>({ latitude: 21.4858, longitude: 39.1925, address: '' })
   const [busy, setBusy] = useState(false)
+  const [toggling, setToggling] = useState(false)
   /**
    * `rename` exists because the API and this form do not spell everything the
    * same. A rejection naming `contactNumber` has to land on the input labelled
@@ -106,9 +173,15 @@ export function Profile() {
     return () => window.removeEventListener('boatpro-focus-field', handler)
   }, [focusTarget])
 
+  /**
+   * What the form held when the marina last loaded, so leaving with edits in it
+   * can be caught. Kept as a string because the comparison is all it is for.
+   */
+  const [loadedSnapshot, setLoadedSnapshot] = useState('')
+
   useEffect(() => {
     if (!marina) return
-    setForm({
+    const next = {
       name: canonicalField<string>(marina, 'name') ?? '',
       nameAr: marina.nameAr ?? '',
       description: canonicalField<string>(marina, 'description') ?? '',
@@ -118,43 +191,93 @@ export function Profile() {
       city: canonicalField<string>(marina, 'city') ?? '',
       depthM: marina.depthM != null ? String(marina.depthM) : '',
       maxLoaFt: marina.maxLoaFt != null ? String(marina.maxLoaFt) : '',
-    })
-    setPoint({ latitude: marina.latitude, longitude: marina.longitude, address: marina.address ?? '' })
+    }
+    setForm(next)
+    // An old record can carry no coordinates at all; the picker keeps its
+    // default pin but with no address, so the operator has to place it before
+    // anything is saved rather than having Jeddah filed silently.
+    const hasPoint = Number.isFinite(marina.latitude) && Number.isFinite(marina.longitude)
+    const storedAddress = marina.address ?? ''
+    const nextPoint = {
+      latitude: hasPoint ? marina.latitude : 21.4858,
+      longitude: hasPoint ? marina.longitude : 39.1925,
+      address: !hasPoint ? '' : isCoordinateText(storedAddress) ? (next.city.trim() || PINNED_LOCATION_LABEL) : storedAddress,
+    }
+    setPoint(nextPoint)
+    setLoadedSnapshot(JSON.stringify({ ...next, ...nextPoint }))
   }, [marina])
 
+  const dirty = !!loadedSnapshot && JSON.stringify({ ...form, ...point }) !== loadedSnapshot
+
+  /**
+   * The browser's own "leave site?" prompt for a reload or a closed tab. Moving
+   * to another page inside the portal cannot be held here: the console runs on
+   * a plain `HashRouter`, which has no navigation blocker.
+   */
+  useEffect(() => {
+    if (!dirty) return
+    const onBeforeUnload = (e: BeforeUnloadEvent) => { e.preventDefault(); e.returnValue = '' }
+    window.addEventListener('beforeunload', onBeforeUnload)
+    return () => window.removeEventListener('beforeunload', onBeforeUnload)
+  }, [dirty])
+
   const save = async () => {
-    if (!marina) return
+    if (!marina || busy) return
     const marinaId = marina.id || marina._id
     if (!marinaId) { toast(translatePortalText('Marina ID missing'), 'warn'); return }
     const errs: Record<string, string | undefined> = {}
-    if (!form.name.trim()) errs.name = 'Marina name is required'
+    const name = form.name.trim()
+    if (!name) errs.name = 'Marina name is required'
+    else if (name.length < 2) errs.name = 'Marina name must be at least 2 characters'
     if (!point.address.trim()) errs.address = 'Address is required'
     if (form.email.trim() && !/^\S+@\S+\.\S+$/.test(form.email.trim())) errs.email = 'Enter a valid email address'
+    if (form.contactNumber.trim() && !PHONE_PATTERN.test(form.contactNumber.trim())) {
+      errs.phone = 'Enter a valid phone number, e.g. +966 12 345 6789'
+    }
+    // The city places the marina in harbour search; once set it cannot be
+    // blanked, and an empty one used to be dropped from the request anyway.
+    if (!form.city.trim() && (canonicalField<string>(marina, 'city') ?? '').trim()) {
+      errs.city = 'City is used to place your marina in harbour search — it cannot be left empty'
+    }
     /**
      * Checked here as well as on the server so the number is questioned while the
      * cursor is still in the field, rather than after a round trip.
+     *
+     * Zero is refused, not stored: the listing and the completeness check both
+     * read 0 as "not set" (W-18), so a saved 0 told the operator nothing and
+     * then showed the field as missing. An empty field stays empty instead.
+     * Clearing a number that was already set is refused too — the API keeps the
+     * old value when the field is left out, so "cleared" never reached it.
      */
-    if (form.depthM !== '' && (Number(form.depthM) < 0 || Number(form.depthM) > 100)) {
-      errs.depth = 'Entrance depth must be between 0 and 100 m'
+    if (form.depthM !== '' && (!(Number(form.depthM) > 0) || Number(form.depthM) > 100)) {
+      errs.depth = 'Entrance depth must be more than 0 and at most 100 m'
+    } else if (form.depthM === '' && marina.depthM != null && marina.depthM > 0) {
+      errs.depth = 'Depth at entrance cannot be cleared once set — enter the current depth'
     }
-    if (form.maxLoaFt !== '' && Number(form.maxLoaFt) < 0) {
-      errs.maxLoa = 'Maximum LOA cannot be negative'
+    if (form.maxLoaFt !== '' && (!(Number(form.maxLoaFt) > 0) || Number(form.maxLoaFt) > 1000)) {
+      errs.maxLoa = 'Maximum LOA must be more than 0 and at most 1,000 ft'
+    } else if (form.maxLoaFt === '' && marina.maxLoaFt != null && marina.maxLoaFt > 0) {
+      errs.maxLoa = 'Max LOA cannot be cleared once set — enter the largest boat you accept'
     }
     if (fe.fail(errs)) { toast(translatePortalText('Please fix the highlighted fields'), 'warn'); return }
     fe.clear()
     setBusy(true)
     try {
+      // Text fields go as '' when emptied, not `undefined`: a key left out of
+      // the PATCH keeps its old value, so clearing the Arabic name or the
+      // description used to report "saved" and change nothing.
+      const address = isCoordinateText(point.address) ? (form.city.trim() || PINNED_LOCATION_LABEL) : point.address.trim()
       const res = await marinaApi.update(marinaId, {
-        name: form.name.trim(),
-        nameAr: form.nameAr.trim() || undefined,
-        description: form.description.trim() || undefined,
-        descriptionAr: form.descriptionAr.trim() || undefined,
-        contactNumber: form.contactNumber.trim() || undefined,
-        email: form.email.trim() || undefined,
+        name,
+        nameAr: form.nameAr.trim(),
+        description: form.description.trim(),
+        descriptionAr: form.descriptionAr.trim(),
+        contactNumber: form.contactNumber.trim(),
+        email: form.email.trim(),
         city: form.city.trim() || undefined,
         depthM: form.depthM === '' ? undefined : Number(form.depthM),
         maxLoaFt: form.maxLoaFt === '' ? undefined : Number(form.maxLoaFt),
-        address: point.address.trim(),
+        address,
         latitude: point.latitude,
         longitude: point.longitude,
       })
@@ -174,12 +297,27 @@ export function Profile() {
     } finally { setBusy(false) }
   }
 
+  // The gallery the 5–20 rule counts: everything but the logo. Older records
+  // only have the flat `images` list, which is all there is to count.
+  const galleryCount = marina
+    ? (marina.imagesCategorized?.length
+      ? marina.imagesCategorized.filter(i => i.category !== 'logo').length
+      : (marina.images ?? []).length)
+    : 0
+
   const addPhotos = async (category: string) => {
     if (!marina) return
     const marinaId = marina.id || marina._id
     if (!marinaId) return
-    const files = await pickFiles('image/*', true)
+    const files = await pickFiles(PHOTO_TYPES.join(','), true)
     if (!files.length) return
+    const problem = files.map(f => fileProblem(f, PHOTO_TYPES, PHOTO_MAX_BYTES)).find(Boolean)
+    if (problem) { toast(`${translatePortalText(problem)} — ${translatePortalText('use JPG, PNG, WebP or GIF up to 8 MB')}`, 'warn'); return }
+    if (files.length > PHOTOS_PER_UPLOAD) { toast(translatePortalText('Add up to 10 photos at a time'), 'warn'); return }
+    if (galleryCount + files.length > MAX_GALLERY_PHOTOS) {
+      toast(translatePortalText(`Your gallery can hold ${MAX_GALLERY_PHOTOS} photos — remove some before adding more`), 'warn')
+      return
+    }
     setUploadingCategory(category)
     try {
       await marinaApi.uploadImages(marinaId, files, category)
@@ -190,30 +328,68 @@ export function Profile() {
     } finally { setUploadingCategory(null) }
   }
 
+  /**
+   * One click on a hover icon used to delete a published photo outright. It now
+   * asks first, and refuses to take the gallery below the five the listing was
+   * approved with — add the replacement, then remove the old one.
+   */
   const removePhoto = async (url: string) => {
     if (!marina) return
     const marinaId = marina.id || marina._id
     if (!marinaId) return
-    try {
-      await marinaApi.deleteImage(marinaId, url)
-      toast(translatePortalText('Photo removed'), 'warn')
-      await reload()
-    } catch (e) {
-      toast(translatePortalText(e instanceof Error ? e.message : 'Could not remove that photo'), 'warn')
+    const isLogo = url === logoUrl || marina.imagesCategorized?.find(i => i.url === url)?.category === 'logo'
+    if (!isLogo && galleryCount <= MIN_GALLERY_PHOTOS) {
+      toast(translatePortalText(`Your listing needs at least ${MIN_GALLERY_PHOTOS} photos — add a replacement before removing this one`), 'warn')
+      return
     }
+    await confirmAndRun({
+      title: 'Remove this photo?',
+      body: 'It disappears from your public listing straight away. This cannot be undone.',
+      confirmLabel: 'Remove',
+      busyLabel: 'Removing...',
+      danger: true,
+      run: async () => {
+        await marinaApi.deleteImage(marinaId, url)
+        await reload()
+      },
+      success: 'Photo removed',
+      error: 'Could not remove that photo',
+    })
   }
 
+  /**
+   * Closing the marina stops every new berth request, so it is confirmed.
+   * Re-opening is not. `toggling` stops a double click flipping it twice.
+   */
   const toggleActive = async () => {
-    if (!marina) return
+    if (!marina || toggling) return
     const marinaId = marina.id || marina._id
     if (!marinaId) return
-    try {
+    const flip = async () => {
       const res = await marinaApi.update(marinaId, { isActive: !marina.isActive })
       applyMarina(res.data.marina)
-      toast(translatePortalText(res.data.marina.isActive ? 'Marina is open for reservations' : 'Marina closed — no new berth requests'), res.data.marina.isActive ? 'success' : 'warn')
+      return res.data.marina
+    }
+    if (marina.isActive) {
+      await confirmAndRun({
+        title: 'Close the marina?',
+        body: 'Boaters stop being able to send new berth requests until you open it again.',
+        confirmLabel: 'Close marina',
+        busyLabel: 'Closing...',
+        danger: true,
+        run: flip,
+        success: 'Marina closed — no new berth requests',
+        error: 'Could not change that',
+      })
+      return
+    }
+    setToggling(true)
+    try {
+      const updated = await flip()
+      toast(translatePortalText(updated.isActive ? 'Marina is open for reservations' : 'Marina closed — no new berth requests'), updated.isActive ? 'success' : 'warn')
     } catch (e) {
       toast(translatePortalText(e instanceof Error ? e.message : 'Could not change that'), 'warn')
-    }
+    } finally { setToggling(false) }
   }
 
   const logoUrl = marina?.logo || marina?.imagesCategorized?.find((img: any) => img.category === 'logo')?.url
@@ -235,10 +411,18 @@ export function Profile() {
   }
 
   if (loading && !marina) return <LoadingState label="Loading your marina…" rows={5} />
-  if (error && !marina) return <div className="card"><EmptyState icon="⚠️" text={error} /></div>
+  if (error && !marina) return (
+    <div className="card">
+      <EmptyState icon="⚠️" text={error} />
+      <div className="flex justify-center pb-4">
+        <button className="btn-ghost text-xs" onClick={() => reload()}><RefreshCw size={13} /> {translatePortalText('Try again')}</button>
+      </div>
+    </div>
+  )
   if (!marina) return null
 
   const F = (label: string, node: React.ReactNode) => <div><label className="label">{translatePortalText(label)}</label>{node}</div>
+  const hours = marina.operatingHours
 
   return (
     <div>
@@ -265,8 +449,20 @@ export function Profile() {
             <Toggle on={marina.isActive} onChange={toggleActive} />
             <span className="text-xs font-bold text-slate-600">{translatePortalText(marina.isActive ? 'Open' : 'Closed')}</span>
           </div>
-          <button className="btn-primary" disabled={busy} onClick={save}><Save size={15} /> {translatePortalText(busy ? 'Saving…' : 'Save profile')}</button>
+          <button className="btn-primary" disabled={busy} onClick={save}><Save size={15} /> {translatePortalText(busy ? 'Saving…' : dirty ? 'Save changes' : 'Save profile')}</button>
         </>} />
+
+      {/* The reason an admin sent the listing back. The badge alone said
+          "Changes Needed" and left the operator to guess which. */}
+      {marina.approvalStatus === 'rejected' && (
+        <div className="mb-5 flex items-start gap-3 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
+          <ShieldAlert size={16} className="mt-0.5 shrink-0" />
+          <div className="min-w-0">
+            <p className="font-bold">{translatePortalText('BoatPro asked for changes before your listing can go live')}</p>
+            <p className="mt-0.5 text-xs break-words">{marina.approvalReason?.trim() || translatePortalText('No reason was recorded — contact BoatPro support for details.')}</p>
+          </div>
+        </div>
+      )}
 
       <FormErrorSummary
         errors={fe}
@@ -285,12 +481,12 @@ export function Profile() {
         <Section title={translatePortalText("Identity")} sub="Name and description, in English and Arabic">
           <div className="grid gap-4">
             <div>
-              {F('Marina name *', <input id="name" {...fe.fieldWith('name', 'input')} value={form.name} onChange={e => { setForm(f => ({ ...f, name: e.target.value })); fe.clear('name') }} />)}
+              {F('Marina name *', <input id="name" {...fe.fieldWith('name', 'input')} maxLength={150} value={form.name} onChange={e => { setForm(f => ({ ...f, name: e.target.value })); fe.clear('name') }} />)}
               <FieldError errors={fe} name="name" />
             </div>
-            {F('Name (Arabic)', <input id="name_ar" className="input" dir="rtl" value={form.nameAr} onChange={e => setForm(f => ({ ...f, nameAr: e.target.value }))} />)}
-            {F('Description', <textarea id="description" className="input min-h-[110px]" value={form.description} onChange={e => setForm(f => ({ ...f, description: e.target.value }))} />)}
-            {F('Description (Arabic)', <textarea id="description_ar" className="input min-h-[90px]" dir="rtl" value={form.descriptionAr} onChange={e => setForm(f => ({ ...f, descriptionAr: e.target.value }))} />)}
+            {F('Name (Arabic)', <input id="name_ar" className="input" dir="rtl" maxLength={150} value={form.nameAr} onChange={e => setForm(f => ({ ...f, nameAr: e.target.value }))} />)}
+            {F('Description', <textarea id="description" className="input min-h-[110px]" maxLength={4000} value={form.description} onChange={e => setForm(f => ({ ...f, description: e.target.value }))} />)}
+            {F('Description (Arabic)', <textarea id="description_ar" className="input min-h-[90px]" dir="rtl" maxLength={4000} value={form.descriptionAr} onChange={e => setForm(f => ({ ...f, descriptionAr: e.target.value }))} />)}
           </div>
         </Section>
 
@@ -298,7 +494,7 @@ export function Profile() {
           <Section title={translatePortalText("Contact & harbour specs")} sub="How boaters reach you, and what fits">
             <div className="grid grid-cols-2 gap-4">
               <div>
-                {F('Phone', <input id="phone" {...fe.fieldWith('phone', 'input')} value={form.contactNumber} onChange={e => { setForm(f => ({ ...f, contactNumber: e.target.value })); fe.clear('phone') }} />)}
+                {F('Phone', <input id="phone" {...fe.fieldWith('phone', 'input')} type="tel" dir="ltr" maxLength={30} value={form.contactNumber} onChange={e => { setForm(f => ({ ...f, contactNumber: e.target.value })); fe.clear('phone') }} />)}
                 <FieldError errors={fe} name="phone" />
               </div>
               <div>
@@ -306,15 +502,15 @@ export function Profile() {
                 <FieldError errors={fe} name="email" />
               </div>
               <div>
-                {F('City', <input id="city" {...fe.fieldWith('city', 'input')} value={form.city} onChange={e => { setForm(f => ({ ...f, city: e.target.value })); fe.clear('city') }} />)}
+                {F('City', <input id="city" {...fe.fieldWith('city', 'input')} maxLength={120} value={form.city} onChange={e => { setForm(f => ({ ...f, city: e.target.value })); fe.clear('city') }} />)}
                 <FieldError errors={fe} name="city" />
               </div>
               <div>
-                {F('Depth at entrance (m)', <input id="depth" {...fe.fieldWith('depth', 'input')} type="number" step="0.1" min={0} max={100} value={form.depthM} onChange={e => { setForm(f => ({ ...f, depthM: e.target.value })); fe.clear('depth') }} />)}
+                {F('Depth at entrance (m)', <input id="depth" {...fe.fieldWith('depth', 'input')} type="number" step="0.1" min={0.1} max={100} value={form.depthM} onChange={e => { setForm(f => ({ ...f, depthM: e.target.value })); fe.clear('depth') }} />)}
                 <FieldError errors={fe} name="depth" />
               </div>
               <div>
-                {F('Max LOA accepted (ft)', <input id="max_loa" {...fe.fieldWith('maxLoa', 'input')} type="number" min={0} value={form.maxLoaFt} onChange={e => { setForm(f => ({ ...f, maxLoaFt: e.target.value })); fe.clear('maxLoa') }} />)}
+                {F('Max LOA accepted (ft)', <input id="max_loa" {...fe.fieldWith('maxLoa', 'input')} type="number" min={1} max={1000} value={form.maxLoaFt} onChange={e => { setForm(f => ({ ...f, maxLoaFt: e.target.value })); fe.clear('maxLoa') }} />)}
                 <FieldError errors={fe} name="maxLoa" />
               </div>
               <div className="flex items-end">
@@ -324,7 +520,7 @@ export function Profile() {
           </Section>
 
           <div id="section-photos" className="transition-all duration-500 rounded-2xl">
-            <Section title={translatePortalText("Photos & Brand Logo")} sub={`${marina.imagesCategorized?.length ?? marina.images.length} photo${(marina.imagesCategorized?.length ?? marina.images.length) === 1 ? '' : 's'} · Official Logo & Gallery`}
+            <Section title={translatePortalText("Photos & Brand Logo")} sub={`${galleryCount} of ${MAX_GALLERY_PHOTOS} gallery photos · at least ${MIN_GALLERY_PHOTOS}`}
               actions={<button id="photos" className="btn-primary !py-1.5 !px-3 text-xs" onClick={() => setPhotosOpen(true)}>{translatePortalText("Manage Photos & Logo")}</button>}>
               <div className="flex items-center gap-4">
                 {logoUrl ? (
@@ -357,8 +553,11 @@ export function Profile() {
           />
 
           <div className="border-t border-slate-100 pt-4">
-            <h4 className="text-xs font-black uppercase tracking-wider text-slate-400 mb-4">
+            <h4 className="text-xs font-black uppercase tracking-wider text-slate-400 mb-1">
               {translatePortalText("Harbour Gallery Sections\r\n            ")}</h4>
+            <p className={`mb-4 text-[11px] ${galleryCount < MIN_GALLERY_PHOTOS ? 'font-semibold text-amber-600' : 'text-slate-400'}`}>
+              {translatePortalText(`${galleryCount} of ${MAX_GALLERY_PHOTOS} gallery photos · at least ${MIN_GALLERY_PHOTOS}`)} · {translatePortalText('JPG, PNG, WebP or GIF, up to 8 MB each')}
+            </p>
             <div className="space-y-5">
               {PHOTO_CATEGORIES.filter(c => c !== 'logo').map((cat) => {
                 const imgs = (marina.imagesCategorized || []).filter((i) => (i.category || 'other') === cat)
@@ -381,8 +580,8 @@ export function Profile() {
                           <button key={img.url} type="button" onClick={() => setViewPhoto(img)}
                             className="group relative overflow-hidden rounded-xl text-left">
                             <img src={fileUrl(img.url)} alt="" className="h-24 w-full object-cover" />
-                            <span onClick={(e) => { e.stopPropagation(); removePhoto(img.url) }}
-                              className="absolute end-1.5 top-1.5 grid h-7 w-7 place-items-center rounded-lg bg-white/90 text-rose-500 opacity-0 transition group-hover:opacity-100">
+                            <span onClick={(e) => { e.stopPropagation(); removePhoto(img.url) }} title={translatePortalText('Remove photo')}
+                              className="absolute end-1.5 top-1.5 grid h-7 w-7 place-items-center rounded-lg bg-white/90 text-rose-500 opacity-100 transition md:opacity-0 md:group-hover:opacity-100">
                               <Trash2 size={13} />
                             </span>
                           </button>
@@ -420,6 +619,20 @@ export function Profile() {
         <div className="space-y-5">
           <Section title={translatePortalText("Operating hours")} actions={<Clock size={16} className="text-slate-300" />}>
             <div className="space-y-2 text-sm">
+              {/* The harbour's actual hours, from Settings. This card was titled
+                  "Operating hours" but only ever showed check-in times. */}
+              <p className="flex justify-between gap-3 rounded-xl bg-sand px-3 py-2.5">
+                <span className="text-slate-500">{translatePortalText("Harbour open")}</span>
+                <b className="text-end text-deep-900">
+                  {!hours
+                    ? translatePortalText('not set')
+                    : hours.open24h
+                      ? translatePortalText('24 hours, every day')
+                      : (hours.openTime && hours.closeTime)
+                        ? `${hours.openTime}–${hours.closeTime} · ${formatPortalNumber(hours.workingDays?.length ?? 0)} ${translatePortalText('days a week')}`
+                        : translatePortalText('not set')}
+                </b>
+              </p>
               <p className="flex justify-between rounded-xl bg-sand px-3 py-2.5">
                 <span className="text-slate-500">{translatePortalText("Check-in from")}</span>
                 <b className="text-deep-900">{marina.settings?.checkInTime ?? '14:00'}</b>
@@ -430,7 +643,7 @@ export function Profile() {
               </p>
               <p className="flex justify-between rounded-xl bg-sand px-3 py-2.5">
                 <span className="text-slate-500">{translatePortalText("Harbour office VHF")}</span>
-                <b className="text-deep-900">{marina.settings?.vhfChannel ? `Ch ${marina.settings.vhfChannel}` : translatePortalText('not set')}</b>
+                <b className="text-deep-900">{marina.settings?.vhfChannel ? vhfLabel(marina.settings.vhfChannel) : translatePortalText('not set')}</b>
               </p>
               <p className="flex justify-between rounded-xl bg-sand px-3 py-2.5">
                 <span className="text-slate-500">{translatePortalText("96% refund until")}</span>
@@ -441,11 +654,11 @@ export function Profile() {
           </Section>
 
           <Section title={translatePortalText("Emergency contacts")} actions={<Phone size={16} className="text-slate-300" />}>
-            {marina.emergencyContacts.length === 0 ? (
+            {(marina.emergencyContacts ?? []).length === 0 ? (
               <EmptyState icon="📞" text="No contacts yet" />
             ) : (
               <div className="space-y-1.5">
-                {marina.emergencyContacts.map((c, i) => (
+                {(marina.emergencyContacts ?? []).map((c, i) => (
                   <a key={i} href={`tel:${c.phone}`} className="flex items-center gap-2 rounded-xl border border-slate-100 px-3 py-2 text-xs transition hover:bg-sand">
                     <span className="font-bold text-deep-900">{c.name}</span>
                     <span className="ms-auto text-slate-400">{c.phone}</span>
@@ -460,11 +673,11 @@ export function Profile() {
 
       <Section title={translatePortalText("Facilities on your listing")} sub="Synced from Facilities management" className="mt-5"
         actions={<Link to="/facilities" className="btn-ghost !py-1.5 !px-3 text-xs">{translatePortalText("Manage facilities")}</Link>}>
-        {marina.facilities.filter(f => f.available).length === 0 ? (
+        {(marina.facilities ?? []).filter(f => f.available).length === 0 ? (
           <EmptyState icon="🏗️" text="Nothing listed yet — tick what your marina offers on the Facilities page." />
         ) : (
           <div className="flex flex-wrap gap-2">
-            {marina.facilities.filter(f => f.available).map(f => (
+            {(marina.facilities ?? []).filter(f => f.available).map(f => (
               <span key={f.key} title={f.detail} className="chip bg-ocean-50 text-ocean-700 ring-1 ring-ocean-200">
                 {translatePortalText(humanize(f.key))}{f.detail ? ` · ${f.detail}` : ''}
               </span>
@@ -484,14 +697,49 @@ const DOC_STATUS_LABEL: Record<string, string> = {
   valid: 'Valid', expiring_soon: 'Expiring soon', expired: 'Expired', no_expiry: 'No expiry',
 }
 
+/**
+ * The AI reading of a filed scan, in a word and a colour. Every upload with a
+ * file is queued for analysis (`queueMarinaDocAI`), but the result lives on a
+ * separate AI document — this table only ever showed the expiry, so a scan
+ * flagged as the wrong document or a possible forgery still read "Valid".
+ */
+function aiCheckSummary(ai: AIDocument | undefined, hasFile: boolean): { label: string; tone: string; detail?: string } {
+  if (!hasFile) return { label: 'No scan to check', tone: 'text-slate-400' }
+  if (!ai) return { label: 'Not checked', tone: 'text-slate-400' }
+  const flags = (ai.validation ?? []).filter(v => v.severity === 'critical' || v.severity === 'warning')
+  const worst = flags.find(v => v.severity === 'critical') ?? flags[0]
+  if (ai.status === 'queued' || ai.status === 'analyzing') return { label: 'AI check running', tone: 'text-slate-500' }
+  if (ai.status === 'failed') return { label: 'AI check failed', tone: 'text-rose-600', detail: ai.failureReason }
+  if (ai.status === 'rejected') return { label: 'Rejected by BoatPro', tone: 'text-rose-600', detail: ai.review?.reason ?? worst?.message }
+  if (ai.status === 'approved') return { label: 'Approved by BoatPro', tone: 'text-emerald-600' }
+  if (ai.status === 'needs_review' || ai.fraud?.level === 'high' || ai.fraud?.level === 'critical') {
+    return { label: 'Flagged for review', tone: 'text-amber-600', detail: worst?.message }
+  }
+  return { label: 'AI checked', tone: 'text-emerald-600', detail: worst?.message }
+}
+
 export function Documents() {
   const { reloadOverview } = useOps()
   const [type, setType] = useState('all')
   const [adding, setAdding] = useState(false)
+  const [editing, setEditing] = useState<ApiMarinaDocument | null>(null)
 
   const state = useAsync(() => marinaDocsApi.list({ type: type === 'all' ? undefined : type, limit: 100 }).then(r => r.data), [type])
   const allDocs = state.data?.items ?? []
   const counts = state.data?.statusCounts ?? {}
+
+  // The operator's AI readings, matched to their filed scans by file URL — the
+  // one thing both records share. A failure here only hides the column's
+  // verdicts; the compliance list itself does not depend on it.
+  const vault = useAsync(() => aiDocumentApi.vault().then(r => r.data), [])
+  const aiByFile = useMemo(() => {
+    const m = new Map<string, AIDocument>()
+    for (const d of vault.data?.documents ?? []) {
+      // Newest first from the API; keep the first, the latest reading of a file.
+      if (d.fileUrl && !m.has(d.fileUrl)) m.set(d.fileUrl, d)
+    }
+    return m
+  }, [vault.data])
 
   /**
    * Expiry is the filter that matters here: a compliance table is read to find
@@ -555,7 +803,8 @@ export function Documents() {
         <StatCard i={0} label="Valid" value={counts.valid ?? 0} icon={<FileCheck2 size={17} />} tone="green" />
         <StatCard i={1} label="Expiring soon" value={counts.expiring_soon ?? 0} icon={<Clock size={17} />} tone="amber" />
         <StatCard i={2} label="Expired" value={counts.expired ?? 0} icon={<ShieldAlert size={17} />} tone="rose" />
-        <StatCard i={3} label="On file" value={rows.length} icon={<FileCheck2 size={17} />} tone="navy" />
+        {/* The total on file, not the rows on the current page of the table. */}
+        <StatCard i={3} label="On file" value={state.data?.pagination?.total ?? allDocs.length} icon={<FileCheck2 size={17} />} tone="navy" />
       </div>
 
       <div className="mb-4 flex flex-wrap items-center gap-2">
@@ -582,14 +831,15 @@ export function Documents() {
         ) : (
           <div className="card overflow-hidden !p-0">
             <div className="overflow-x-auto custom-scrollbar">
-              <table className="w-full min-w-[920px]">
+              <table className="w-full min-w-[1040px]">
                 <thead><tr className="border-b border-slate-100 bg-sand/50">
                   <th className="th">{translatePortalText("Document")}</th><th className="th">{translatePortalText("Type")}</th><th className="th">{translatePortalText("Issued")}</th>
-                  <th className="th">{translatePortalText("Expires")}</th><th className="th">{translatePortalText("Status")}</th><th className="th text-right">{translatePortalText("Actions")}</th>
+                  <th className="th">{translatePortalText("Expires")}</th><th className="th">{translatePortalText("Status")}</th><th className="th">{translatePortalText("AI check")}</th><th className="th text-right">{translatePortalText("Actions")}</th>
                 </tr></thead>
                 <tbody>
                   {rows.map((d, i) => {
                     const left = daysUntil(d.expiresAt)
+                    const ai = aiCheckSummary(d.fileUrl ? aiByFile.get(d.fileUrl) : undefined, !!d.fileUrl)
                     return (
                       <motion.tr key={d.id} layout initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: Math.min(i * 0.03, 0.4) }}
                         className="border-b border-slate-50 transition hover:bg-sand/60">
@@ -609,12 +859,20 @@ export function Documents() {
                           </p>}
                         </td>
                         <td className="td"><Badge>{translatePortalText(DOC_STATUS_LABEL[d.status] ?? d.status)}</Badge></td>
+                        <td className="td max-w-[220px]">
+                          <p className={`text-xs font-semibold ${ai.tone}`}>{translatePortalText(vault.error && d.fileUrl ? 'Could not load' : ai.label)}</p>
+                          {ai.detail && !vault.error && <p className="mt-0.5 line-clamp-2 text-[10px] text-slate-400" title={ai.detail}>{ai.detail}</p>}
+                        </td>
                         <td className="td">
                           <div className="flex justify-end gap-1.5">
                             {d.fileUrl && (
                               <a className="btn-ghost !p-2" title={translatePortalText("Open")} href={fileUrl(d.fileUrl)} target="_blank" rel="noreferrer"><ExternalLink size={14} /></a>
                             )}
-                            <button className="btn-ghost !p-2 hover:!bg-rose-50 hover:!border-rose-200 hover:text-rose-500" onClick={() => remove(d)}><Trash2 size={14} /></button>
+                            {/* Renewal, or a fresh scan after a rejection: the API has
+                                always taken a replacement file on PATCH, the page never
+                                offered one. */}
+                            <button className="btn-ghost !p-2" title={translatePortalText("Update or renew")} onClick={() => setEditing(d)}><RefreshCw size={14} /></button>
+                            <button className="btn-ghost !p-2 hover:!bg-rose-50 hover:!border-rose-200 hover:text-rose-500" title={translatePortalText("Delete")} onClick={() => remove(d)}><Trash2 size={14} /></button>
                           </div>
                         </td>
                       </motion.tr>
@@ -628,64 +886,112 @@ export function Documents() {
         )}
       </AsyncBlock>
 
-      <AddDocumentModal open={adding} onClose={() => setAdding(false)} onDone={async () => { await state.reload(); await reloadOverview() }} />
+      <AddDocumentModal open={adding} onClose={() => setAdding(false)} onDone={async () => { await state.reload(); await reloadOverview(); void vault.reload() }} />
+      <AddDocumentModal open={!!editing} doc={editing} onClose={() => setEditing(null)} onDone={async () => { await state.reload(); await reloadOverview(); void vault.reload() }} />
     </div>
   )
 }
 
-function AddDocumentModal({ open, onClose, onDone }: { open: boolean; onClose: () => void; onDone: () => Promise<void> }) {
+const EMPTY_DOC_FORM = { name: '', type: 'license', issuedAt: '', expiresAt: '', reference: '', notes: '' }
+
+/**
+ * Adds a document, or — given `doc` — updates one: new dates for a renewal, or
+ * a fresh scan after the AI check or an admin turned the old one down.
+ */
+function AddDocumentModal({ open, onClose, onDone, doc }: { open: boolean; onClose: () => void; onDone: () => Promise<void>; doc?: ApiMarinaDocument | null }) {
   const [busy, setBusy] = useState(false)
-  const [f, setF] = useState({ name: '', type: 'license', issuedAt: '', expiresAt: '', reference: '', notes: '' })
+  const [f, setF] = useState(EMPTY_DOC_FORM)
   const [file, setFile] = useState<File | null>(null)
+  const editing = !!doc
+
+  useEffect(() => {
+    if (!open) return
+    setFile(null)
+    setF(doc
+      ? {
+          name: doc.name ?? '', type: doc.type ?? 'other',
+          issuedAt: (doc.issuedAt ?? '').slice(0, 10), expiresAt: (doc.expiresAt ?? '').slice(0, 10),
+          reference: doc.reference ?? '', notes: doc.notes ?? '',
+        }
+      : EMPTY_DOC_FORM)
+  }, [open, doc])
+
+  const today = todayIso()
+  const expiryInPast = !!f.expiresAt && f.expiresAt < today
 
   const submit = async () => {
-    if (!f.name.trim()) { toast(translatePortalText('Give the document a name'), 'warn'); return }
+    if (busy) return
+    const name = f.name.trim()
+    if (!name) { toast(translatePortalText('Give the document a name'), 'warn'); return }
+    if (name.length < 2) { toast(translatePortalText('The document name must be at least 2 characters'), 'warn'); return }
+    if (f.issuedAt && f.issuedAt > today) { toast(translatePortalText('The issue date cannot be in the future'), 'warn'); return }
+    if (f.issuedAt && f.expiresAt && f.expiresAt <= f.issuedAt) {
+      toast(translatePortalText('The expiry date must be after the issue date'), 'warn'); return
+    }
     setBusy(true)
     try {
-      await marinaDocsApi.create({
-        name: f.name.trim(), type: f.type,
-        issuedAt: f.issuedAt || undefined, expiresAt: f.expiresAt || undefined,
-        reference: f.reference.trim() || undefined, notes: f.notes.trim() || undefined,
-        file,
-      })
-      toast(translatePortalText(`${f.name} added`))
+      if (doc) {
+        // Only what is set goes up: an emptied date would fail the API's date
+        // check, and the PATCH keeps whatever is left out.
+        await marinaDocsApi.update(doc.id, {
+          name, type: f.type as ApiMarinaDocument['type'],
+          issuedAt: f.issuedAt || undefined, expiresAt: f.expiresAt || undefined,
+          reference: f.reference.trim(), notes: f.notes.trim(),
+          file,
+        })
+        toast(translatePortalText(`${name} updated`), 'success')
+      } else {
+        await marinaDocsApi.create({
+          name, type: f.type,
+          issuedAt: f.issuedAt || undefined, expiresAt: f.expiresAt || undefined,
+          reference: f.reference.trim() || undefined, notes: f.notes.trim() || undefined,
+          file,
+        })
+        toast(translatePortalText(`${name} added`))
+      }
       onClose()
-      setF({ name: '', type: 'license', issuedAt: '', expiresAt: '', reference: '', notes: '' })
+      setF(EMPTY_DOC_FORM)
       setFile(null)
       await onDone()
     } catch (e) {
-      toast(translatePortalText(e instanceof Error ? e.message : 'Could not add the document'), 'warn')
+      toast(translatePortalText(e instanceof Error ? e.message : editing ? 'Could not update the document' : 'Could not add the document'), 'warn')
     } finally { setBusy(false) }
   }
 
   return (
-    <Modal open={open} onClose={onClose} title={translatePortalText("📄 Add a document")}>
+    <Modal open={open} onClose={onClose} title={translatePortalText(editing ? '📄 Update or renew a document' : '📄 Add a document')}>
       <div className="space-y-4">
-        <div><label className="label">{translatePortalText("Name")}</label><input className="input" value={f.name} onChange={e => setF(s => ({ ...s, name: e.target.value }))} placeholder={translatePortalText("Marina operating licence")} /></div>
+        <div><label className="label">{translatePortalText("Name")}</label><input className="input" maxLength={200} value={f.name} onChange={e => setF(s => ({ ...s, name: e.target.value }))} placeholder={translatePortalText("Marina operating licence")} /></div>
         <div className="grid grid-cols-2 gap-4">
           <div><label className="label">{translatePortalText("Type")}</label>
             <select className="input" value={f.type} onChange={e => setF(s => ({ ...s, type: e.target.value }))}>
               {DOC_TYPES.map(t => <option key={t} value={t}>{translatePortalText(humanize(t))}</option>)}
             </select>
           </div>
-          <div><label className="label">{translatePortalText("Reference")}</label><input className="input" value={f.reference} onChange={e => setF(s => ({ ...s, reference: e.target.value }))} /></div>
-          <div><label className="label">{translatePortalText("Issued")}</label><input type="date" className="input" value={f.issuedAt} onChange={e => setF(s => ({ ...s, issuedAt: e.target.value }))} /></div>
-          <div><label className="label">{translatePortalText("Expires")}</label><input type="date" className="input" value={f.expiresAt} onChange={e => setF(s => ({ ...s, expiresAt: e.target.value }))} /></div>
+          <div><label className="label">{translatePortalText("Reference")}</label><input className="input" maxLength={120} value={f.reference} onChange={e => setF(s => ({ ...s, reference: e.target.value }))} /></div>
+          <div><label className="label">{translatePortalText("Issued")}</label><input type="date" className="input" max={today} value={f.issuedAt} onChange={e => setF(s => ({ ...s, issuedAt: e.target.value }))} /></div>
+          <div><label className="label">{translatePortalText("Expires")}</label><input type="date" className="input" min={f.issuedAt || undefined} value={f.expiresAt} onChange={e => setF(s => ({ ...s, expiresAt: e.target.value }))} />
+            {expiryInPast && <p className="mt-1 text-[11px] font-semibold text-amber-600">{translatePortalText('This date has passed — the document will be filed as expired.')}</p>}
+          </div>
         </div>
-        <div><label className="label">{translatePortalText("Notes")}</label><textarea className="input min-h-[70px]" value={f.notes} onChange={e => setF(s => ({ ...s, notes: e.target.value }))} /></div>
+        <div><label className="label">{translatePortalText("Notes")}</label><textarea className="input min-h-[70px]" maxLength={1000} value={f.notes} onChange={e => setF(s => ({ ...s, notes: e.target.value }))} /></div>
         <div>
-          <label className="label">{translatePortalText("Scan or PDF (optional)")}</label>
+          <label className="label">{translatePortalText(editing ? 'Replacement scan or PDF (optional)' : 'Scan or PDF (optional)')}</label>
           <button type="button" className="btn-ghost w-full justify-center" onClick={async () => {
-            const picked = await pickFiles('image/*,application/pdf', false)
-            if (picked.length) setFile(picked[0])
+            const picked = await pickFiles(DOC_FILE_TYPES.join(','), false)
+            if (!picked.length) return
+            const problem = fileProblem(picked[0], DOC_FILE_TYPES, DOC_MAX_BYTES)
+            if (problem) { toast(`${translatePortalText(problem)} — ${translatePortalText('use a PDF or an image up to 15 MB')}`, 'warn'); return }
+            setFile(picked[0])
           }}>
-            <Upload size={14} /> {file ? file.name : translatePortalText('Choose a file')}
+            <Upload size={14} /> {file ? file.name : translatePortalText(editing && doc?.fileUrl ? 'Keep the current file, or choose a new one' : 'Choose a file')}
           </button>
+          <p className="mt-1 text-[11px] text-slate-400">{translatePortalText('PDF, JPG, PNG or WebP, up to 15 MB. Every scan is read by BoatPro’s AI check.')}</p>
         </div>
       </div>
       <div className="mt-6 flex justify-end gap-2">
         <button className="btn-ghost" onClick={onClose}>{translatePortalText("Cancel")}</button>
-        <button className="btn-primary" disabled={busy} onClick={submit}>{translatePortalText(busy ? 'Saving…' : 'Add document')}</button>
+        <button className="btn-primary" disabled={busy} onClick={submit}>{translatePortalText(busy ? 'Saving…' : editing ? 'Save changes' : 'Add document')}</button>
       </div>
     </Modal>
   )
@@ -727,6 +1033,17 @@ export function Settings() {
   const [bankErrors, setBankErrors] = useState<BankDetailsErrors>({})
   const [dirty, setDirty] = useState(false)
   const [busy, setBusy] = useState(false)
+  /** False until the marina has saved hours of its own — the form then shows suggestions, not its schedule. */
+  const hoursOnFile = !!marina?.operatingHours
+
+  // Reload or close the tab with unsaved settings → the browser asks first.
+  // In-portal navigation cannot be held: the console runs on a plain HashRouter.
+  useEffect(() => {
+    if (!dirty) return
+    const onBeforeUnload = (e: BeforeUnloadEvent) => { e.preventDefault(); e.returnValue = '' }
+    window.addEventListener('beforeunload', onBeforeUnload)
+    return () => window.removeEventListener('beforeunload', onBeforeUnload)
+  }, [dirty])
 
   const focusTarget = useCallback((id: string) => {
     if (id === 'hours' || id === 'operating_hours' || id === 'section-hours') {
@@ -823,7 +1140,47 @@ export function Settings() {
     })
   }
 
+  /**
+   * Everything the API would refuse, or would store as something other than
+   * what was typed, caught before either call goes out. Returns the first
+   * problem, worded for a toast.
+   */
+  const settingsProblem = (): string | null => {
+    const saved = state.data?.settings
+    if (!hours.open24h) {
+      if (!hours.workingDays.length) return 'Pick at least one working day, or switch on 24/7 operations'
+      if (!hours.openTime || !hours.closeTime) return 'Set both an opening and a closing time'
+      if (hours.closeTime <= hours.openTime) return 'Closing time must be after opening time — use 24/7 for round-the-clock hours'
+    }
+    const refundWindow = draft.cancellationWindowHours
+    // 0 is refused as well: the refund engine reads 0 as "not set" and quietly
+    // applies BoatPro's 48 hours instead, so a marina that typed 0 got 48.
+    if (refundWindow === undefined || !Number.isFinite(refundWindow) || !Number.isInteger(refundWindow) || refundWindow < 1 || refundWindow > 2160) {
+      return 'The refund window must be a whole number of hours between 1 and 2160'
+    }
+    if (!draft.checkInTime || !draft.checkOutTime) return 'Set both a check-in and a check-out time'
+    if (draft.vhfChannel?.trim() && !vhfIsValid(draft.vhfChannel)) {
+      return 'Enter a marine VHF channel between 1 and 88, e.g. 16 or Ch 68'
+    }
+    if (!/^[A-Z]{3}$/.test(draft.currency ?? '')) return 'Currency must be a three-letter code such as SAR'
+    for (const [key, label] of [['electricityRate', 'Electricity'], ['waterRate', 'Water']] as const) {
+      const v = draft[key]
+      if (v !== undefined && (!Number.isFinite(v) || v < 0)) return `${label} rate cannot be negative`
+      // The API keeps the old rate when the field is left out, so an emptied
+      // rate would report "saved" and stay as it was.
+      if (v === undefined && saved?.[key] != null) return `${label} rate cannot be cleared once set — enter the current rate`
+    }
+    return null
+  }
+
   const save = async () => {
+    if (busy) return
+    const problem = settingsProblem()
+    if (problem) { toast(translatePortalText(problem), 'warn'); return }
+    const marinaId = marina?.id || marina?._id
+    // Hours and bank details live on the marina record. Without it they were
+    // skipped while the toast still said everything had been saved.
+    if (!marinaId) { toast(translatePortalText('Your marina has not loaded yet — try again in a moment'), 'warn'); return }
     /**
      * Checked before anything is sent: this saves the portal settings and the
      * marina in two calls, so an IBAN the API rejects would leave the first
@@ -838,21 +1195,18 @@ export function Settings() {
 
     setBusy(true)
     try {
-      await portalApi.updateSettings(draft)
-      const marinaId = marina?.id || marina?._id
-      if (marinaId) {
-        const res = await marinaApi.update(marinaId, {
-          operatingHours: {
-            open24h: hours.open24h,
-            workingDays: hours.workingDays,
-            openTime: hours.open24h ? undefined : hours.openTime,
-            closeTime: hours.open24h ? undefined : hours.closeTime,
-          },
-          bank: bankPayload(bank),
-        })
-        if (res.data?.marina) {
-          applyMarina(res.data.marina)
-        }
+      await portalApi.updateSettings({ ...draft, vhfChannel: draft.vhfChannel?.trim() })
+      const res = await marinaApi.update(marinaId, {
+        operatingHours: {
+          open24h: hours.open24h,
+          workingDays: hours.workingDays,
+          openTime: hours.open24h ? undefined : hours.openTime,
+          closeTime: hours.open24h ? undefined : hours.closeTime,
+        },
+        bank: bankPayload(bank),
+      })
+      if (res.data?.marina) {
+        applyMarina(res.data.marina)
       }
       toast(translatePortalText('Operating schedule and settings saved successfully! ✨'), 'success')
       setDirty(false)
@@ -883,6 +1237,13 @@ export function Settings() {
                 sub="When the harbour office and docks are manned for boater arrivals and clearance."
               >
                 <div id="hours" className="space-y-4">
+                  {/* Without saved hours the form below holds suggestions, and the
+                      profile shows "not set" — said here so the two do not disagree. */}
+                  {marina && !hoursOnFile && (
+                    <p className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] font-semibold text-amber-800">
+                      {translatePortalText('No hours saved yet — these are suggestions until you save.')}
+                    </p>
+                  )}
                   <div className="flex items-start justify-between gap-3 rounded-xl bg-sand p-3.5 border border-slate-100">
                     <div className="flex items-start gap-3">
                       <div className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-ocean-50 text-ocean-600 font-bold">
@@ -964,15 +1325,18 @@ export function Settings() {
                       {translatePortalText("On: a request skips your review and goes straight to payment. Off: you approve or decline each one first.\r\n                    ")}</p>
                   </div>
                 </div>
+                {/* An emptied field is held as NaN, not 0, so validation can ask for
+                    a number instead of saving a zero the refund engine ignores. */}
                 {F('96% refund window (hours)',
-                  <input type="number" min={0} className="input" value={draft.cancellationWindowHours ?? 48}
-                    onChange={e => set('cancellationWindowHours', Number(e.target.value))} />,
+                  <input type="number" min={1} max={2160} step={1} className="input"
+                    value={draft.cancellationWindowHours === undefined ? 48 : Number.isFinite(draft.cancellationWindowHours) ? draft.cancellationWindowHours : ''}
+                    onChange={e => set('cancellationWindowHours', e.target.value === '' ? NaN : Number(e.target.value))} />,
                   'A boater who cancels more than this many hours before check-in is refunded 96% (the other 4% is the non-returnable bank/app transaction fee). Closer than that, the first day\'s fee or 25% of the total rental value is deducted, whichever is higher. BoatPro\'s published standard is 48 hours.')}
                 <div id="checkin" className="grid grid-cols-2 gap-4 rounded-xl transition-all duration-500">
                   {F('Check-in from', <input type="time" className="input" value={draft.checkInTime ?? '14:00'} onChange={e => set('checkInTime', e.target.value)} />)}
                   {F('Check-out by', <input type="time" className="input" value={draft.checkOutTime ?? '11:00'} onChange={e => set('checkOutTime', e.target.value)} />)}
                 </div>
-                {F('VHF hailing channel', <input id="vhf" className="input" value={draft.vhfChannel ?? ''} onChange={e => set('vhfChannel', e.target.value)} placeholder={translatePortalText("e.g. Ch 16, Ch 68, Ch 72")} />, 'Primary marine VHF channel used by arriving yachts')}
+                {F('VHF hailing channel', <input id="vhf" className="input" maxLength={20} value={draft.vhfChannel ?? ''} onChange={e => set('vhfChannel', e.target.value)} placeholder={translatePortalText("e.g. Ch 16, Ch 68, Ch 72")} />, 'Primary marine VHF channel used by arriving yachts')}
               </div>
             </Section>
 
@@ -997,7 +1361,8 @@ export function Settings() {
             <div id="money" className="transition-all duration-500 rounded-2xl">
               <Section title={translatePortalText("Money & Utility Tariffs")} sub="Currency, tax and meter utility rates">
                 <div className="grid grid-cols-2 gap-4">
-                  {F('Currency', <input className="input uppercase" maxLength={3} value={draft.currency ?? 'SAR'} onChange={e => set('currency', e.target.value.toUpperCase())} />)}
+                  {F('Currency', <input className="input uppercase" maxLength={3} value={draft.currency ?? 'SAR'} onChange={e => set('currency', e.target.value.toUpperCase().replace(/[^A-Z]/g, ''))} />,
+                    'Card payments are collected in SAR whatever is set here')}
                   {/* VAT is set by BoatPro's admins, not by each marina: the server ignores a
                       marina's own value (one had typed 84%) and this shows the rate actually
                       charged. Only an admin acting for the marina can assign an override. */}
@@ -1005,9 +1370,9 @@ export function Settings() {
                     ? <input type="number" min={0} max={100} step="0.5" className="input" value={draft.vatRate ?? 15} onChange={e => set('vatRate', Number(e.target.value))} />
                     : <input type="number" className="input cursor-not-allowed bg-slate-50 text-slate-500" value={draft.vatRate ?? 15} readOnly aria-readonly="true" title={translatePortalText('Set by BoatPro')} />)}
                   {F(`Electricity (${draft.currency ?? 'SAR'}/kWh)`,
-                    <input type="number" step="0.01" className="input" value={draft.electricityRate ?? ''} onChange={e => set('electricityRate', e.target.value === '' ? undefined : Number(e.target.value))} />)}
+                    <input type="number" step="0.01" min={0} className="input" value={draft.electricityRate ?? ''} onChange={e => set('electricityRate', e.target.value === '' ? undefined : Number(e.target.value))} />)}
                   {F(`Water (${draft.currency ?? 'SAR'}/m³)`,
-                    <input type="number" step="0.01" className="input" value={draft.waterRate ?? ''} onChange={e => set('waterRate', e.target.value === '' ? undefined : Number(e.target.value))} />)}
+                    <input type="number" step="0.01" min={0} className="input" value={draft.waterRate ?? ''} onChange={e => set('waterRate', e.target.value === '' ? undefined : Number(e.target.value))} />)}
                 </div>
                 <p className="mt-3 flex items-start gap-2 rounded-xl bg-sand px-3 py-2 text-[11px] text-slate-500">
                   <Percent size={14} className="mt-0.5 shrink-0 text-ocean-500" />
@@ -1058,6 +1423,12 @@ export function Settings() {
 
             {/* 5. Alerts & Notifications */}
             <Section title={translatePortalText("Alerts")} sub="How the platform reaches you">
+              {/* Both switches are stored, but nothing that sends mail or SMS reads
+                  them — delivery follows the account's notification preferences.
+                  Said plainly rather than letting "off" look like silence. */}
+              <p className="mb-3 rounded-xl bg-sand px-3 py-2 text-[11px] text-slate-500">
+                {translatePortalText("Saved as your preference, but alerts are not routed by these switches yet — delivery follows BoatPro's notification defaults for your account.")}
+              </p>
               <div className="space-y-3">
                 {([['notifyByEmail', 'Email me', 'Berth requests, payments and expiring documents by email.'],
                    ['notifyBySms', 'Text me', 'Urgent items by SMS (arrivals, incidents).']] as const).map(([key, title, hint]) => (
@@ -1156,13 +1527,26 @@ const INCIDENT_STATUSES = ['open', 'investigating', 'resolved'] as const
 const INCIDENT_STATUS_LABEL: Record<string, string> = { open: 'Open', investigating: 'Investigating', resolved: 'Resolved' }
 const SEVERITY_LABEL: Record<string, string> = { low: 'Low', medium: 'Medium', high: 'High' }
 
+/** How far out a live SOS is still this harbour's to answer. */
+const SOS_RANGE_NM = 100
+
+/** Great-circle distance in nautical miles. */
+function distanceNm(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const rad = (d: number) => (d * Math.PI) / 180
+  const dLat = rad(lat2 - lat1)
+  const dLon = rad(lon2 - lon1)
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(dLon / 2) ** 2
+  return 3440.065 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+}
+
 export function Emergency() {
   const location = useLocation()
   const { reloadOverview } = useOps()
-  const { reload: reloadMarina } = useMarina()
+  const { marina, reload: reloadMarina } = useMarina()
   const [status, setStatus] = useState('all')
   const [adding, setAdding] = useState(false)
   const [editingContacts, setEditingContacts] = useState(false)
+  const [updatingId, setUpdatingId] = useState<string | null>(null)
 
   useEffect(() => {
     const hash = location.hash.replace(/^#/, '')
@@ -1201,10 +1585,28 @@ export function Emergency() {
   const incTf = useTableFilters(allIncidents, incCfg)
   const rows = incTf.pagedRows
   const counts = state.data?.statusCounts ?? {}
-  const contacts = state.data?.emergencyContacts ?? []
-  const activeSos = state.data?.activeSos ?? []
+  // The call list also rides on the marina record, so a failed incident load
+  // no longer reads as "No emergency contacts yet" with a zero beside it.
+  const contacts = state.data?.emergencyContacts ?? marina?.emergencyContacts ?? []
+  /**
+   * The API returns every unresolved SOS on the platform, not the ones near this
+   * harbour (its own comment says "in range"; the query has no range). Until it
+   * filters, the list is narrowed here to calls within SOS_RANGE_NM of the
+   * marina, nearest first, with the distance shown — a marina in Jeddah has no
+   * business ringing a boater off Dubai.
+   */
+  const activeSos = useMemo(() => {
+    const all = state.data?.activeSos ?? []
+    if (!marina || !Number.isFinite(marina.latitude) || !Number.isFinite(marina.longitude)) return all.map(s => ({ ...s, distanceNm: null as number | null }))
+    return all
+      .map(s => ({ ...s, distanceNm: Number.isFinite(s.latitude) && Number.isFinite(s.longitude) ? distanceNm(marina.latitude, marina.longitude, s.latitude, s.longitude) : null }))
+      .filter(s => s.distanceNm === null || s.distanceNm <= SOS_RANGE_NM)
+      .sort((a, b) => (a.distanceNm ?? Infinity) - (b.distanceNm ?? Infinity))
+  }, [state.data, marina])
 
   const setIncidentStatus = async (inc: ApiIncident, next: string) => {
+    if (updatingId) return
+    setUpdatingId(inc.id)
     try {
       await incidentsApi.update(inc.id, { status: next as ApiIncident['status'] })
       toast(`${inc.code} → ${translatePortalText(INCIDENT_STATUS_LABEL[next])}`)
@@ -1212,7 +1614,7 @@ export function Emergency() {
       await reloadOverview()
     } catch (e) {
       toast(translatePortalText(e instanceof Error ? e.message : 'Could not update the incident'), 'warn')
-    }
+    } finally { setUpdatingId(null) }
   }
 
   const remove = (inc: ApiIncident) =>
@@ -1239,9 +1641,10 @@ export function Emergency() {
           <button className="btn-primary !bg-rose-500 hover:!bg-rose-600" onClick={() => setEditingContacts(true)}><PhoneCall size={14} /> {translatePortalText(contacts.length ? 'Emergency Call List' : '+ Add Emergency Contact')}</button>
           <button className="btn-ghost" onClick={() => setAdding(true)}><Plus size={15} /> {translatePortalText("Log incident")}</button>
         </>} />
+      <StaffAccessNote need={['manage_staff']} action="Editing the emergency call list" />
 
       {activeSos.length > 0 && (
-        <Section title={translatePortalText("Live SOS calls")} sub="Boaters currently signalling for help on the BoatPro network" className="mb-5">
+        <Section title={translatePortalText("Live SOS calls")} sub={`Boaters signalling for help within ${SOS_RANGE_NM} nm of your marina`} className="mb-5">
           <div className="space-y-2">
             {activeSos.map(s => (
               <div key={s._id} className="flex flex-wrap items-center gap-3 rounded-xl border border-rose-200 bg-rose-50 p-3">
@@ -1254,6 +1657,7 @@ export function Emergency() {
                   href={`https://www.openstreetmap.org/?mlat=${s.latitude}&mlon=${s.longitude}#map=10/${s.latitude}/${s.longitude}`}
                   target="_blank" rel="noreferrer">
                   <MapPin size={12} /> {formatPortalNumber(s.latitude, { minimumFractionDigits: 3, maximumFractionDigits: 3 })}, {formatPortalNumber(s.longitude, { minimumFractionDigits: 3, maximumFractionDigits: 3 })}
+                  {s.distanceNm !== null && <span className="font-bold"> · {formatPortalNumber(s.distanceNm, { maximumFractionDigits: s.distanceNm < 10 ? 1 : 0 })} {translatePortalText('nm')}</span>}
                 </a>
                 {s.user?.phone && <a className="chip bg-white text-rose-700 ring-1 ring-rose-200" href={`tel:${s.user.phone}`}><Phone size={12} /> {translatePortalText("Call")}</a>}
               </div>
@@ -1312,11 +1716,11 @@ export function Emergency() {
                       <p className="mt-2 rounded-xl bg-sand px-3 py-2 text-xs text-slate-600"><b>{translatePortalText("Action taken:")}</b> {inc.actionsTaken}</p>
                     )}
                     <div className="mt-3 flex items-center gap-2 border-t border-slate-100 pt-3">
-                      <select value={inc.status} onChange={e => setIncidentStatus(inc, e.target.value)} className="input !w-auto !py-1.5 text-xs font-semibold">
+                      <select value={inc.status} disabled={updatingId === inc.id} onChange={e => setIncidentStatus(inc, e.target.value)} className="input !w-auto !py-1.5 text-xs font-semibold">
                         {INCIDENT_STATUSES.map(s => <option key={s} value={s}>{translatePortalText(INCIDENT_STATUS_LABEL[s])}</option>)}
                       </select>
                       {inc.resolvedAt && <span className="text-[11px] text-slate-400">{translatePortalText("Resolved ")}{fmtRelative(inc.resolvedAt)}</span>}
-                      <button className="btn-ghost !ms-auto !p-2 hover:!bg-rose-50 hover:!border-rose-200 hover:text-rose-500" onClick={() => remove(inc)}><Trash2 size={14} /></button>
+                      <button className="btn-ghost !ms-auto !p-2 hover:!bg-rose-50 hover:!border-rose-200 hover:text-rose-500" title={translatePortalText('Delete')} onClick={() => remove(inc)}><Trash2 size={14} /></button>
                     </div>
                   </motion.div>
                 ))}
@@ -1332,7 +1736,9 @@ export function Emergency() {
             sub="Who the crew rings first"
             actions={<button className="btn-primary !py-1.5 !px-2.5 text-xs !bg-rose-500 hover:!bg-rose-600" onClick={() => setEditingContacts(true)}><Plus size={13} /> {translatePortalText(contacts.length ? 'Edit List' : 'Add Contact')}</button>}
           >
-            {contacts.length ? (
+            {state.error && !state.data?.emergencyContacts && !marina ? (
+              <p className="rounded-xl bg-rose-50 px-3 py-4 text-center text-xs font-semibold text-rose-600">{translatePortalText('Could not load your call list.')}</p>
+            ) : contacts.length ? (
               <div className="space-y-2">
                 {contacts.map((c, i) => (
                   <a key={i} href={`tel:${c.phone}`} className="flex items-center gap-3 rounded-xl border border-slate-100 p-3 transition hover:bg-sand">
@@ -1369,26 +1775,39 @@ function LogIncidentModal({ open, onClose, onDone }: { open: boolean; onClose: (
   const [busy, setBusy] = useState(false)
   const [f, setF] = useState({
     title: '', kind: 'other', severity: 'low', status: 'open',
-    occurredAt: new Date().toISOString().slice(0, 16), description: '', actionsTaken: '', boatName: '',
+    occurredAt: localDateTimeInput(), description: '', actionsTaken: '', boatName: '',
   })
 
+  // "When" defaults to now as of opening the form — local time. It was the
+  // UTC clock (three hours behind in Saudi Arabia), read back as local, so
+  // every incident logged with the default was filed three hours early.
+  useEffect(() => {
+    if (open) setF(s => ({ ...s, occurredAt: localDateTimeInput() }))
+  }, [open])
+
   const submit = async () => {
-    if (!f.title.trim()) { toast(translatePortalText('Give the incident a title'), 'warn'); return }
+    if (busy) return
+    const title = f.title.trim()
+    if (!title) { toast(translatePortalText('Give the incident a title'), 'warn'); return }
+    if (title.length < 2) { toast(translatePortalText('The incident title must be at least 2 characters'), 'warn'); return }
+    const when = new Date(f.occurredAt)
+    if (!f.occurredAt || isNaN(when.getTime())) { toast(translatePortalText('Enter when it happened'), 'warn'); return }
+    if (when.getTime() > Date.now() + 5 * 60000) { toast(translatePortalText('An incident cannot be logged in the future'), 'warn'); return }
     setBusy(true)
     try {
       await incidentsApi.create({
-        title: f.title.trim(),
+        title,
         kind: f.kind as ApiIncident['kind'],
         severity: f.severity as ApiIncident['severity'],
         status: f.status as ApiIncident['status'],
-        occurredAt: new Date(f.occurredAt).toISOString(),
+        occurredAt: when.toISOString(),
         description: f.description.trim() || undefined,
         actionsTaken: f.actionsTaken.trim() || undefined,
         boatName: f.boatName.trim() || undefined,
       })
       toast(translatePortalText('Incident logged'))
       onClose()
-      setF({ title: '', kind: 'other', severity: 'low', status: 'open', occurredAt: new Date().toISOString().slice(0, 16), description: '', actionsTaken: '', boatName: '' })
+      setF({ title: '', kind: 'other', severity: 'low', status: 'open', occurredAt: localDateTimeInput(), description: '', actionsTaken: '', boatName: '' })
       await onDone()
     } catch (e) {
       toast(translatePortalText(e instanceof Error ? e.message : 'Could not log the incident'), 'warn')
@@ -1398,7 +1817,7 @@ function LogIncidentModal({ open, onClose, onDone }: { open: boolean; onClose: (
   return (
     <Modal open={open} onClose={onClose} title={translatePortalText("🚨 Log an incident")} wide>
       <div className="grid grid-cols-2 gap-4">
-        <div className="col-span-2"><label className="label">{translatePortalText("What happened")}</label><input className="input" value={f.title} onChange={e => setF(s => ({ ...s, title: e.target.value }))} placeholder={translatePortalText("Diesel sheen at the fuel dock")} /></div>
+        <div className="col-span-2"><label className="label">{translatePortalText("What happened")}</label><input className="input" maxLength={200} value={f.title} onChange={e => setF(s => ({ ...s, title: e.target.value }))} placeholder={translatePortalText("Diesel sheen at the fuel dock")} /></div>
         <div><label className="label">{translatePortalText("Kind")}</label>
           <select className="input" value={f.kind} onChange={e => setF(s => ({ ...s, kind: e.target.value }))}>
             {INCIDENT_KINDS.map(k => <option key={k} value={k}>{translatePortalText(humanize(k))}</option>)}
@@ -1409,10 +1828,10 @@ function LogIncidentModal({ open, onClose, onDone }: { open: boolean; onClose: (
             {INCIDENT_SEVERITIES.map(s => <option key={s} value={s}>{translatePortalText(SEVERITY_LABEL[s])}</option>)}
           </select>
         </div>
-        <div><label className="label">{translatePortalText("When")}</label><input type="datetime-local" className="input" value={f.occurredAt} onChange={e => setF(s => ({ ...s, occurredAt: e.target.value }))} /></div>
-        <div><label className="label">{translatePortalText("Boat involved")}</label><input className="input" value={f.boatName} onChange={e => setF(s => ({ ...s, boatName: e.target.value }))} /></div>
-        <div className="col-span-2"><label className="label">{translatePortalText("Description")}</label><textarea className="input min-h-[80px]" value={f.description} onChange={e => setF(s => ({ ...s, description: e.target.value }))} /></div>
-        <div className="col-span-2"><label className="label">{translatePortalText("Action taken")}</label><textarea className="input min-h-[70px]" value={f.actionsTaken} onChange={e => setF(s => ({ ...s, actionsTaken: e.target.value }))} /></div>
+        <div><label className="label">{translatePortalText("When")}</label><input type="datetime-local" className="input" max={localDateTimeInput()} value={f.occurredAt} onChange={e => setF(s => ({ ...s, occurredAt: e.target.value }))} /></div>
+        <div><label className="label">{translatePortalText("Boat involved")}</label><input className="input" maxLength={150} value={f.boatName} onChange={e => setF(s => ({ ...s, boatName: e.target.value }))} /></div>
+        <div className="col-span-2"><label className="label">{translatePortalText("Description")}</label><textarea className="input min-h-[80px]" maxLength={4000} value={f.description} onChange={e => setF(s => ({ ...s, description: e.target.value }))} /></div>
+        <div className="col-span-2"><label className="label">{translatePortalText("Action taken")}</label><textarea className="input min-h-[70px]" maxLength={4000} value={f.actionsTaken} onChange={e => setF(s => ({ ...s, actionsTaken: e.target.value }))} /></div>
       </div>
       <div className="mt-6 flex justify-end gap-2">
         <button className="btn-ghost" onClick={onClose}>{translatePortalText("Cancel")}</button>
@@ -1427,12 +1846,18 @@ function ContactsModal({ open, onClose, initial, onDone }: {
 }) {
   const [rows, setRows] = useState<EmergencyContact[]>([])
   const [busy, setBusy] = useState(false)
+  // Read through a ref so the rows are seeded once per opening. Keyed on
+  // `initial` itself, a parent that passed a fresh `[]` each render wiped
+  // whatever was being typed on every re-render.
+  const initialRef = React.useRef(initial)
+  initialRef.current = initial
 
   useEffect(() => {
     if (open) {
-      setRows(initial.length ? initial.map((contact) => ({ ...contact })) : [{ name: '', phone: '', kind: '' }])
+      const seed = initialRef.current
+      setRows(seed.length ? seed.map((contact) => ({ ...contact })) : [{ name: '', phone: '', kind: '' }])
     }
-  }, [open, initial])
+  }, [open])
 
   const addPreset = (name: string, phone: string, kind: string) => {
     setRows(s => {
@@ -1442,16 +1867,30 @@ function ContactsModal({ open, onClose, initial, onDone }: {
   }
 
   const save = async () => {
+    if (busy) return
+    // A row with a name and no number (or the reverse) used to be dropped on
+    // save without a word — the Dockmaster preset arrives exactly like that.
+    const half = rows.find(r => !!r.name.trim() !== !!r.phone.trim())
+    if (half) {
+      toast(translatePortalText(`Add a phone number for "${half.name.trim() || half.phone.trim()}", or remove that row`), 'warn')
+      return
+    }
     const validRows = rows.filter(r => r.name.trim() && r.phone.trim())
     if (!validRows.length) {
       toast(translatePortalText('Please enter at least one contact name and phone number'), 'warn')
       return
     }
+    const badPhone = validRows.find(r => !PHONE_PATTERN.test(r.phone.trim()))
+    if (badPhone) {
+      toast(translatePortalText(`"${badPhone.phone.trim()}" is not a phone number — use digits, spaces and an optional +`), 'warn')
+      return
+    }
+    if (validRows.length > 30) { toast(translatePortalText('The call list holds up to 30 numbers'), 'warn'); return }
     setBusy(true)
     try {
       await incidentsApi.setContacts(validRows.map((contact) => ({
-        name: contact.name,
-        phone: contact.phone,
+        name: contact.name.trim(),
+        phone: contact.phone.trim(),
         kind: canonicalField<string>(contact, 'kind') ?? '',
       })))
       toast(translatePortalText('Emergency call list saved! 🎉'), 'success')
@@ -1484,7 +1923,9 @@ function ContactsModal({ open, onClose, initial, onDone }: {
             <button type="button" onClick={() => addPreset('Fire & Safety', '998', 'Fire Emergency')}
               className="chip bg-sand hover:bg-ocean-50 hover:text-ocean-700 text-xs font-semibold ring-1 ring-slate-200">
               {translatePortalText("🚒 Fire (998)\r\n            ")}</button>
-            <button type="button" onClick={() => addPreset('Dockmaster Duty Phone', '+966 50 000 0000', 'Harbour Operations')}
+            {/* No number of its own: this used to file "+966 50 000 0000", a
+                placeholder that reached the crew's call list as if it were real. */}
+            <button type="button" onClick={() => addPreset('Dockmaster Duty Phone', '', 'Harbour Operations')}
               className="chip bg-sand hover:bg-ocean-50 hover:text-ocean-700 text-xs font-semibold ring-1 ring-slate-200">
               {translatePortalText("🛥️ Dockmaster Duty\r\n            ")}</button>
           </div>
@@ -1503,18 +1944,23 @@ function ContactsModal({ open, onClose, initial, onDone }: {
             <div key={i} className="grid grid-cols-[1fr_1fr_130px_36px] gap-2 items-center">
               <input
                 className="input text-xs"
+                maxLength={100}
                 placeholder={translatePortalText("e.g. Coast Guard")}
                 value={r.name}
                 onChange={e => setRows(s => s.map((x, k) => k === i ? { ...x, name: e.target.value } : x))}
               />
               <input
                 className="input text-xs font-mono"
+                type="tel"
+                dir="ltr"
+                maxLength={40}
                 placeholder={translatePortalText("e.g. +966 50 123 4567 or 994")}
                 value={r.phone}
                 onChange={e => setRows(s => s.map((x, k) => k === i ? { ...x, phone: e.target.value } : x))}
               />
               <input
                 className="input text-xs"
+                maxLength={50}
                 placeholder={translatePortalText("e.g. Rescue / Security")}
                 value={r.kind ?? ''}
                 onChange={e => setRows(s => s.map((x, k) => k === i ? { ...x, kind: e.target.value, kindEn: e.target.value } : x))}
@@ -1553,74 +1999,149 @@ function ContactsModal({ open, onClose, initial, onDone }: {
 // ===========================================================================
 // Platform connections — what this marina is actually plugged into
 // ===========================================================================
+/**
+ * What a connection card can honestly say. "Connected" only when the thing is
+ * demonstrably working for this marina; the rest say why not.
+ */
+type ConnectionState = 'connected' | 'off' | 'pending' | 'unavailable' | 'preference'
+const CONNECTION_CHIP: Record<ConnectionState, { label: string; cls: string }> = {
+  connected: { label: 'Connected', cls: 'bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200' },
+  off: { label: 'Off', cls: 'bg-slate-100 text-slate-500' },
+  pending: { label: 'Not live yet', cls: 'bg-amber-50 text-amber-700 ring-1 ring-amber-200' },
+  unavailable: { label: 'Unavailable', cls: 'bg-rose-50 text-rose-600 ring-1 ring-rose-200' },
+  preference: { label: 'Not routed yet', cls: 'bg-slate-100 text-slate-500' },
+}
+
 export function Integrations() {
   const { marina, currency } = useMarina()
   const { user } = useAuth()
   const [showToken, setShowToken] = useState(false)
   const settings = useAsync(() => portalApi.settings().then(r => r.data), [])
   const earnings = useAsync(() => earningsApi.mine().then(r => r.data), [])
+  // The same forecast the dashboard shows; whether it answers is the honest
+  // test of the weather card, which used to say "Connected" unconditionally.
+  const weather = useAsync(() => portalApi.weather().then(r => r.data), [])
+  // Whose VAT number goes on the invoices: the marina's own, but only from an
+  // approved registration (`resolveSeller`). Read so the card can say which.
+  const registration = useAsync(() => providerRegistrationApi.me().then(r => r.data), [])
 
-  const rows = [
+  // The chat card read "Socket connection active" whatever the socket was doing.
+  const [socketUp, setSocketUp] = useState(() => getSocket().connected)
+  useEffect(() => {
+    const s = getSocket()
+    const up = () => setSocketUp(true)
+    const down = () => setSocketUp(false)
+    s.on('connect', up)
+    s.on('disconnect', down)
+    setSocketUp(s.connected)
+    return () => { s.off('connect', up); s.off('disconnect', down) }
+  }, [])
+
+  const live = !!marina && marina.isActive && marina.approvalStatus === 'approved' && !!marina.isPublished
+  const listingMeta = !marina
+    ? '—'
+    : marina.approvalStatus === 'pending'
+      ? 'Not live — waiting for BoatPro to approve your listing'
+      : marina.approvalStatus === 'rejected'
+        ? 'Not live — BoatPro asked for changes on your profile'
+        : marina.approvalStatus !== 'approved'
+          ? 'Not live — finish and submit your listing'
+          : !marina.isPublished
+            ? 'Approved — publish your listing to go live'
+            : !marina.isActive
+              ? 'Marina closed — turn it on in your profile'
+              : 'Live — accepting berth requests'
+
+  const hasIban = !!marina?.bank?.iban?.trim()
+  const reg = registration.data?.registration
+  const vatDigits = String(reg?.business?.vatNumber ?? '').replace(/[\s-]/g, '')
+  const ownVatOnInvoices = reg?.status === 'approved' && /^\d{15}$/.test(vatDigits)
+  const vatRate = settings.data?.settings.vatRate
+  // A place name, never the raw pin (see `isCoordinateText`).
+  const placeName = marina
+    ? (canonicalField<string>(marina, 'city')?.trim() || (!isCoordinateText(marina.address) ? marina.address?.trim() : '') || translatePortalText(PINNED_LOCATION_LABEL))
+    : '—'
+
+  const rows: { name: string; icon: string; desc: string; state: ConnectionState; meta: string }[] = [
     {
       name: 'BoatPro boat-provider app',
       icon: '⚓',
       desc: 'Berth requests arrive here from boat providers and owners searching for a slip.',
-      connected: !!marina?.isActive,
-      meta: translatePortalText(marina?.isActive ? 'Live — accepting berth requests' : 'Marina closed — turn it on in your profile'),
+      // Open alone is not live: an unapproved or unpublished marina is shown to no one.
+      state: live ? 'connected' : marina && marina.approvalStatus === 'approved' && marina.isPublished ? 'off' : 'pending',
+      meta: translatePortalText(listingMeta),
     },
     {
       name: 'Payments & payouts',
       icon: '💳',
       desc: 'Card and wallet payments on berth contracts, with the platform commission split automatically.',
-      connected: !!earnings.data,
-      meta: earnings.data
-        // `planLabel` comes from the server already worded for the plan's own
-        // kind. The old line appended `${commissionRate}%`, which is 0 on a
-        // fixed-fee plan and read as "Commission billing · 0%".
-        ? `${localizedEnum(earnings.data.planLabel ?? (earnings.data.billingModel === 'subscription' ? 'Subscription' : 'Commission'))} · ${formatPortalNumber(earnings.data.totals.count)} ${translatePortalText('settled payments')}`
-        : translatePortalText('Loading…'),
+      // A loaded earnings summary only proves the API answered. Payouts need
+      // somewhere to go, so without an IBAN on file this is not connected.
+      state: earnings.error ? 'unavailable' : earnings.data && hasIban ? 'connected' : 'pending',
+      meta: earnings.error
+        ? translatePortalText('Could not load your payment summary')
+        : earnings.data
+          // `planLabel` comes from the server already worded for the plan's own
+          // kind. The old line appended `${commissionRate}%`, which is 0 on a
+          // fixed-fee plan and read as "Commission billing · 0%".
+          ? `${localizedEnum(earnings.data.planLabel ?? (earnings.data.billingModel === 'subscription' ? 'Subscription' : 'Commission'))} · ${hasIban
+            ? `${formatPortalNumber(earnings.data.totals.count)} ${translatePortalText('settled payments')}`
+            : translatePortalText('add your IBAN in Settings to receive payouts')}`
+          : translatePortalText('Loading…'),
     },
     {
       name: 'VAT invoicing',
       icon: '🧾',
       desc: 'Every paid berth and utility bill generates a numbered VAT invoice PDF for the boater.',
-      connected: true,
-      meta: `${formatPortalNumber(settings.data?.settings.vatRate ?? 15)}${isPortalArabic() ? '٪' : '%'} ${translatePortalText('VAT')} · ${currency}`,
+      state: 'connected',
+      meta: settings.error
+        ? translatePortalText('Could not load your VAT rate')
+        : vatRate == null
+          ? translatePortalText('Loading…')
+          : `${formatPortalNumber(vatRate)}${isPortalArabic() ? '٪' : '%'} ${translatePortalText('VAT')} · ${currency} · ${translatePortalText(
+            registration.loading && !registration.data ? 'checking your VAT registration…'
+              : ownVatOnInvoices ? 'your VAT number is on your invoices'
+                : 'your own VAT number is not on an approved registration')}`,
     },
     {
       name: 'Marine weather & tides',
       icon: '🌤️',
       desc: 'Live wind, sea state and tide curve for your exact coordinates, on your dashboard.',
-      connected: true,
-      meta: marina ? `${formatPortalNumber(marina.latitude, { minimumFractionDigits: 3, maximumFractionDigits: 3 })}, ${formatPortalNumber(marina.longitude, { minimumFractionDigits: 3, maximumFractionDigits: 3 })}` : '—',
+      state: weather.error ? 'unavailable' : weather.data ? 'connected' : 'pending',
+      meta: weather.error
+        ? `${translatePortalText('Forecast unavailable right now')} · ${placeName}`
+        : weather.data ? placeName : translatePortalText('Loading…'),
     },
     {
       name: 'Maps & geocoding',
       icon: '🗺️',
       desc: 'Places your marina on the map boaters search, and resolves your address.',
-      connected: true,
+      state: 'connected',
       meta: 'OpenStreetMap',
     },
     {
+      // Stored, but read by nothing that sends mail: delivery follows the
+      // account's notification defaults. The card says so instead of
+      // "Connected" / "Off" (see the note in Settings → Alerts).
       name: 'Email alerts',
       icon: '✉️',
       desc: 'Berth requests, payments and expiring documents delivered to your inbox.',
-      connected: !!settings.data?.settings.notifyByEmail,
-      meta: settings.data?.settings.notifyByEmail ? (user?.email ?? translatePortalText('enabled')) : translatePortalText('Off — switch it on in Settings'),
+      state: 'preference',
+      meta: `${translatePortalText(settings.data?.settings.notifyByEmail ? 'Your switch: on' : 'Your switch: off')} · ${user?.email ?? '—'}`,
     },
     {
       name: 'SMS alerts',
       icon: '📱',
       desc: 'Urgent items by text: arrivals, incidents and SOS calls.',
-      connected: !!settings.data?.settings.notifyBySms,
-      meta: settings.data?.settings.notifyBySms ? (user?.phone ?? translatePortalText('enabled')) : translatePortalText('Off — switch it on in Settings'),
+      state: 'preference',
+      meta: `${translatePortalText(settings.data?.settings.notifyBySms ? 'Your switch: on' : 'Your switch: off')}${user?.phone ? ` · ${user.phone}` : ''}`,
     },
     {
       name: 'Live chat',
       icon: '💬',
       desc: 'Real-time messaging with berth holders, shared with the mobile apps.',
-      connected: true,
-      meta: translatePortalText('Socket connection active'),
+      state: socketUp ? 'connected' : 'unavailable',
+      meta: translatePortalText(socketUp ? 'Live connection active' : 'Live connection down — messages arrive on refresh'),
     },
   ]
 
@@ -1639,11 +2160,11 @@ export function Integrations() {
                 <h3 className="truncate font-display text-base font-extrabold text-deep-900">{translatePortalText(r.name)}</h3>
                 <p className="mt-0.5 text-xs text-slate-500">{translatePortalText(r.desc)}</p>
               </div>
-              <span className={`chip ${r.connected ? 'bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200' : 'bg-slate-100 text-slate-500'}`}>
-                {translatePortalText(r.connected ? 'Connected' : 'Off')}
+              <span className={`chip shrink-0 ${CONNECTION_CHIP[r.state].cls}`}>
+                {translatePortalText(CONNECTION_CHIP[r.state].label)}
               </span>
             </div>
-            <p className="mt-3 border-t border-slate-100 pt-3 text-[11px] font-semibold text-slate-400">{r.meta}</p>
+            <p className="mt-3 border-t border-slate-100 pt-3 text-[11px] font-semibold text-slate-400 break-words">{r.meta}</p>
           </motion.div>
         ))}
       </div>

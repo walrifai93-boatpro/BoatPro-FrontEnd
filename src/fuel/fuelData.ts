@@ -37,7 +37,6 @@ export { avatar } from '../format'
 // Team & Access invite/edit form so the two never drift apart.
 export const FUEL_PERMISSION_LABELS: Record<string, string> = {
   calendar: 'Fuel Calendar',
-  tracking: 'Live Tracking',
   bookings: 'Fuel Booking Request',
   deliveries: 'Fuel Booking Management',
   inventory: 'Inventory & Tanks',
@@ -328,21 +327,19 @@ export const BOOKING_ACTION: Record<string, 'accept' | 'reject' | 'schedule' | '
   Cancelled: 'cancel',
 }
 
-export type BookingMethodLabel = 'Dockside' | 'Fuel Barge' | 'Fuel Truck' | 'Mobile Unit'
+export type BookingMethodLabel = 'At the fuel dock' | 'Fuel Barge' | 'Fuel Truck' | 'Mobile Unit'
 
+/**
+ * Fuel is served at the station only — the boat comes alongside the fuel dock —
+ * so every new order is `dockside`. The other labels stay so orders placed
+ * while delivery to the berth existed still read correctly.
+ */
 const METHOD_LABEL: Record<FuelMethod, BookingMethodLabel> = {
-  dockside: 'Dockside',
+  dockside: 'At the fuel dock',
   barge: 'Fuel Barge',
   truck: 'Fuel Truck',
   mobile_unit: 'Mobile Unit',
 }
-export const METHOD_VALUE: Record<BookingMethodLabel, FuelMethod> = {
-  Dockside: 'dockside',
-  'Fuel Barge': 'barge',
-  'Fuel Truck': 'truck',
-  'Mobile Unit': 'mobile_unit',
-}
-export const METHOD_LABELS = Object.keys(METHOD_VALUE) as BookingMethodLabel[]
 
 const PRIORITY_LABEL: Record<FuelPriority, 'Low' | 'Medium' | 'High' | 'Critical'> = {
   low: 'Low',
@@ -412,7 +409,7 @@ export function toBooking(b: ApiFuelBooking): FuelBooking {
     boatLen: b.boatLengthFt ? `${b.boatLengthFt} ft` : '—',
     fuel: b.fuelType,
     qty: b.quantity,
-    method: METHOD_LABEL[b.method] ?? 'Dockside',
+    method: METHOD_LABEL[b.method] ?? 'At the fuel dock',
     location: b.location ?? '—',
     date: shortDate(b.scheduledAt ?? b.createdAt),
     time: b.scheduledAt ? shortTime(b.scheduledAt) : b.emergency ? 'ASAP' : '—',

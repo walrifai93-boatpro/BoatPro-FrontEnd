@@ -9,23 +9,34 @@ import {
   useAsync, useMarina, marinaCoverPhotos, formatMoney, berthLabel, fmtTime, fmtRelative, personOf,
   weatherText, windDir, RESERVATION_LABELS,
 } from '../live'
-import { useOps } from '../opsStore'
+import { monthRevenueGross, useOps } from '../opsStore'
+import { useMarinaPermissions } from '../auth'
 import { fileUrl, reservationsApi, monetizationApi } from '../api'
+import { activeCurrency, convert } from '../currency'
 import { PackagePlanCard, type ProviderDashboardData } from '../shared/packageLimit'
 import { formatPortalDate, formatPortalNumber, isPortalArabic, localizedEnum, localizedField, portalLocale, translatePortalText } from '../i18n/runtime'
 
 
 const C = { s1: '#1b9bbf', s2: '#8b5cf6', s3: '#f59e0b', s4: '#10b981' }
 
-const ChartTip = ({ active, payload, label, currency = 'SAR' }: any) => {
+/**
+ * Chart tooltip. Pass `money` to say what the series is: `true` formats every
+ * value as money (converted into the display currency), `false` as a plain
+ * number. Left unset it keeps the old guess — anything over 500 is money —
+ * which other pages still rely on; on this page that guess printed a 300-riyal
+ * month as a bare "300" and a 600-berth count as "SAR 600", so every chart here
+ * says which it is.
+ */
+const ChartTip = ({ active, payload, label, currency = 'SAR', money }: any) => {
   if (!active || !payload?.length) return null
+  const isMoney = (v: unknown) => typeof v === 'number' && (money === undefined ? v > 500 : !!money)
   return (
     <div className="rounded-xl border border-slate-100 bg-white/95 px-3 py-2 text-xs shadow-lift backdrop-blur">
       <p className="font-bold text-deep-900 mb-1">{label}</p>
       {payload.map((p: any) => (
         <p key={p.name} className="flex items-center gap-2 text-slate-500">
           <span className="h-2 w-2 rounded-full" style={{ background: p.color || p.fill }} />
-          {translatePortalText(p.name)}: <b className="text-deep-900">{typeof p.value === 'number' && p.value > 500 ? formatMoney(p.value, currency) : formatPortalNumber(p.value)}</b>
+          {translatePortalText(p.name)}: <b className="text-deep-900">{isMoney(p.value) ? formatMoney(p.value, currency) : formatPortalNumber(p.value)}</b>
         </p>
       ))}
     </div>
@@ -50,9 +61,12 @@ const greeting = () => {
   return translatePortalText(h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening')
 }
 
-/** A signed percentage change, or undefined when there's nothing to compare to. */
+/**
+ * A signed percentage change, or undefined when there's nothing to compare to.
+ * Growth from zero has no percentage — it used to print a made-up "+100%".
+ */
 const pctDelta = (current: number, previous: number): string | undefined => {
-  if (!previous) return current ? '+100%' : undefined
+  if (!previous) return undefined
   const change = ((current - previous) / previous) * 100
   if (!isFinite(change) || Math.abs(change) < 0.05) return undefined
   return `${change > 0 ? '+' : ''}${formatPortalNumber(change, { maximumFractionDigits: 1, minimumFractionDigits: 1 })}%`
@@ -64,12 +78,19 @@ const countDelta = (current: number, previous: number): string | undefined => {
 }
 
 export default function Dashboard() {
-  const { overview, weather, loading, error, reloadOverview } = useOps()
+  const { overview, weather, weatherError, reloadWeather, alerts: feedAlerts, alertsError, loading, error, reloadOverview } = useOps()
   const { marina, currency } = useMarina()
-  const billing = useAsync(() => monetizationApi.providerDashboard().then((r) => r.data as unknown as ProviderDashboardData), [])
+  const access = useMarinaPermissions()
+  // The plan and its usage are the owner's; a staff account is never shown them.
+  const billing = useAsync(
+    () => access.isOwner
+      ? monetizationApi.providerDashboard().then((r) => r.data as unknown as ProviderDashboardData)
+      : Promise.resolve(null),
+    [access.isOwner],
+  )
 
   if (loading && !overview) return <LoadingState label="Loading your marina…" rows={5} />
-  if (error && !overview) return <ErrorState error={error} onRetry={reloadOverview} />
+  if (error && !overview) return <ErrorState error={error} onRetry={() => void reloadOverview()} />
   if (!overview) return <EmptyState icon="⚓" text="No marina data yet" />
 
   const b = overview.berths
@@ -81,19 +102,47 @@ export default function Dashboard() {
   const openArrivals = overview.arrivals.filter(m => m.status === 'expected' || m.status === 'en_route')
   const openDepartures = overview.departures.filter(m => m.status === 'expected' || m.status === 'en_route')
   const alerts = overview.workOrders.filter(w => w.priority === 'critical' || w.priority === 'high')
+  // "Buzzing" only when something is actually happening — a marina with no
+  // movements and no requests was told the harbour was busy all the same.
+  const busy = openArrivals.length + openDepartures.length + pending + duePayment + alerts.length > 0
   const dashboardSummary = isPortalArabic()
-    ? `القوارب المتوقعة وصولها اليوم: ${formatPortalNumber(openArrivals.length)}، والقوارب المتوقع مغادرتها: ${formatPortalNumber(openDepartures.length)}${pending > 0 ? `، طلبات الحجوزات المعلقة: ${formatPortalNumber(pending)}` : ''}${duePayment > 0 ? `، بانتظار الدفع: ${formatPortalNumber(duePayment)}` : ''}${alerts.length > 0 ? `، ويتطلب الانتباه: ${localizedField(alerts[0], 'title')}` : ''} — المرسى يعج بالحركة.`
-    : `${openArrivals.length} ${openArrivals.length === 1 ? 'arrival' : 'arrivals'} and ${openDepartures.length} ${openDepartures.length === 1 ? 'departure' : 'departures'} today${pending > 0 ? `, ${pending} booking request${pending === 1 ? '' : 's'} waiting` : ''}${duePayment > 0 ? `, ${duePayment} awaiting payment` : ''}${alerts.length > 0 ? `, and ${alerts[0].title.toLowerCase()} is due` : ''} — the harbor is buzzing.`
+    ? `القوارب المتوقعة وصولها اليوم: ${formatPortalNumber(openArrivals.length)}، والقوارب المتوقع مغادرتها: ${formatPortalNumber(openDepartures.length)}${pending > 0 ? `، طلبات الحجوزات المعلقة: ${formatPortalNumber(pending)}` : ''}${duePayment > 0 ? `، بانتظار الدفع: ${formatPortalNumber(duePayment)}` : ''}${alerts.length > 0 ? `، ويتطلب الانتباه: ${localizedField(alerts[0], 'title')}` : ''} — ${busy ? 'المرسى يعج بالحركة.' : 'يوم هادئ على الماء.'}`
+    : `${openArrivals.length} ${openArrivals.length === 1 ? 'arrival' : 'arrivals'} and ${openDepartures.length} ${openDepartures.length === 1 ? 'departure' : 'departures'} today${pending > 0 ? `, ${pending} booking request${pending === 1 ? '' : 's'} waiting` : ''}${duePayment > 0 ? `, ${duePayment} awaiting payment` : ''}${alerts.length > 0 ? `, and ${alerts[0].title.toLowerCase()} is due` : ''} — ${busy ? 'the harbor is buzzing.' : 'a quiet day on the water.'}`
 
+  // Staff without `view_reports` get the overview with revenue zeroed: hide those tiles.
+  const showMoney = !overview.moneyHidden
   const t = overview.trends
   const last = <T,>(a: T[]) => a[a.length - 1]
-  const prev = <T,>(a: T[]) => a[a.length - 2]
+  // The tiles' delta reads "vs last wk", so a daily series compares today with
+  // the same day a week ago — not with yesterday, as it used to.
+  const weekAgo = <T,>(a: T[]) => a[a.length - 8]
   const revenueSeries = overview.revenue.series.map(r => ({ ...r, m: monthLabel(r.month) }))
+  const monthGross = monthRevenueGross(overview)
+  // Axis ticks in the currency the operator reads in; the series is stored in
+  // the marina's own (SAR) and the tooltip already converts.
+  const displayCurrency = activeCurrency()
+  const axisMoney = (v: number) => {
+    const n = convert(v, currency, displayCurrency)
+    return Math.abs(n) >= 1000 ? `${formatPortalNumber(Math.round(n / 1000))}k` : formatPortalNumber(Math.round(n))
+  }
+  // Unread items from the live feed (socket + 60 s poll), so the card empties
+  // the moment "Mark all read" lands instead of a minute later. The overview's
+  // own snapshot stands in while the feed hasn't arrived, or if it failed.
+  const latestAlerts = alertsError || feedAlerts.length === 0 ? overview.alerts : feedAlerts.filter(n => !n.isRead)
+  const uncleared = overview.departures.filter(d => (d.status === 'expected' || d.status === 'en_route') && !d.securityCleared)
   // The last 7 days of the fortnight series is what the weekly bar chart shows.
   const week = t.days.slice(-7).map((d, i) => ({ d: dayLabel(d), occ: t.occupancyRate.slice(-7)[i] }))
 
   return (
     <div className="space-y-6">
+      {/* A background refresh that fails keeps the last good numbers on screen —
+          but says so, rather than presenting them as live. */}
+      {error && (
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl bg-amber-50 px-4 py-3 text-xs font-semibold text-amber-800 ring-1 ring-amber-100">
+          <span>⚠️ {translatePortalText('Live refresh failed — the figures below may be out of date.')}</span>
+          <button className="btn-ghost !py-1 !px-3 text-xs" onClick={() => void reloadOverview()}>{translatePortalText('Try again')}</button>
+        </div>
+      )}
       {/* ── Hero ── */}
       <motion.div initial={{ opacity: 0, scale: 0.985 }} animate={{ opacity: 1, scale: 1 }} transition={{ duration: 0.5 }}
         className="relative overflow-hidden rounded-3xl bg-hero-gradient text-white shadow-lift">
@@ -130,37 +179,50 @@ export default function Dashboard() {
 
       {/* ── KPIs ── */}
       <div className="grid grid-cols-2 gap-4 md:grid-cols-4 ">
-        <StatCard i={0} label={`${translatePortalText('Revenue · ')}${new Date().toLocaleDateString(portalLocale(), { month: 'long' })}`} value={overview.revenue.month.gross}
-          prefix={`${currency} `} delta={pctDelta(last(t.revenue) ?? 0, prev(t.revenue) ?? 0)}
-          icon={<DollarSign size={20} />} tone="navy" spark={t.revenue} to="/billing" />
+        {/* Money goes through `currency` (converted into the reading currency),
+            not a "SAR " prefix that ignored the SAR⇄USD switch. No delta: the
+            tile's caption is "vs last wk", and the only comparison the series
+            offers is a part month against a whole one. */}
+        {showMoney && (
+          <StatCard i={0} label={`${translatePortalText('Revenue · ')}${new Date().toLocaleDateString(portalLocale(), { month: 'long' })}`} value={monthGross}
+            currency={currency}
+            icon={<DollarSign size={20} />} tone="navy" spark={t.revenue} to="/billing" />
+        )}
         <StatCard i={1} label="Today's arrivals" value={overview.arrivals.length}
-          delta={countDelta(last(t.arrivals) ?? 0, prev(t.arrivals) ?? 0)}
+          delta={countDelta(last(t.arrivals) ?? 0, weekAgo(t.arrivals) ?? 0)}
           icon={<Anchor size={20} />} tone="ocean" spark={t.arrivals} to="/movements" />
         <StatCard i={2} label="Today's departures" value={overview.departures.length}
-          delta={countDelta(last(t.departures) ?? 0, prev(t.departures) ?? 0)}
+          delta={countDelta(last(t.departures) ?? 0, weekAgo(t.departures) ?? 0)}
           icon={<LogOut size={20} />} tone="violet" spark={t.departures} to="/movements" />
         <StatCard i={3} label="Occupied berths" value={occupied} suffix={` / ${totalBerths}`}
-          delta={pctDelta(last(t.occupancyRate) ?? 0, t.occupancyRate[t.occupancyRate.length - 8] ?? 0)}
+          delta={pctDelta(last(t.occupancyRate) ?? 0, weekAgo(t.occupancyRate) ?? 0)}
           icon={<Ship size={20} />} tone="green" spark={t.occupiedBerths} to="/berths" />
         <StatCard i={4} label="Pending requests" value={pending} icon={<Hourglass size={20} />} tone="amber" spark={t.requests} to="/reservations" />
         <StatCard i={5} label="Maintenance alerts" value={alerts.length} icon={<Wrench size={20} />} tone="rose" spark={t.workOrders} to="/maintenance" />
       </div>
 
       {/* ── Package usage & billing ── */}
-      {billing.data && (
+      {billing.data ? (
         <Section title={translatePortalText("Package Usage")} sub="Current usage against your active plan's limits — upgrade, downgrade or cancel here">
           <PackagePlanCard dashboard={billing.data} providerType="marina_provider" onChanged={billing.reload} />
         </Section>
-      )}
+      ) : billing.error ? (
+        // The section used to vanish without a word when this failed, which
+        // read as "no plan" rather than "couldn't load your plan".
+        <Section title={translatePortalText("Package Usage")} sub="Current usage against your active plan's limits — upgrade, downgrade or cancel here">
+          <ErrorState error={billing.error} onRetry={() => void billing.reload()} />
+        </Section>
+      ) : null}
 
       {/* ── Revenue + Weather ── */}
       <div className="grid gap-5 lg:grid-cols-3">
-        <Section title={translatePortalText("Revenue overview")} sub="Berthing, services & fuel — trailing 12 months" className="lg:col-span-2"
+        {showMoney && (
+        <Section title={translatePortalText("Revenue overview")} sub="Berthing, services, fuel & other — trailing 12 months" className="lg:col-span-2"
           actions={<Link to="/reports" className="btn-ghost !py-1.5 !px-3 text-xs">{translatePortalText("Full report")}</Link>}>
           <ResponsiveContainer width="100%" height={290}>
             <AreaChart data={revenueSeries} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
               <defs>
-                {[['g1', C.s1], ['g2', C.s2], ['g3', C.s3]].map(([id, c]) => (
+                {[['g1', C.s1], ['g2', C.s2], ['g3', C.s3], ['g4', C.s4]].map(([id, c]) => (
                   <linearGradient key={id} id={id} x1="0" y1="0" x2="0" y2="1">
                     <stop offset="0%" stopColor={c} stopOpacity={0.28} /><stop offset="100%" stopColor={c} stopOpacity={0.02} />
                   </linearGradient>
@@ -168,15 +230,19 @@ export default function Dashboard() {
               </defs>
               <CartesianGrid strokeDasharray="3 3" stroke="#eef2f7" vertical={false} />
               <XAxis dataKey="m" tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false} />
-              <YAxis tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false} tickFormatter={v => `${v >= 1000 ? `${Math.round(v / 1000)}k` : v}`} />
-              <Tooltip content={<ChartTip currency={currency} />} />
+              <YAxis tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false} tickFormatter={axisMoney} />
+              <Tooltip content={<ChartTip currency={currency} money />} />
               <Legend iconType="circle" iconSize={8} wrapperStyle={{ fontSize: 12 }} />
               <Area type="monotone" dataKey="docking" name={translatePortalText('Berthing')} stroke={C.s1} strokeWidth={2} fill="url(#g1)" />
               <Area type="monotone" dataKey="services" name={translatePortalText('Services')} stroke={C.s2} strokeWidth={2} fill="url(#g2)" />
               <Area type="monotone" dataKey="fuel" name={translatePortalText('Fuel')} stroke={C.s3} strokeWidth={2} fill="url(#g3)" />
+              {/* Every other booking type the server buckets as `other` — it
+                  counts in the month's total, so it belongs on the chart too. */}
+              <Area type="monotone" dataKey="other" name={translatePortalText('Other')} stroke={C.s4} strokeWidth={2} fill="url(#g4)" />
             </AreaChart>
           </ResponsiveContainer>
         </Section>
+        )}
 
         <Section title={translatePortalText("Weather & tide")}
           sub={marina ? `${marina.city ?? marina.address} · ${formatPortalNumber(marina.latitude, { minimumFractionDigits: 3, maximumFractionDigits: 3 })}, ${formatPortalNumber(marina.longitude, { minimumFractionDigits: 3, maximumFractionDigits: 3 })}` : 'Live marine forecast'}>
@@ -208,7 +274,7 @@ export default function Dashboard() {
                 <AreaChart data={weather.tides.map(x => ({ t: x.time, h: x.height }))} margin={{ top: 4, right: 4, left: 4, bottom: 0 }}>
                   <defs><linearGradient id="tide" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={C.s1} stopOpacity={0.35} /><stop offset="100%" stopColor={C.s1} stopOpacity={0.03} /></linearGradient></defs>
                   <XAxis dataKey="t" tick={{ fontSize: 9, fill: '#94a3b8' }} axisLine={false} tickLine={false} interval={1} />
-                  <Tooltip content={<ChartTip currency={currency} />} />
+                  <Tooltip content={<ChartTip currency={currency} money={false} />} />
                     <Area type="monotone" dataKey="h" name={translatePortalText('Tide')} stroke={C.s1} strokeWidth={2} fill="url(#tide)" />
                 </AreaChart>
               </ResponsiveContainer>
@@ -218,7 +284,10 @@ export default function Dashboard() {
                 ⚠️ {translatePortalText(weather.warning)}
               </div>
             )}
-          </>) : <LoadingState label="Fetching marine conditions…" rows={2} />}
+          </>) : weatherError
+            // A failed feed used to leave this card on "Fetching…" forever.
+            ? <ErrorState error="Marine conditions are unavailable right now" onRetry={() => void reloadWeather()} />
+            : <LoadingState label="Fetching marine conditions…" rows={2} />}
         </Section>
       </div>
 
@@ -269,9 +338,12 @@ export default function Dashboard() {
                 </motion.div>
               )
             })}
-            {overview.departures.some(d => !d.documentsVerified || !d.securityCleared) && (
+            {/* Condition and count now agree, and only boats still to leave
+                count — a checked-out or cancelled departure needs no clearance.
+                It used to show on documents alone and then count "0". */}
+            {uncleared.length > 0 && (
               <div className="rounded-2xl bg-sand p-3.5 text-xs text-slate-500">
-                💡 <b>{translatePortalText("Tip:")}</b> {formatPortalNumber(overview.departures.filter(d => !d.securityCleared).length)} {translatePortalText("departure(s) still need security clearance before the berth can be released.\r\n              ")}</div>
+                💡 <b>{translatePortalText("Tip:")}</b> {formatPortalNumber(uncleared.length)} {translatePortalText("departure(s) still need security clearance before the berth can be released.\r\n              ")}</div>
             )}
           </div>
         </Section>
@@ -285,13 +357,15 @@ export default function Dashboard() {
               <CartesianGrid strokeDasharray="3 3" stroke="#eef2f7" vertical={false} />
               <XAxis dataKey="d" tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false} />
               <YAxis tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false} unit="%" />
-              <Tooltip content={<ChartTip currency={currency} />} cursor={{ fill: 'rgba(27,155,191,0.06)' }} />
+              <Tooltip content={<ChartTip currency={currency} money={false} />} cursor={{ fill: 'rgba(27,155,191,0.06)' }} />
               <Bar dataKey="occ" name={translatePortalText('Occupancy')} fill={C.s1} radius={[6, 6, 0, 0]} />
             </BarChart>
           </ResponsiveContainer>
         </Section>
 
-        <Section title={translatePortalText("Upcoming reservations")} sub="Confirmed & pending requests" actions={<Link to="/reservations" className="text-xs font-bold text-ocean-600 hover:underline">{translatePortalText("Manage →")}</Link>}>
+        {/* The server sends only requests still waiting (review or payment) here,
+            capped at 10 — the caption used to promise confirmed bookings too. */}
+        <Section title={translatePortalText("Upcoming reservations")} sub="Awaiting your review or the boater's payment" actions={<Link to="/reservations" className="text-xs font-bold text-ocean-600 hover:underline">{translatePortalText("Manage →")}</Link>}>
           <div className="space-y-2">
             {overview.pendingRequests.length === 0 && <EmptyState icon="✅" text="Nothing waiting on you" />}
             {overview.pendingRequests.slice(0, 5).map((r, i) => (
@@ -302,7 +376,8 @@ export default function Dashboard() {
                   <p className="truncate text-sm font-bold text-deep-900">{r.boatName} <span className="font-medium text-slate-400">· {r.reservationNo}</span></p>
                   <p className="text-xs text-slate-400">{formatPortalDate(r.startDate)} → {formatPortalDate(r.endDate)} · {berthLabel(r.pontoon, r.slot)}</p>
                 </div>
-                <Badge>{translatePortalText(RESERVATION_LABELS[r.status] ?? r.status)}</Badge>
+                {/* Legacy `pending` rows are the same as awaiting review. */}
+                <Badge>{translatePortalText(RESERVATION_LABELS[(r.status as string) === 'pending' ? 'pending_approval' : r.status] ?? r.status)}</Badge>
               </motion.div>
             ))}
           </div>
@@ -310,9 +385,9 @@ export default function Dashboard() {
 
         <Section title={translatePortalText("Latest notifications")} sub="What needs your attention" actions={<Link to="/notifications" className="text-xs font-bold text-ocean-600 hover:underline">{translatePortalText("All →")}</Link>}>
           <div className="space-y-2">
-            {overview.alerts.length === 0 && <EmptyState icon="🔔" text="You're all caught up" />}
-            {overview.alerts.slice(0, 5).map((n, i) => (
-              <motion.div key={n.id} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: i * 0.06 }}
+            {latestAlerts.length === 0 && <EmptyState icon="🔔" text="You're all caught up" />}
+            {latestAlerts.slice(0, 5).map((n, i) => (
+              <motion.div key={n.id ?? n._id} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: i * 0.06 }}
                 className="flex gap-3 rounded-xl px-1 py-1.5">
                 <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-sand text-base">{NOTIF_ICON[n.type] ?? '🔔'}</span>
                 <div className="min-w-0">
@@ -346,7 +421,7 @@ export default function Dashboard() {
                       <Pie data={mix.filter(m => m.v > 0)} dataKey="v" nameKey="name" cx="50%" cy="50%" innerRadius={56} outerRadius={80} paddingAngle={3} strokeWidth={2} stroke="#fff">
                         {mix.filter(m => m.v > 0).map(m => <Cell key={m.name} fill={MIXC[m.name]} />)}
                       </Pie>
-                      <Tooltip content={<ChartTip currency={currency} />} />
+                      <Tooltip content={<ChartTip currency={currency} money={false} />} />
                     </PieChart>
                   </ResponsiveContainer>
                   <div className="pointer-events-none absolute inset-0 grid place-items-center text-center">
@@ -369,10 +444,12 @@ export default function Dashboard() {
           })()}
         </Section>
 
+        {access.can('manage_bookings') && (
         <Section title={translatePortalText("Booking ledger")} sub="Most recent reservations across all statuses" className="lg:col-span-2"
           actions={<Link to="/reservations" className="btn-ghost !py-1.5 !px-3 text-xs">{translatePortalText("Open reservations")}</Link>}>
           <BookingLedger currency={currency} />
         </Section>
+        )}
       </div>
     </div>
   )
@@ -393,6 +470,8 @@ const avatarFor = (name?: string, avatar?: string) =>
 function BookingLedger({ currency }: { currency: string }) {
   const state = useAsync(() => reservationsApi.list({ status: 'all', limit: 6 }).then(r => r.data), [])
   if (state.loading && !state.data) return <LoadingState label="Loading the ledger…" rows={3} />
+  // A failed read used to fall through to "No reservations yet".
+  if (state.error && !state.data) return <ErrorState error={state.error} onRetry={() => void state.reload()} />
   const rows = state.data?.items ?? []
   if (!rows.length) return <EmptyState icon="📋" text="No reservations yet" />
   return (

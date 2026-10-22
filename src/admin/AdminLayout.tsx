@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { NavLink, useOutlet, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '../auth'
 import { motion, AnimatePresence } from 'framer-motion'
@@ -321,6 +321,9 @@ function timeAgo(iso: string) {
 function useAdminNotifications() {
   const [items, setItems] = useState<ApiNotification[]>([])
   const [unreadCount, setUnreadCount] = useState(0)
+  /** The drawer's current rows, readable from the socket handler without re-subscribing. */
+  const itemsRef = useRef<ApiNotification[]>([])
+  itemsRef.current = items
   const refresh = () => adminPortalApi.notifications({ limit: 30 }, { silent: true }).then(res => {
     setItems(res.data.items); setUnreadCount(res.data.unreadCount)
   }).catch(() => {})
@@ -340,9 +343,24 @@ function useAdminNotifications() {
   // fraud alert to an admin at a desk: they hold no push token, so before this
   // the alert waited on the poll above.
   useEffect(() => {
-    const off = onSocket('notification:new', (payload: ApiNotification) => {
-      if (!payload?.id) return
-      setItems(prev => (prev.some(n => n.id === payload.id) ? prev : [payload, ...prev].slice(0, 30)))
+    // Two emitters, two shapes: `notifyUser` sends the saved document
+    // (`toJSON()` — `_id`, no `id`), alert routing sends `{ id, type, title,
+    // body, data }` with no `_id`, `isRead` or `createdAt`. This used to require
+    // `id`, so every `notifyUser` alert was dropped until the next poll, and the
+    // ones that did arrive had no `_id` for their key or for "mark read".
+    const off = onSocket('notification:new', (payload: Partial<ApiNotification>) => {
+      const id = payload?._id || payload?.id
+      if (!id) return
+      const item: ApiNotification = {
+        ...(payload as ApiNotification),
+        _id: id,
+        id,
+        isRead: payload.isRead ?? false,
+        createdAt: payload.createdAt || new Date().toISOString(),
+      }
+      // Only a notification not already in the drawer is a new unread one.
+      if (itemsRef.current.some(n => n._id === id)) return
+      setItems(prev => (prev.some(n => n._id === id) ? prev : [item, ...prev].slice(0, 30)))
       setUnreadCount(n => n + 1)
     })
     // A reconnect means an unknown span offline, so re-read rather than trust
@@ -353,14 +371,32 @@ function useAdminNotifications() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  const markAllRead = () => adminPortalApi.markAllNotificationsRead().then(refresh).catch(() => {})
+  // Resolves to whether the server took it, so the drawer's toast can say so —
+  // it used to announce "marked as read" before the request had even answered.
+  const markAllRead = () => adminPortalApi.markAllNotificationsRead().then(() => { void refresh(); return true }).catch(() => false)
   const markRead = (id: string) => adminPortalApi.markNotificationRead(id).then(refresh).catch(() => {})
   return { items, unreadCount, markAllRead, markRead }
 }
 
 // ── DRAWERS ──
-function NotifDrawer({ open, onClose, items, onMarkAllRead, onMarkRead }: { open: boolean; onClose: () => void; items: ApiNotification[]; onMarkAllRead: () => void; onMarkRead: (id: string) => void }) {
+function NotifDrawer({ open, onClose, items, onMarkAllRead, onMarkRead }: { open: boolean; onClose: () => void; items: ApiNotification[]; onMarkAllRead: () => Promise<boolean>; onMarkRead: (id: string) => void }) {
   const tones: any = { info: 'bg-teal-50 text-teal-600', success: 'bg-emerald-50 text-emerald-600', warn: 'bg-amber-50 text-amber-600', danger: 'bg-rose-50 text-rose-600' }
+  const nav = useNavigate()
+  const [marking, setMarking] = useState(false)
+  const markAll = async () => {
+    if (marking) return
+    setMarking(true)
+    const ok = await onMarkAllRead()
+    setMarking(false)
+    toast(translatePortalText(ok ? 'All notifications marked as read' : 'Could not mark notifications as read'), ok ? undefined : 'warn')
+  }
+  /** Alerts that carry an in-console link (fraud sweeps send `/admin/risk`) open it. */
+  const open_ = (n: ApiNotification) => {
+    if (!n.isRead) onMarkRead(n._id)
+    const raw = n.data?.link
+    const link = typeof raw === 'string' ? raw : ''
+    if (link.startsWith('/admin')) { onClose(); nav(link) }
+  }
   return (
     <AnimatePresence>
       {open && (<>
@@ -370,7 +406,7 @@ function NotifDrawer({ open, onClose, items, onMarkAllRead, onMarkRead }: { open
           <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
             <h3 className="font-display text-lg font-bold">🛡️ {translatePortalText('Platform Notifications')}</h3>
             <div className="flex gap-2">
-              <button className="btn-ghost !py-1.5 !px-3 text-xs" onClick={() => { onMarkAllRead(); toast(translatePortalText('All notifications marked as read')) }}>{translatePortalText('Mark all read')}</button>
+              <button className="btn-ghost !py-1.5 !px-3 text-xs disabled:opacity-50" disabled={marking || items.every(n => n.isRead)} onClick={() => void markAll()}>{translatePortalText('Mark all read')}</button>
               <button onClick={onClose} className="grid h-8 w-8 place-items-center rounded-lg text-slate-400 hover:bg-slate-100"><X size={18} /></button>
             </div>
           </div>
@@ -380,7 +416,7 @@ function NotifDrawer({ open, onClose, items, onMarkAllRead, onMarkRead }: { open
               const meta = notifMeta(n.type)
               return (
                 <motion.div key={n._id} initial={{ opacity: 0, x: 30 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: i * 0.04 }}
-                  onClick={() => !n.isRead && onMarkRead(n._id)}
+                  onClick={() => open_(n)}
                   className={`flex gap-3 rounded-2xl border p-3.5 transition hover:shadow-soft cursor-pointer ${!n.isRead ? 'border-emerald-100 bg-emerald-50/40' : 'border-slate-100 bg-white'}`}>
                   <span className={`grid h-10 w-10 shrink-0 place-items-center rounded-xl text-lg ${tones[meta.tone]}`}>{meta.icon}</span>
                   <div className="min-w-0">
@@ -401,7 +437,9 @@ function NotifDrawer({ open, onClose, items, onMarkAllRead, onMarkRead }: { open
 function QuickDrawer({ open, onClose }: { open: boolean; onClose: () => void }) {
   const nav = useNavigate()
   const acts = [
-    { icon: '🗓️', label: 'Customer Bookings', to: '/admin/customer/bookings' }, { icon: '👤', label: 'Create User', to: '/admin/users' },
+    // Was "Create User": the users screen has no create form, so the tile
+    // promised an action it only navigated past.
+    { icon: '🗓️', label: 'Customer Bookings', to: '/admin/customer/bookings' }, { icon: '👤', label: 'User Management', to: '/admin/users' },
     { icon: '💵', label: 'Run Settlement', to: '/admin/payments?tab=payouts' },
     { icon: '⛵', label: 'Boat Providers', to: '/admin/boat/providers' }, { icon: '⚓', label: 'Marina Providers', to: '/admin/marina/providers' },
     { icon: '🛍️', label: 'Customers', to: '/admin/customers' }, { icon: '📊', label: 'View Reports', to: '/admin/reports' },
@@ -476,6 +514,7 @@ export default function AdminLayout() {
   const [pendingStationApprovals, setPendingStationApprovals] = useState(0)
   const [pendingMarinaApprovals, setPendingMarinaApprovals] = useState(0)
   const [pendingMaintShopApprovals, setPendingMaintShopApprovals] = useState(0)
+  const searchRef = useRef<HTMLInputElement>(null)
   const pulse = usePlatformPulse()
   const nav = useNavigate()
   const { user, logout } = useAuth()
@@ -485,12 +524,30 @@ export default function AdminLayout() {
   useEffect(() => {
     adminPortalApi.dashboard().then(res => {
       setPendingRoleCounts(res.data?.totals?.pendingRoleCounts || {})
-      setPendingWorkerCounts(res.data?.totals?.pendingWorkerCounts || {})
+      // `pendingWorkerCounts` has maintenance, marina and fuel only — the boat
+      // panel's "Crew Requests" reads `boat`, so keep whatever the crew queue
+      // below reported rather than wiping it.
+      setPendingWorkerCounts(prev => ({ ...(res.data?.totals?.pendingWorkerCounts || {}), ...(prev.boat !== undefined ? { boat: prev.boat } : {}) }))
       setPendingStationApprovals(res.data?.totals?.pendingStationApprovals || 0)
       setPendingMarinaApprovals(res.data?.totals?.pendingMarinaApprovals || 0)
       setPendingMaintShopApprovals(res.data?.totals?.pendingMaintShopApprovals || 0)
     }).catch(() => {})
+    // Boat crew awaiting approval. The dashboard does not count them, so the
+    // badge on Boat Providers → Crew Requests could never appear.
+    adminPortalApi.workerApprovals('pending', 'boat')
+      .then(res => setPendingWorkerCounts(prev => ({ ...prev, boat: res.data.total })))
+      .catch(() => {})
   }, [loc.pathname])
+
+  // ⌘K / Ctrl+K focuses the search box the hint advertises. The hint was drawn
+  // with nothing listening for the keys.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); searchRef.current?.focus() }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
   return (
     <div className="min-h-screen overflow-x-hidden">
       <Sidebar open={side} desktopOpen={desktopSide} onClose={() => setSide(false)} onDesktopClose={() => setDesktopSide(false)} pendingRoleCounts={pendingRoleCounts} pendingWorkerCounts={pendingWorkerCounts} pendingStationApprovals={pendingStationApprovals} pendingMarinaApprovals={pendingMarinaApprovals} pendingMaintShopApprovals={pendingMaintShopApprovals} />
@@ -501,9 +558,13 @@ export default function AdminLayout() {
             <button className={`hidden lg:block btn-ghost !p-2 transition-opacity ${desktopSide ? 'opacity-0 pointer-events-none w-0 !p-0' : 'opacity-100'}`} onClick={() => setDesktopSide(true)}><Menu size={18} /></button>
             <div className="relative hidden flex-1 max-w-md sm:block">
               <Search size={16} className="pointer-events-none absolute start-3.5 top-1/2 -translate-y-1/2 text-slate-400" />
-              <input value={q} onChange={e => setQ(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter' && q.trim()) { nav('/admin/users'); toast(translatePortalText(`Searching “${q}”…`), 'info') } }}
-                placeholder={translatePortalText('Search users, providers, bookings, transactions…')} className="input !rounded-full ps-10 pe-14" />
+              {/* Enter opens User Management with the text as `?q=`. It used to
+                  open the page bare and toast "Searching…" over a list that was
+                  not filtered, and the placeholder promised bookings and
+                  transactions, which nothing here searches. */}
+              <input ref={searchRef} value={q} onChange={e => setQ(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter' && q.trim()) nav(`/admin/users?q=${encodeURIComponent(q.trim())}`) }}
+                placeholder={translatePortalText('Search name, email, ID…')} className="input !rounded-full ps-10 pe-14" />
               <kbd className="absolute end-3.5 top-1/2 -translate-y-1/2 rounded-md border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] font-bold text-slate-400">⌘K</kbd>
             </div>
             <div className="ms-auto flex items-center gap-1.5">
@@ -514,16 +575,19 @@ export default function AdminLayout() {
                 <Bell size={19} />
                 {unreadCount > 0 && <span className="absolute end-1.5 top-1.5 grid h-4 w-4 place-items-center rounded-full bg-emerald-500 text-[9px] font-extrabold text-white animate-pulse-soft">{unreadCount > 9 ? `${formatPortalNumber(9)}+` : formatPortalNumber(unreadCount)}</span>}
               </button>
-              <button onClick={() => toast(translatePortalText('Account menu — profile & security'), 'info')} className="ms-1 flex items-center gap-2.5 rounded-full border border-slate-200 bg-white py-1 ps-1 pe-3 transition hover:shadow-soft">
+              {/* An identity chip, not a button: it toasted "Account menu —
+                  profile & security" and opened nothing, as there is no admin
+                  profile screen to open. */}
+              <div className="ms-1 flex items-center gap-2.5 rounded-full border border-slate-200 bg-white py-1 ps-1 pe-3">
                 {/* Every signed-in operator was shown as "Tom Whitaker, Super
                     Admin" — a name belonging to nobody, on the one control in
                     the chrome that says whose session this is. */}
                 <img src={fileUrl(user?.avatar) || avatar(52)} alt={user?.name ?? ''} className="h-8 w-8 rounded-full object-cover" />
                 <span className="hidden text-left md:block">
-                  <span className="block text-xs font-extrabold text-deep-900 leading-tight"><bdi dir="auto">{translatePortalText(localizedField<string>(user, 'name', user?.name) || user?.name || 'Administrator')}</bdi></span>
-                  <span className="block text-[10px] font-semibold text-slate-400">{user?.email ?? ''}</span>
+                  <span className="block max-w-[180px] truncate text-xs font-extrabold text-deep-900 leading-tight"><bdi dir="auto">{translatePortalText(localizedField<string>(user, 'name', user?.name) || user?.name || 'Administrator')}</bdi></span>
+                  <span className="block max-w-[180px] truncate text-[10px] font-semibold text-slate-400">{user?.email ?? ''}</span>
                 </span>
-              </button>
+              </div>
               <button title={translatePortalText('Sign out')} onClick={() => { logout(); nav('/login') }}
                 className="grid h-10 w-10 place-items-center rounded-full text-slate-400 transition hover:bg-slate-100 hover:text-deep-900"><LogOut size={17} /></button>
               <Clock />
@@ -547,7 +611,7 @@ export default function AdminLayout() {
             {useOutlet()}
           </div>
           <footer className="mt-10 flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 pt-5 pb-2 text-xs text-slate-400">
-            <p>© {formatPortalNumber(new Date().getFullYear(), { useGrouping: false })} HarborLink · {translatePortalText('BoatPro Platform HQ')} · {translatePortalText('Super Admin Console')}</p>
+            <p>© {formatPortalNumber(new Date().getFullYear(), { useGrouping: false })} boatpro.club · {translatePortalText('BoatPro Platform HQ')} · {translatePortalText('Super Admin Console')}</p>
             {/* Was "99.98% uptime · 6 regions live", neither of which was
                 measured anywhere. The dot means the API answered this poll. */}
             <p className="flex items-center gap-1.5">

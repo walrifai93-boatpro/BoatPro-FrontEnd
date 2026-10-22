@@ -1,10 +1,10 @@
 import React, { Suspense, useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
-import { Bot, Headset, Inbox, LifeBuoy, MessageSquare, Plus, RefreshCw, Send } from 'lucide-react'
-import { aiSupportApi, chatApi, idOf, type ApiChat, type ApiMessage } from '../api'
+import { Bot, Headset, Inbox, LifeBuoy, Loader2, MessageSquare, Plus, RefreshCw, Send } from 'lucide-react'
+import { aiSupportApi, chatApi, get, idOf, type ApiChat, type ApiMessage, type ApiSupport, type Ok, type Paginated, type SupportDesk } from '../api'
 import { useAuth } from '../auth'
 import { fmtRelative } from '../live'
-import { translatePortalText } from '../i18n/runtime'
+import { formatPortalNumber, translatePortalText } from '../i18n/runtime'
 import { getSocket, onSocket } from '../socket'
 import { Spinner, toast } from '../ui'
 import { ChatAttachments } from './ChatAttachments'
@@ -17,6 +17,28 @@ const FuelMessages = React.lazy(() => import('../fuel/pages/FuelEngage').then(m 
 const MaintMessages = React.lazy(() => import('../maint/pages/MaintEngage').then(m => ({ default: m.MaintMessages })))
 
 type View = 'messages' | 'help' | 'cases'
+
+/** The server's cap per text message (`sendMessageSchema`). */
+const MESSAGE_MAX = 4000
+/** Messages per page of history — the most the messages route returns at once. */
+const PAGE_SIZE = 100
+
+const DESK_LABEL: Record<SupportDesk, string> = {
+  admin: 'BoatPro', marina: 'Marina', fuel: 'Fuel provider', maintenance: 'Maintenance provider', boat: 'Boat provider',
+}
+
+/**
+ * Who a request went to: the business by name when the desk is a provider's
+ * (the API populates it), otherwise the desk. It used to be built as
+ * `${desk} provider`, which no translation could match.
+ */
+function deskName(support?: ApiSupport): string {
+  if (!support) return ''
+  const owner = typeof support.deskOwner === 'object' && support.deskOwner ? support.deskOwner : undefined
+  const business = owner?.business?.businessName || owner?.name
+  if (support.desk !== 'admin' && business) return business
+  return translatePortalText(DESK_LABEL[support.desk] ?? support.desk)
+}
 
 /**
  * Where a request stands, in the requester's terms. "Open" alone said nothing
@@ -33,7 +55,7 @@ function requestStatus(chat: ApiChat): string {
 }
 
 export default function ProviderInbox() {
-  const { user, fuelAccess, maintAccess } = useAuth()
+  const { user, fuelAccess, maintAccess, marinaAccess } = useAuth()
   const [params, setParams] = useSearchParams()
   const isFuel = user?.role === 'fuel_provider' || user?.role === 'fuel_worker'
   const isMaint = user?.role === 'maintenance_provider' || user?.role === 'maintenance_worker'
@@ -41,7 +63,10 @@ export default function ProviderInbox() {
     ? !fuelAccess || fuelAccess.isOwner || fuelAccess.permissions.includes('messages')
     : isMaint
       ? !maintAccess || maintAccess.isOwner || maintAccess.permissions.includes('messages')
-      : true
+      // Marina staff talk to boaters only from the bookings / dock desks.
+      : user?.role === 'marina_worker'
+        ? !!marinaAccess && marinaAccess.permissions.some((p) => p === 'manage_bookings' || p === 'check_in')
+        : true
   const canHandleCases = !!user && ['boat_provider', 'marina_provider', 'fuel_provider', 'maintenance_provider'].includes(user.role)
   const requested = params.get('view')
   const view: View = requested === 'cases' && canHandleCases ? 'cases'
@@ -80,7 +105,9 @@ export default function ProviderInbox() {
         {isFuel ? <FuelMessages /> : isMaint ? <MaintMessages /> : <MarinaMessages directOnly />}
       </Suspense>}
       {view === 'help' && <>
-        <MySupportRequests accentClass={accentClass} />
+        {/* `?view=help&chat=<id>` opens that request — a link from a
+            notification or an email lands on the thread, not the first one. */}
+        <MySupportRequests accentClass={accentClass} initialChatId={params.get('chat')} />
         <p className="text-xs text-slate-500">
           {translatePortalText('Looking for earnings, invoices or payouts? Open')}{' '}
           <Link className="font-bold text-ocean-700 underline" to={billingUrl}>{translatePortalText('Billing & Payments')}</Link>.
@@ -106,7 +133,7 @@ function assistantAnswers(chat: ApiChat | undefined): boolean {
   return !chat?.support?.assignedTo && (state === 'ai_active' || state === 'queued')
 }
 
-function MySupportRequests({ accentClass }: { accentClass: string }) {
+function MySupportRequests({ accentClass, initialChatId }: { accentClass: string; initialChatId?: string | null }) {
   const { user } = useAuth()
   const me = idOf(user)
   const [threads, setThreads] = useState<ApiChat[]>([])
@@ -114,6 +141,16 @@ function MySupportRequests({ accentClass }: { accentClass: string }) {
   const [messages, setMessages] = useState<ThreadMessage[]>([])
   const [loading, setLoading] = useState(true)
   const [loadingMessages, setLoadingMessages] = useState(false)
+  /*
+    History beyond the newest page. The route returns the latest 100, and a
+    longer request used to lose everything before that with no way back to it.
+  */
+  const [historyPage, setHistoryPage] = useState(1)
+  const [hasOlder, setHasOlder] = useState(false)
+  const [loadingOlder, setLoadingOlder] = useState(false)
+  /** Set while older messages are prepended, so the view stays where the reader was instead of jumping to the bottom. */
+  const keepScroll = useRef<number | null>(null)
+  const initialChatRef = useRef(initialChatId)
   const [error, setError] = useState('')
   const [draft, setDraft] = useState('')
   const [sending, setSending] = useState(false)
@@ -132,7 +169,11 @@ function MySupportRequests({ accentClass }: { accentClass: string }) {
       const res = await chatApi.mySupportChats()
       const mine = res.data.items.filter(c => c.type === 'support' && idOf(c.support?.openedBy) === me)
       setThreads(mine)
-      setActiveId(current => current && mine.some(c => idOf(c) === current) ? current : idOf(mine[0]) || null)
+      const linked = initialChatRef.current
+      initialChatRef.current = null
+      setActiveId(current => current && mine.some(c => idOf(c) === current) ? current
+        : linked && mine.some(c => idOf(c) === linked) ? linked
+          : idOf(mine[0]) || null)
       setError('')
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Could not load your help requests')
@@ -151,7 +192,13 @@ function MySupportRequests({ accentClass }: { accentClass: string }) {
   /** A message that arrived, added once; it also settles the "sending" copy of our own. */
   const addMessage = useCallback((incoming: ApiMessage) => {
     const own = isMine(incoming, me)
-    if (!own) { setAwaitingReply(false); setTyping(null) }
+    if (!own) {
+      setAwaitingReply(false)
+      setTyping(null)
+      // It arrived in the thread on screen, so it has been read. Without this
+      // the list reload a moment later put an unread badge on the open request.
+      if (activeRef.current) void chatApi.markRead(activeRef.current).catch(() => null)
+    }
     setMessages(list => {
       if (list.some(m => idOf(m) === idOf(incoming))) return list
       const rest = own ? list.filter(m => !(m.pending && m.text === incoming.text)) : list
@@ -161,7 +208,13 @@ function MySupportRequests({ accentClass }: { accentClass: string }) {
 
   /** The server's copy of the thread, keeping any of our messages still on their way. */
   const mergeServer = useCallback((items: ApiMessage[]) => {
-    setMessages(list => [...items, ...list.filter(m => m.pending && !items.some(i => isMine(i, me) && i.text === m.text))])
+    setMessages(list => {
+      // Older history the reader loaded stays: the server's copy is only the newest page.
+      const ids = new Set(items.map(i => idOf(i)))
+      const firstAt = items[0]?.createdAt
+      const older = firstAt ? list.filter(m => !m.pending && !ids.has(idOf(m)) && m.createdAt < firstAt) : []
+      return [...older, ...items, ...list.filter(m => m.pending && !items.some(i => isMine(i, me) && i.text === m.text))]
+    })
     const last = items[items.length - 1]
     if (last && !isMine(last, me)) setAwaitingReply(false)
   }, [me])
@@ -170,14 +223,17 @@ function MySupportRequests({ accentClass }: { accentClass: string }) {
   useEffect(() => {
     setTyping(null)
     setAwaitingReply(false)
+    setHistoryPage(1)
+    setHasOlder(false)
     if (!activeId) { setMessages([]); return }
     let current = true
     setLoadingMessages(true)
     chatApi.messages(activeId).then(res => {
       if (!current) return
       setMessages(res.data.items)
+      setHasOlder((res.data.pagination?.totalPages ?? 1) > 1)
       void chatApi.markRead(activeId).catch(() => null)
-    }).catch(e => { if (current) toast(e instanceof Error ? e.message : 'Could not load messages', 'warn') })
+    }).catch(e => { if (current) toast(translatePortalText(e instanceof Error ? e.message : 'Could not load messages'), 'warn') })
       .finally(() => { if (current) setLoadingMessages(false) })
     return () => { current = false }
   }, [activeId])
@@ -225,8 +281,40 @@ function MySupportRequests({ accentClass }: { accentClass: string }) {
 
   const showTyping = typing !== null || awaitingReply
   useEffect(() => {
-    if (scroller.current) scroller.current.scrollTop = scroller.current.scrollHeight
+    const el = scroller.current
+    if (!el) return
+    if (keepScroll.current !== null) {
+      // Older messages went in above: hold the reader's place.
+      el.scrollTop = el.scrollHeight - keepScroll.current
+      keepScroll.current = null
+      return
+    }
+    el.scrollTop = el.scrollHeight
   }, [messages, showTyping])
+
+  /** The next page back. Page 2+ does not mark the thread read, by the route's design. */
+  const loadOlder = async () => {
+    if (!activeId || loadingOlder) return
+    const chatId = activeId
+    const next = historyPage + 1
+    setLoadingOlder(true)
+    try {
+      const res = await get<Ok<Paginated<ApiMessage>>>(`/chats/${chatId}/messages`, { limit: PAGE_SIZE, page: next })
+      if (activeRef.current !== chatId) return
+      const el = scroller.current
+      keepScroll.current = el ? el.scrollHeight - el.scrollTop : null
+      // Pages are counted from the newest message, so one that arrived since
+      // shifts them by one; duplicates are dropped rather than shown twice.
+      setMessages(list => {
+        const seen = new Set(list.map(m => idOf(m)))
+        return [...res.data.items.filter(m => !seen.has(idOf(m))), ...list]
+      })
+      setHistoryPage(next)
+      setHasOlder(next < (res.data.pagination?.totalPages ?? next))
+    } catch (e) {
+      toast(translatePortalText(e instanceof Error ? e.message : 'Could not load earlier messages'), 'warn')
+    } finally { setLoadingOlder(false) }
+  }
 
   const active = threads.find(c => idOf(c) === activeId)
   const send = async () => {
@@ -253,7 +341,7 @@ function MySupportRequests({ accentClass }: { accentClass: string }) {
       setMessages(list => list.filter(m => idOf(m) !== pendingId))
       setDraft(current => current || text)
       setAwaitingReply(false)
-      toast(e instanceof Error ? e.message : 'Message not sent', 'warn')
+      toast(translatePortalText(e instanceof Error ? e.message : 'Message not sent'), 'warn')
     } finally { setSending(false) }
   }
 
@@ -264,7 +352,7 @@ function MySupportRequests({ accentClass }: { accentClass: string }) {
         <p className="text-xs text-slate-500">{translatePortalText('Messages you sent to BoatPro or another support desk appear here.')}</p>
       </div>
       <div className="flex gap-2">
-        <button type="button" onClick={() => void reload()} className="btn-ghost !px-3 !py-2 text-xs"><RefreshCw size={14} />{translatePortalText('Refresh')}</button>
+        <button type="button" onClick={() => void reload()} disabled={loading} className="btn-ghost !px-3 !py-2 text-xs disabled:opacity-60"><RefreshCw size={14} className={loading ? 'animate-spin' : ''} />{translatePortalText('Refresh')}</button>
         <button type="button" onClick={() => setComposing(true)} className={`${accentClass} !px-3 !py-2 text-xs`}><Plus size={14} />{translatePortalText('Contact BoatPro')}</button>
       </div>
     </div>
@@ -284,7 +372,7 @@ function MySupportRequests({ accentClass }: { accentClass: string }) {
             className={`mb-1 w-full rounded-xl border p-3 text-start transition ${selected ? 'border-ocean-200 bg-ocean-50' : 'border-transparent hover:bg-slate-50'}`}>
             <span className="flex items-start justify-between gap-2">
               <span className="min-w-0 truncate text-sm font-bold text-deep-900">{c.subject || translatePortalText('Help request')}</span>
-              {!!c.unreadCount && <span className="shrink-0 rounded-full bg-ocean-600 px-2 text-xs font-bold text-white">{c.unreadCount}</span>}
+              {!!c.unreadCount && <span className="shrink-0 rounded-full bg-ocean-600 px-2 text-xs font-bold text-white">{formatPortalNumber(c.unreadCount)}</span>}
             </span>
             <span className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-500">
               <StatusPill chat={c} />
@@ -299,12 +387,18 @@ function MySupportRequests({ accentClass }: { accentClass: string }) {
           <div className="flex flex-wrap items-start justify-between gap-2 border-b border-slate-100 px-4 py-3">
             <div className="min-w-0">
               <h3 className="truncate font-bold text-deep-900">{active.subject || translatePortalText('Help request')}</h3>
-              <p className="text-xs text-slate-500">{active.support?.reference} · {translatePortalText(active.support?.desk === 'admin' ? 'BoatPro' : `${active.support?.desk} provider`)}</p>
+              <p className="truncate text-xs text-slate-500">{[active.support?.reference, deskName(active.support)].filter(Boolean).join(' · ')}</p>
             </div>
             <StatusPill chat={active} />
           </div>
           <div ref={scroller} className="min-h-0 flex-1 space-y-3 overflow-y-auto bg-slate-50/60 p-4" aria-live="polite">
             {loadingMessages && <div className="grid place-items-center py-8"><Spinner /></div>}
+            {!loadingMessages && hasOlder && <div className="flex justify-center">
+              <button type="button" onClick={() => void loadOlder()} disabled={loadingOlder}
+                className="btn-ghost !px-3 !py-1.5 text-xs disabled:opacity-60">
+                {loadingOlder ? <Loader2 size={13} className="animate-spin" /> : null}{translatePortalText('Load earlier messages')}
+              </button>
+            </div>}
             {!loadingMessages && !messages.length && <p className="py-8 text-center text-sm text-slate-500">{translatePortalText('No messages yet. Write below to explain what you need.')}</p>}
             {messages.map(m => {
               const own = isMine(m, me)
@@ -338,12 +432,16 @@ function MySupportRequests({ accentClass }: { accentClass: string }) {
           </div>
           <div className="border-t border-slate-100 p-3">
             <div className="flex items-end gap-2">
-              <textarea className="input min-h-[44px] flex-1 resize-none" rows={2} value={draft} onChange={e => setDraft(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void send() } }} placeholder={translatePortalText('Write to support…')} />
+              {/* Capped at the server's limit, so a long message is not typed out only to be refused on send. */}
+              <textarea className="input min-h-[44px] flex-1 resize-none" rows={2} dir="auto" maxLength={MESSAGE_MAX} value={draft} onChange={e => setDraft(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); void send() } }} placeholder={translatePortalText('Write to support…')} />
               <ChatAttachments chatId={idOf(active)} accentClass={accentClass} disabled={sending} onSent={m => { addMessage(m); void reload() }} />
               <button type="button" className={`${accentClass} !px-3`} disabled={sending || !draft.trim()} onClick={() => void send()} aria-label={translatePortalText('Send message')}><Send size={16} /></button>
             </div>
-            <p className="mt-1.5 text-[10.5px] text-slate-400">{translatePortalText('Enter to send · Shift + Enter for a new line')}</p>
+            <p className="mt-1.5 flex justify-between gap-2 text-[10.5px] text-slate-400">
+              <span>{translatePortalText('Enter to send · Shift + Enter for a new line')}</span>
+              {draft.length > MESSAGE_MAX * 0.9 && <span className="font-semibold text-amber-600">{formatPortalNumber(draft.length)} / {formatPortalNumber(MESSAGE_MAX)}</span>}
+            </p>
           </div>
         </> : <div className="grid flex-1 place-items-center px-6 text-center text-sm text-slate-500">{translatePortalText('Choose a request to read it, or contact BoatPro.')}</div>}
       </div>

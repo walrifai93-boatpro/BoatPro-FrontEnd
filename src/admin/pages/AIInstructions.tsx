@@ -51,17 +51,23 @@ export function AIInstructionsModal({ moduleKey, moduleName, onClose, onSaved }:
   const [previewLoading, setPreviewLoading] = useState(false)
   // A preview of unsaved edits, and the exact draft it was built from — so it is never shown for a different draft.
   const [draftPreview, setDraftPreview] = useState<Record<string, { text: string; of: string }>>({})
+  const [attempt, setAttempt] = useState(0)
 
   useEffect(() => {
     if (!moduleKey) return
+    // `alive`: opening a second module before the first answered wrote the first
+    // module's prompts under the second one's title.
+    let alive = true
     setPrompts(null); setError(''); setDraftPreview({}); setPreviewOpen(false)
     adminPortalApi.aiPrompts(moduleKey).then(res => {
+      if (!alive) return
       setPrompts(res.data.prompts)
       setLimits(res.data.limits)
       setDrafts(Object.fromEntries(res.data.prompts.map(p => [p.id, toDraft(p)])))
       setActive(res.data.prompts[0]?.id ?? '')
-    }).catch(err => setError((err as Error)?.message || t('Could not load the instructions')))
-  }, [moduleKey])
+    }).catch(err => { if (alive) setError((err as Error)?.message || t('Could not load the instructions')) })
+    return () => { alive = false }
+  }, [moduleKey, attempt])
 
   const prompt = prompts?.find(p => p.id === active)
   const draft = prompt ? drafts[prompt.id] : undefined
@@ -118,7 +124,12 @@ export function AIInstructionsModal({ moduleKey, moduleName, onClose, onSaved }:
   return (
     <Modal open={!!moduleKey} onClose={close} wide title={<>{t(moduleName)} · {t('Instructions')}</>}>
       {error ? (
-        <p className="rounded-xl bg-rose-50 px-4 py-3 text-sm font-semibold text-rose-700">{error}</p>
+        <div className="flex flex-wrap items-center gap-3 rounded-xl bg-rose-50 px-4 py-3 text-sm font-semibold text-rose-700">
+          <p className="min-w-0 flex-1">{error}</p>
+          <button onClick={() => setAttempt(n => n + 1)} className="btn-ghost !py-1.5 !text-xs">
+            <RefreshCw size={12} /> {t('Try again')}
+          </button>
+        </div>
       ) : !prompts || !prompt || !draft ? (
         <LoadingState label={t('Loading instructions…')} rows={5} />
       ) : (

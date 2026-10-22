@@ -243,6 +243,7 @@ export const REPORTS_ARABIC_MESSAGES: Record<string, string> = {
   'Marina list': 'قائمة المراسي',
   'Stations & fuels': 'المحطات والوقود',
   'Fuel orders': 'طلبات الوقود',
+  'Could not load the filters for this report': 'تعذّر تحميل عوامل التصفية لهذا التقرير',
   'Station list': 'قائمة المحطات',
   'Fuel list': 'قائمة أنواع الوقود',
   'Shops & team': 'الورش والفريق',

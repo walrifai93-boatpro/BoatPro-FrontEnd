@@ -27,6 +27,17 @@ import {
   type ProviderTypeKey,
 } from '../api'
 import { HyperpayCheckoutModal, stashPendingCheckout, type HyperpayCheckoutInfo } from '../payments/HyperpayCheckout'
+import {
+  PlanScheduleList,
+  ProviderPricingPanel,
+  amountsDiffer,
+  chargeFromCheckout,
+  planMoney,
+  planPaymentError,
+  renewBlockedReason,
+  type ProviderPricingData,
+} from './PlanPricing'
+import type { PricingStepView } from '../api'
 
 
 // ── usage widget ─────────────────────────────────────────────────────────
@@ -85,7 +96,7 @@ export function UsageMeter({ item, onUpgrade }: { item: UsageRow; onUpgrade?: ()
 // ── limit-reached modal ──────────────────────────────────────────────────
 
 import { AlertTriangle, Sparkles, Send, ArrowUpRight, Check, Plus, Loader2, CreditCard, Clock } from 'lucide-react'
-import { formatPortalDate, formatPortalNumber, isPortalArabic, translatePortalText } from '../i18n/runtime'
+import { formatPortalDate, formatPortalNumber, isPortalArabic, translatePortalTemplate, translatePortalText } from '../i18n/runtime'
 
 
 interface PackageLimitModalProps {
@@ -398,6 +409,12 @@ export interface ProviderDashboardData {
   commissionPackageName?: string
   packageLifecycle?: PackageLifecycle
   currency: string
+  /**
+   * What this provider actually pays: the next renewal's price (intro step and
+   * offer applied), the plan's schedule, the commission in force, and their
+   * offers. Absent on an older server.
+   */
+  pricing?: ProviderPricingData | null
 }
 
 /**
@@ -418,6 +435,9 @@ interface DowngradeCandidate {
   id: string
   name: string
   price: number
+  durationMonths?: number
+  /** The package's intro steps, when the listing sent them. */
+  schedule?: PricingStepView[]
 }
 
 /**
@@ -527,6 +547,12 @@ export function PackagePlanCard({
         dashboard.subscriptionPlan?.id,
         gateway ? { gateway } : undefined
       )
+      // A free plan is renewed by that call itself — no card form to open.
+      if (res.data.mode === 'free') {
+        toast(translatePortalText('Your free plan has been renewed.'), 'success')
+        onChanged()
+        return
+      }
       const reference = res.data.orderId || res.data.checkoutId
       stashPendingCheckout(reference, {
         kind: 'subscription',
@@ -539,10 +565,21 @@ export function PackagePlanCard({
       }
       setTamaraUnavailable(res.data.tamaraUnavailable ?? null)
       setPayAgainWithTamara(() => () => void renewSubscription('tamara'))
-      setCheckoutLabel(`${formatPortalNumber(res.data.package.price)} ${dashboard.currency}`)
+      // What the checkout will actually charge — `package.price` is the amount
+      // with the intro step and any offer applied, not the plan's list price.
+      const charge = chargeFromCheckout(res.data)
+      const charged = charge?.amount ?? res.data.package.price
+      const listPrice = charge?.quote?.regularPrice
+      setCheckoutLabel(
+        amountsDiffer(listPrice, charged)
+          ? `${planMoney(charged, dashboard.currency)} (${translatePortalText('Regular price')}: ${planMoney(listPrice!, dashboard.currency)})`
+          : planMoney(charged, dashboard.currency)
+      )
       setCheckout({ checkoutId: res.data.checkoutId, hyperpayBaseUrl: res.data.hyperpayBaseUrl! })
     } catch (e) {
-      toast(translatePortalText(e instanceof Error ? e.message : 'Could not start the renewal payment'), 'error')
+      // The server's reason as it came — a plan change is scheduled, the first
+      // payment belongs on the onboarding screen — or, for a 403, what it means.
+      toast(planPaymentError(e, 'Could not start the renewal payment'), 'error')
     } finally {
       setBusy(false)
       if (gateway) setTamaraBusy(false)
@@ -558,7 +595,7 @@ export function PackagePlanCard({
       const lower = r.data.packages
         .filter((p) => p.price < currentPrice)
         .sort((a, b) => b.price - a.price)
-        .map((p) => ({ id: p._id || p.id || '', name: p.name, price: p.price }))
+        .map((p) => ({ id: p._id || p.id || '', name: p.name, price: p.price, durationMonths: p.durationMonths, schedule: p.schedule }))
       setPackages(lower)
     } catch {
       setPackages([])
@@ -620,6 +657,34 @@ export function PackagePlanCard({
   const approvedRequests = myRequests.filter((r) => r.status === 'approved')
   const pendingRequests = myRequests.filter((r) => r.status === 'pending')
 
+  /*
+    What the next renewal actually costs (intro step and offer applied), from
+    the server. The Renew button names it when it differs from the plan's list
+    price, so the figure on the button is the figure on the card form.
+  */
+  const isSubscription = dashboard.paymentModel === 'subscription'
+  /*
+    `nextRenewal` is quoted for the package that will actually renew. With a
+    change scheduled that is another package (and renewing early is refused
+    until it takes effect); moving to commission or cancelling, nothing renews.
+    So the button only names a figure when the quote is for this plan, and is
+    switched off — with the reason beside it — while a change is scheduled.
+  */
+  const renewalNote = isSubscription ? dashboard.pricing?.subscription?.renewalNote ?? null : null
+  const renewBlocked = renewBlockedReason(renewalNote, lifecycle?.switchEffectiveAt || dashboard.subscriptionExpiry)
+  const rawNextRenewal = isSubscription ? dashboard.pricing?.subscription?.nextRenewal ?? null : null
+  const planId = dashboard.subscriptionPlan?.id
+  const nextRenewal =
+    rawNextRenewal && !renewalNote && (!planId || !rawNextRenewal.packageId || String(rawNextRenewal.packageId) === String(planId))
+      ? rawNextRenewal
+      : null
+  const renewalLabel =
+    nextRenewal && typeof nextRenewal.amount === 'number' && amountsDiffer(nextRenewal.amount, dashboard.subscriptionPlan?.price)
+      ? translatePortalTemplate('Renew · {{amount}}', {
+          amount: nextRenewal.amount <= 0 ? translatePortalText('Free') : planMoney(nextRenewal.amount, nextRenewal.currency || dashboard.currency),
+        })
+      : translatePortalText('Renew')
+
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-100 bg-white p-4">
@@ -642,7 +707,15 @@ export function PackagePlanCard({
         <div className="flex gap-2">
           {dashboard.paymentModel === 'subscription' && (
             <>
-              <button className="btn-primary" disabled={busy} onClick={() => void renewSubscription()}>{translatePortalText("Renew")}</button>
+              <button
+                className="btn-primary disabled:cursor-not-allowed disabled:opacity-60"
+                disabled={busy || !!renewBlocked}
+                title={renewBlocked ?? undefined}
+                aria-describedby={renewBlocked ? 'renew-blocked-reason' : undefined}
+                onClick={() => void renewSubscription()}
+              >
+                {renewalLabel}
+              </button>
               <button className="btn-ghost" onClick={openDowngradeBrowser}>{translatePortalText("Downgrade")}</button>
               {lifecycle?.cancelAtPeriodEnd ? (
                 <button className="btn-ghost" onClick={reactivate}>{translatePortalText("Undo Cancellation")}</button>
@@ -652,6 +725,9 @@ export function PackagePlanCard({
             </>
           )}
         </div>
+        {!!renewBlocked && (
+          <p id="renew-blocked-reason" className="w-full text-xs font-medium text-amber-700">{renewBlocked}</p>
+        )}
       </div>
 
       <HyperpayCheckoutModal
@@ -662,6 +738,16 @@ export function PackagePlanCard({
         onPayWithTamara={payAgainWithTamara ?? undefined}
         tamaraUnavailable={tamaraUnavailable}
         tamaraBusy={tamaraBusy}
+      />
+
+      {/* Next renewal and how it was priced, the plan's intro schedule with
+          the current step marked, the commission in force against the regular
+          rate, and this provider's offers. Nothing on an older server. */}
+      <ProviderPricingPanel
+        pricing={dashboard.pricing}
+        currency={dashboard.currency}
+        isSubscription={isSubscription}
+        periodEnd={lifecycle?.switchEffectiveAt || dashboard.subscriptionExpiry}
       />
 
       {/* Admin Approved Add-On Requests Banner */}
@@ -769,10 +855,15 @@ export function PackagePlanCard({
               <button
                 key={pkg.id}
                 onClick={() => pickDowngrade(pkg)}
-                className="flex items-center justify-between rounded-xl border border-slate-200 px-4 py-3 text-left transition hover:border-ocean-400 hover:bg-ocean-50/40"
+                className="flex flex-col gap-1.5 rounded-xl border border-slate-200 px-4 py-3 text-left transition hover:border-ocean-400 hover:bg-ocean-50/40"
               >
-                <p className="font-semibold text-deep-900">{pkg.name}</p>
-                <p className="font-semibold text-deep-900">{formatPortalNumber(pkg.price)}</p>
+                <span className="flex w-full items-center justify-between gap-3">
+                  <span className="font-semibold text-deep-900">{pkg.name}</span>
+                  <span className="font-semibold text-deep-900">{formatPortalNumber(pkg.price)}</span>
+                </span>
+                {/* Its intro steps, when it has any — the price above is the
+                    regular one they give way to. */}
+                <PlanScheduleList schedule={pkg.schedule} kind="subscription" durationMonths={pkg.durationMonths} currency={dashboard.currency} className="w-full" />
               </button>
             ))}
           </div>

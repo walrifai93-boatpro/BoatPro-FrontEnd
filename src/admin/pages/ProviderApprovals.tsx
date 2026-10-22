@@ -1,13 +1,14 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { TableToolbar, useTableFilters, NoFilterMatches, type TableFiltersConfig } from '../../shared/TableFilters'
 import { motion } from 'framer-motion'
 import { ShieldCheck, Check, X, Ban, MapPin, Building2, Mail, Phone, RefreshCw, Sparkles, FileText, ExternalLink, AlertTriangle, Eye, BellRing } from 'lucide-react'
-import { PageWrap, vatCertificateLabel } from './_shared'
+import { PageWrap, relevantRegistrationDocs, vatCertificateLabel } from './_shared'
 import { AdminHeader, ABadge } from '../adminUi'
 import { DocumentFindingList, DocumentFindingsSummary, type DocumentReview } from '../DocumentFindings'
 import { RequiredDocsChecklist } from './RequiredDocsChecklist'
 import type { ApiApplicantDocChecklist } from '../../api'
 import { Modal, toast, Counter, CardGridSkeleton } from '../../ui'
+import { confirm, confirmAndRun } from '../../async'
 import { translatePortalText  , formatPortalDate, formatPortalNumber, formatPortalPercent} from '../../i18n/runtime'
 import { adminApi, aiDocumentApi, fileUrl, type AdminProvider, type ApiProviderRegistration, type AIDocument } from '../../api'
 import { onSocket } from '../../socket'
@@ -92,6 +93,10 @@ export default function ProviderApprovals() {
   const [docReview, setDocReview] = useState<DocumentReview | null>(null)
   const [docChecklist, setDocChecklist] = useState<ApiApplicantDocChecklist | null>(null)
   const [regLoading, setRegLoading] = useState(false)
+  // Set when the registration/documents request failed — distinct from "no
+  // documents", which is what the swallowed error used to look like.
+  const [regError, setRegError] = useState<string | null>(null)
+  const [docBusy, setDocBusy] = useState<string | null>(null)
   const [expandedDocTypes, setExpandedDocTypes] = useState<Record<string, boolean>>({})
   const [aiDoc, setAiDoc] = useState<AIDocument | null>(null)
   // The document a reviewer is asking the provider to replace, if any.
@@ -101,28 +106,72 @@ export default function ProviderApprovals() {
     setExpandedDocTypes(prev => ({ ...prev, [type]: !prev[type] }))
   }
 
+  // The latest provider opened only — a slower answer for the one opened
+  // before it must not fill this modal with that provider's documents.
+  const detailSeq = useRef(0)
   const openDetail = async (p: AdminProvider) => {
-    setDetail(p); setRegistration(null); setRegDocs([]); setDocReview(null); setDocChecklist(null); setRegLoading(true); setExpandedDocTypes({})
+    const seq = ++detailSeq.current
+    setDetail(p); setRegistration(null); setRegDocs([]); setDocReview(null); setDocChecklist(null); setRegError(null); setRegLoading(true); setExpandedDocTypes({})
     try {
+      // A provider with no wizard registration still answers 200 with
+      // `registration: null` — so a throw here is a real failure, not a legacy row.
       const r = await adminApi.getRegistration(p.id)
+      if (seq !== detailSeq.current) return
       setRegistration(r.data.registration)
-      setRegDocs(r.data.documents || [])
+      setRegDocs(relevantRegistrationDocs(r.data.documents || [], p.role, r.data.documentChecklist))
       setDocReview(r.data.documentReview ?? null)
       setDocChecklist(r.data.documentChecklist ?? null)
-    } catch {
-      /* legacy providers may have no wizard registration on file */
+    } catch (e) {
+      if (seq !== detailSeq.current) return
+      setRegError(e instanceof Error ? e.message : 'Could not load the documents')
     } finally {
-      setRegLoading(false)
+      if (seq === detailSeq.current) setRegLoading(false)
     }
   }
 
   const verifyDoc = async (docId: string, status: 'approved' | 'rejected') => {
+    if (status === 'rejected') {
+      // A rejection went out with no reason at all, so the provider was told
+      // "rejected" and nothing they could fix.
+      const done = await confirmAndRun({
+        title: 'Reject this document?',
+        body: 'The provider is told this document was rejected, with your reason, and has to upload it again.',
+        confirmLabel: 'Reject document',
+        busyLabel: 'Rejecting…',
+        danger: true,
+        input: {
+          label: 'Reason (shown to the provider)',
+          required: true,
+          multiline: true,
+          maxLength: 500,
+          validate: (v) => (v.trim().length < 3 ? 'Give a reason of at least 3 characters' : null),
+        },
+        run: (text) => adminApi.verifyDocument(docId, 'rejected', text.trim()),
+        success: 'Document rejected',
+      })
+      if (done !== undefined && detail) openDetail(detail)
+      return
+    }
+    if (docBusy) return
+    setDocBusy(docId)
     try {
       await adminApi.verifyDocument(docId, status)
-      toast(translatePortalText(status === 'approved' ? 'Document approved' : 'Document rejected'))
+      toast(translatePortalText('Document approved'))
       if (detail) openDetail(detail)
     } catch (e) {
       toast(translatePortalText(e instanceof Error ? e.message : 'Action failed'), 'warn')
+    } finally {
+      setDocBusy(null)
+    }
+  }
+
+  /** Opens the AI record behind a document — also where an AI-only row is approved or rejected. */
+  const inspectAi = async (aiDocumentId: string) => {
+    try {
+      const res = await aiDocumentApi.get(aiDocumentId)
+      setAiDoc(res.data.document)
+    } catch {
+      toast(translatePortalText('Could not load AI details for this document'), 'warn')
     }
   }
 
@@ -175,15 +224,98 @@ export default function ProviderApprovals() {
   // landed on, so the toast reads that instead of guessing (it used to say
   // "awaiting subscription payment" to commission providers, and "now live" to
   // unpaid subscription ones).
+  //
+  // `provisioningWarning` is the server saying the account was approved but its
+  // marina / station / workshop could not be created from the registration — the
+  // toast said "now live" regardless.
   const approvedMsg = (p: AdminProvider) => (res: any) =>
     res?.data?.user?.onboarding?.status === 'pending_subscription_payment'
       ? `${p.business?.businessName || p.name} approved — awaiting subscription payment`
-      : `${p.business?.businessName || p.name} approved — now live`
+      : res?.provisioningWarning
+        ? `${p.business?.businessName || p.name} approved, but its listing could not be set up: ${res.provisioningWarning}`
+        : `${p.business?.businessName || p.name} approved — now live`
+
+  /**
+   * Approve, after saying out loud what is being approved.
+   *
+   * The server's approve also marks every pending document of this provider
+   * approved, critical AI findings and missing required documents included —
+   * and the card's Approve button did that in one click without the reviewer
+   * ever having opened the documents. So the findings and the checklist are
+   * read first (from the open detail, or fetched) and the admin has to confirm
+   * past them.
+   */
+  const approveWithChecks = async (p: AdminProvider) => {
+    if (busyId) return
+    setBusyId(p.id)
+    let review: DocumentReview | null = null
+    let checklist: ApiApplicantDocChecklist | null = null
+    let loaded = false
+    if (detail?.id === p.id && !regLoading && !regError) {
+      review = docReview; checklist = docChecklist; loaded = true
+    } else {
+      try {
+        const r = await adminApi.getRegistration(p.id)
+        review = r.data.documentReview ?? null
+        checklist = r.data.documentChecklist ?? null
+        loaded = true
+      } catch { /* reported in the dialog below */ }
+    }
+    setBusyId(null)
+
+    const name = p.business?.businessName || p.name
+    const warnings: string[] = []
+    if (!isDiver(p)) {
+      if (!loaded) warnings.push(translatePortalText('The documents could not be loaded, so you are approving without having seen them.'))
+      const critical = review?.counts?.critical ?? 0
+      const toReview = review?.counts?.warning ?? 0
+      if (critical > 0) warnings.push(translatePortalText(`${critical} critical AI finding${critical === 1 ? '' : 's'} on the documents.`))
+      if (toReview > 0) warnings.push(translatePortalText(`${toReview} AI warning${toReview === 1 ? '' : 's'} to review.`))
+      const outstanding = checklist?.outstanding?.length ?? 0
+      if (outstanding > 0) {
+        const labels = (checklist?.required ?? []).filter((s) => checklist!.outstanding.includes(s.docType)).map((s) => s.label)
+        warnings.push(translatePortalText(`${outstanding} required document${outstanding === 1 ? ' is' : 's are'} missing or rejected${labels.length ? `: ${labels.join(', ')}` : ''}.`))
+      }
+    }
+    const ok = await confirm({
+      title: `Approve ${name}?`,
+      body: [
+        ...warnings,
+        translatePortalText('Approving also marks every pending document of this provider as approved.'),
+      ].join(' '),
+      confirmLabel: warnings.length ? 'Approve anyway' : 'Approve',
+      danger: warnings.length > 0,
+    })
+    if (!ok) return
+    act(p, () => adminApi.approve(p.id, { expectedStatus: p.onboarding?.status ?? 'pending' }), approvedMsg(p))
+  }
+
+  const doSuspend = async (p: AdminProvider) => {
+    const name = p.business?.businessName || p.name
+    const ok = await confirm({
+      title: `Suspend ${name}?`,
+      body: 'Their listings stop taking bookings straight away and the provider is notified.',
+      confirmLabel: 'Suspend',
+      danger: true,
+    })
+    if (ok) act(p, () => adminApi.suspend(p.id), `${name} suspended`, 'warn')
+  }
+
+  const doActivate = async (p: AdminProvider) => {
+    const name = p.business?.businessName || p.name
+    const ok = await confirm({
+      title: `Activate ${name} without payment?`,
+      body: 'The subscription fee has not been paid. Activating marks it paid and starts the subscription period now — nothing is charged.',
+      confirmLabel: 'Activate without payment',
+      danger: true,
+    })
+    if (ok) act(p, () => adminApi.approve(p.id, { forceBypassPayment: true, expectedStatus: p.onboarding?.status ?? 'pending' }), `${name} activated — now live`)
+  }
 
   const doReject = () => {
-    if (!rejecting) return
-    if (reason.trim().length < 3) { toast(translatePortalText('Please give a rejection reason'), 'warn'); return }
-    act(rejecting, () => adminApi.reject(rejecting.id, reason.trim()), `${rejecting.name} rejected`, 'warn')
+    if (!rejecting || busyId) return
+    if (reason.trim().length < 3) { toast(translatePortalText('Give a rejection reason of at least 3 characters'), 'warn'); return }
+    act(rejecting, () => adminApi.reject(rejecting.id, reason.trim(), rejecting.onboarding?.status ?? 'pending'), `${rejecting.business?.businessName || rejecting.name} rejected`, 'warn')
   }
 
   const filterCfg: TableFiltersConfig<any> = useMemo(() => ({
@@ -250,7 +382,7 @@ export default function ProviderApprovals() {
         searchPlaceholder={translatePortalText("Search applicants by business, name or email...")}
       />
 
-      {!loading && providers.length === 0 && (
+      {!loading && !error && providers.length === 0 && (
         <div className="rounded-2xl border border-dashed border-slate-200 py-16 text-center text-sm text-slate-400">{translatePortalText("No providers in “")}{tab || 'all'}”.</div>
       )}
       {!loading && providers.length > 0 && visible.length === 0 && (
@@ -298,17 +430,17 @@ export default function ProviderApprovals() {
                   <div className="mt-3 flex gap-1.5 border-t border-slate-100 pt-3">
                     <button onClick={() => openDetail(p)} className="btn-ghost flex-1 !justify-center !py-1.5 !text-[11px]">{translatePortalText("Details")}</button>
                     {status === 'pending' && (<>
-                      <button disabled={busyId === p.id} onClick={() => act(p, () => adminApi.approve(p.id), approvedMsg(p))} className="btn-admin flex-1 !justify-center !py-1.5 !text-[11px] disabled:opacity-60"><Check size={12} /> {translatePortalText("Approve")}</button>
-                      <button disabled={busyId === p.id} onClick={() => { setRejecting(p); setReason('') }} className="btn-ghost !justify-center !py-1.5 !px-2.5 !text-[11px] !text-rose-500"><X size={12} /></button>
+                      <button disabled={busyId === p.id} onClick={() => void approveWithChecks(p)} className="btn-admin flex-1 !justify-center !py-1.5 !text-[11px] disabled:opacity-60"><Check size={12} /> {translatePortalText("Approve")}</button>
+                      <button disabled={busyId === p.id} onClick={() => { setRejecting(p); setReason('') }} className="btn-ghost !justify-center !py-1.5 !px-2.5 !text-[11px] !text-rose-500" title={translatePortalText("Reject")}><X size={12} /></button>
                     </>)}
                     {status === 'pending_subscription_payment' && (
-                      <button disabled={busyId === p.id} onClick={() => act(p, () => adminApi.approve(p.id, { forceBypassPayment: true }), `${p.business?.businessName || p.name} activated — now live`)} className="btn-admin flex-1 !justify-center !py-1.5 !text-[11px] disabled:opacity-60"><Check size={12} /> {translatePortalText("Activate Live")}</button>
+                      <button disabled={busyId === p.id} onClick={() => void doActivate(p)} className="btn-admin flex-1 !justify-center !py-1.5 !text-[11px] disabled:opacity-60"><Check size={12} /> {translatePortalText("Activate Live")}</button>
                     )}
                     {status === 'approved' && (
-                      <button disabled={busyId === p.id} onClick={() => act(p, () => adminApi.suspend(p.id), `${p.business?.businessName || p.name} suspended`, 'warn')} className="btn-ghost flex-1 !justify-center !py-1.5 !text-[11px] !text-amber-600"><Ban size={12} /> {translatePortalText("Suspend")}</button>
+                      <button disabled={busyId === p.id} onClick={() => void doSuspend(p)} className="btn-ghost flex-1 !justify-center !py-1.5 !text-[11px] !text-amber-600"><Ban size={12} /> {translatePortalText("Suspend")}</button>
                     )}
                     {(status === 'rejected' || status === 'suspended') && (
-                      <button disabled={busyId === p.id} onClick={() => act(p, () => adminApi.approve(p.id), approvedMsg(p))} className="btn-admin flex-1 !justify-center !py-1.5 !text-[11px] disabled:opacity-60"><Check size={12} /> {translatePortalText(" Approve")}</button>
+                      <button disabled={busyId === p.id} onClick={() => void approveWithChecks(p)} className="btn-admin flex-1 !justify-center !py-1.5 !text-[11px] disabled:opacity-60"><Check size={12} /> {translatePortalText(" Approve")}</button>
                     )}
                   </div>
                 </div>
@@ -321,10 +453,11 @@ export default function ProviderApprovals() {
       {/* reject reason modal */}
       <Modal open={!!rejecting} onClose={() => setRejecting(null)} title={translatePortalText(`Reject ${rejecting?.business?.businessName || rejecting?.name || ''}`)}>
         <p className="mb-2 text-sm text-slate-500">{translatePortalText("Tell the provider why their application was rejected.")}</p>
-        <textarea className="input min-h-[90px]" value={reason} onChange={e => setReason(e.target.value)} placeholder={translatePortalText("e.g. Business licence document is unreadable — please re-upload.")} />
+        <textarea className="input min-h-[90px]" dir="auto" maxLength={500} value={reason} onChange={e => setReason(e.target.value)} placeholder={translatePortalText("e.g. Business licence document is unreadable — please re-upload.")} />
+        <p className="mt-1 text-[11px] text-slate-400">{translatePortalText("At least 3 characters. Every pending document of this provider is rejected with it.")}</p>
         <div className="mt-4 flex justify-end gap-2">
           <button className="btn-ghost" onClick={() => setRejecting(null)}>{translatePortalText("Cancel")}</button>
-          <button className="btn-admin !bg-gradient-to-r !from-rose-500 !to-rose-600" onClick={doReject}>{translatePortalText("Reject application")}</button>
+          <button className="btn-admin !bg-gradient-to-r !from-rose-500 !to-rose-600 disabled:opacity-60" disabled={!!busyId || reason.trim().length < 3} onClick={doReject}>{translatePortalText(busyId ? "Rejecting…" : "Reject application")}</button>
         </div>
       </Modal>
 
@@ -350,6 +483,12 @@ export default function ProviderApprovals() {
             )}
 
             {regLoading && <p className="text-xs text-slate-400">{translatePortalText("Loading full registration…")}</p>}
+            {regError && (
+              <div className="flex items-center justify-between gap-2 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
+                <span>{translatePortalText("Couldn’t load the registration and documents: ")}{regError}</span>
+                <button className="btn-ghost !py-1 !px-2 !text-[11px]" onClick={() => openDetail(detail)}><RefreshCw size={12} /> {translatePortalText("Retry")}</button>
+              </div>
+            )}
 
             {/* Outside the registration block: boat providers have no wizard
                 registration, but they have a checklist all the same. */}
@@ -392,171 +531,6 @@ export default function ProviderApprovals() {
                   </div>
                 )}
 
-                {(() => {
-                  const groupedDocs: Record<string, any[]> = {};
-                  regDocs.forEach(d => {
-                    const type = d.docType || 'other';
-                    if (!groupedDocs[type]) groupedDocs[type] = [];
-                    groupedDocs[type].push(d);
-                  });
-                  const docTypes = Object.keys(groupedDocs);
-
-                  return (
-                    <div className="space-y-3">
-                      <DocumentFindingsSummary review={docReview} />
-                      <div className="flex items-center justify-between">
-                        <p className="label">{translatePortalText("Verification Documents (")}{formatPortalNumber(regDocs.length)})</p>
-                        <span className="text-[11px] font-bold text-slate-400">{formatPortalNumber(docTypes.length)} {translatePortalText(" types submitted")}</span>
-                      </div>
-                      <div className="space-y-3">
-                        {docTypes.map(type => {
-                          const docs = groupedDocs[type];
-                          const latest = docs[0];
-                          const history = docs.slice(1);
-                          const isExpanded = expandedDocTypes[type];
-                          const isPdf = latest.fileUrl?.toLowerCase().endsWith('.pdf') || latest.fileName?.toLowerCase().endsWith('.pdf');
-
-                          return (
-                            <div key={type} className="rounded-2xl border border-slate-200 bg-white overflow-hidden shadow-2xs">
-                              <div className="p-3.5 bg-sand/60 border-b border-slate-100 flex flex-wrap items-center justify-between gap-2">
-                                <div className="flex items-center gap-2.5 min-w-0 flex-1">
-                                  <div className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-white border border-slate-200 text-teal-600 shadow-2xs">
-                                    <FileText size={16} />
-                                  </div>
-                                  <div className="min-w-0 flex-1">
-                                    <div className="flex items-center gap-2">
-                                      <a href={fileUrl(latest.fileUrl)} target="_blank" rel="noreferrer" className="truncate font-extrabold text-[13px] text-deep-900 hover:text-teal-600 flex items-center gap-1">
-                                        {latest.label || latest.docType.replace(/_/g, ' ')}
-                                        <ExternalLink size={12} className="text-slate-400" />
-                                      </a>
-                                      <ABadge dot={latest.status === 'approved'}>{translatePortalText(latest.status.replace(/_/g, ' '))}</ABadge>
-                                    </div>
-                                    <p className="text-[11px] text-slate-400 truncate">
-                                      {latest.fileName || 'Document scan'} {latest.uploadedAt ? `· ${formatPortalDate(new Date(latest.uploadedAt))}` : ''}
-                                    </p>
-                                  </div>
-                                </div>
-
-                                <div className="flex items-center gap-1.5 shrink-0">
-                                  {latest.confidence != null && (
-                                    <span className="inline-flex items-center gap-1 rounded-lg bg-teal-50 px-2 py-1 text-[11px] font-extrabold text-teal-700">
-                                      <Sparkles size={11} /> {formatPortalPercent(latest.confidence)} {translatePortalText("AI\n                                    ")}</span>
-                                  )}
-                                  {latest.aiDocumentId && (
-                                    <button
-                                      onClick={async () => {
-                                        try {
-                                          const res = await aiDocumentApi.get(latest.aiDocumentId);
-                                          setAiDoc(res.data.document);
-                                        } catch {
-                                          toast(translatePortalText('Could not load AI details for this document'), 'warn');
-                                        }
-                                      }}
-                                      className="btn-ghost !py-1 !px-2.5 !text-[11px] !text-teal-700 bg-white border border-teal-200 hover:bg-teal-50"
-                                    >
-                                      <Sparkles size={12} /> {translatePortalText(" Inspect AI\n                                    ")}</button>
-                                  )}
-                                  {latest.status === 'pending' && (
-                                    <>
-                                      <button onClick={() => verifyDoc(latest._id, 'approved')} className="btn-admin !py-1 !px-2.5 !text-[11px]"><Check size={12} /> {translatePortalText(" Approve")}</button>
-                                      {/* The middle option. Rejecting ends the signup; this reopens
-                                          the step with a reason attached. */}
-                                      <button
-                                        onClick={() => setReuploadFor({ id: latest._id, label: latest.label || latest.docType.replace(/_/g, ' '), provider: detail?.business?.businessName || detail?.name })}
-                                        className="btn-ghost !py-1 !px-2.5 !text-[11px] !text-amber-600 border border-amber-200 bg-white hover:!bg-amber-50"
-                                        title={translatePortalText("Ask the provider to upload this one again")}
-                                      >
-                                        <BellRing size={12} /> {translatePortalText(" Ask again\n                                      ")}</button>
-                                      <button onClick={() => verifyDoc(latest._id, 'rejected')} className="btn-ghost !py-1 !px-2 !text-[11px] !text-rose-500 hover:!bg-rose-50"><X size={12} /></button>
-                                    </>
-                                  )}
-                                  {history.length > 0 && (
-                                    <button onClick={() => toggleDocHistory(type)} className="btn-ghost !py-1 !px-2 !text-[11px]">
-                                      {formatPortalNumber(history.length)} {translatePortalText(" Past ")}<Eye size={11} />
-                                    </button>
-                                  )}
-                                </div>
-                              </div>
-
-                              {/* AI Flags / Feedback Alert */}
-                              {/* Every finding on this document, with the reasoning behind each.
-                                  Was a single line of headline, which told a reviewer that
-                                  something was wrong and nothing about what. */}
-                              <DocumentFindingList
-                                findings={latest.aiFlags}
-                                severity={latest.aiSeverity}
-                                acknowledgedAt={latest.acknowledgedAt}
-                                acknowledgedNote={latest.acknowledgedNote}
-                                defaultOpen={latest.aiSeverity === 'critical'}
-                              />
-                              {!latest.aiFlags?.length && latest.aiFeedback && (
-                                <div className="mx-3.5 mt-3 flex items-start gap-2 rounded-xl bg-amber-50/80 border border-amber-200 p-2.5 text-[11.5px] text-amber-800">
-                                  <AlertTriangle size={14} className="shrink-0 text-amber-600 mt-0.5" />
-                                  <div className="flex-1">
-                                    <strong className="font-bold">{translatePortalText("AI Flag:")}</strong> {latest.aiFeedback}
-                                  </div>
-                                </div>
-                              )}
-
-                              {/* Extracted Fields Summary */}
-                              {latest.extractedFields && Object.keys(latest.extractedFields).length > 0 && (
-                                <div className="p-3.5 grid grid-cols-2 sm:grid-cols-3 gap-2 bg-slate-50/50">
-                                  {Object.entries(latest.extractedFields).map(([k, f]: [string, any]) => {
-                                    const val = typeof f === 'object' && f !== null ? f.value : f;
-                                    if (!val) return null;
-                                    return (
-                                      <div key={k} className="rounded-xl bg-white border border-slate-100 p-2 text-xs">
-                                        <p className="text-[10px] font-bold uppercase text-slate-400 truncate">{f?.label || k.replace(/_/g, ' ')}</p>
-                                        <p className="font-extrabold text-deep-900 truncate mt-0.5">{String(val)}</p>
-                                      </div>
-                                    );
-                                  })}
-                                </div>
-                              )}
-
-                              {/* Preview Link */}
-                              <div className="px-3.5 py-2.5 bg-white border-t border-slate-100 flex items-center justify-between text-xs">
-                                <span className="text-slate-400 font-medium">{isPdf ? 'PDF Document' : 'Image Scan'}</span>
-                                <a
-                                  href={fileUrl(latest.fileUrl)}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                  className="font-bold text-teal-600 hover:text-teal-700 flex items-center gap-1"
-                                >
-                                  {translatePortalText("\n                                  View Full Document ")}<ExternalLink size={12} />
-                                </a>
-                              </div>
-
-                              {/* History / Previous Revisions */}
-                              {isExpanded && history.length > 0 && (
-                                <div className="p-3 bg-slate-100/70 border-t border-slate-200 space-y-2">
-                                  <p className="text-[10px] font-extrabold uppercase tracking-wider text-slate-400">{translatePortalText("Previous Versions")}</p>
-                                  {history.map((hd, i) => (
-                                    <div key={hd._id} className="flex items-center justify-between rounded-xl bg-white p-2.5 text-[11px] border border-slate-200">
-                                      <a href={fileUrl(hd.fileUrl)} target="_blank" rel="noreferrer" className="font-bold text-deep-900 hover:text-teal-600 flex items-center gap-2">
-                                        <span>{translatePortalText("Version ")}{formatPortalNumber(history.length - i)}</span>
-                                        <ABadge>{translatePortalText(hd.status.replace(/_/g, ' '))}</ABadge>
-                                      </a>
-                                      <span className="text-slate-500 text-[10.5px] truncate max-w-[250px]">{hd.aiFeedback || hd.rejectionReason || 'Superseded'}</span>
-                                    </div>
-                                  ))}
-                                </div>
-                              )}
-                            </div>
-                          );
-                        })}
-                        {docTypes.length === 0 && (
-                          <div className="rounded-2xl border border-dashed border-slate-200 py-8 text-center text-xs text-slate-400">
-                            {detail && isDiver(detail)
-                              ? 'Scuba diver account — no documents are required. This application can be approved on its business details alone.'
-                              : 'No verification documents uploaded for this provider yet.'}
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })()}
-
                 {registration.images?.length > 0 && (
                   <div>
                     <p className="label">{translatePortalText("Photos (")}{formatPortalNumber(registration.images.length)})</p>
@@ -570,10 +544,191 @@ export default function ProviderApprovals() {
               </div>
             )}
 
+            {/* Documents and their AI findings. Outside the registration block: a
+                boat provider has no wizard registration, and with this inside it
+                their documents and findings were never shown to the reviewer. */}
+            {!regLoading && !regError && (() => {
+              const groupedDocs: Record<string, any[]> = {};
+              regDocs.forEach(d => {
+                const type = d.docType || 'other';
+                if (!groupedDocs[type]) groupedDocs[type] = [];
+                groupedDocs[type].push(d);
+              });
+              const docTypes = Object.keys(groupedDocs);
+
+              return (
+                <div className="space-y-3">
+                  <DocumentFindingsSummary review={docReview} />
+                  <div className="flex items-center justify-between">
+                    <p className="label">{translatePortalText("Verification Documents (")}{formatPortalNumber(regDocs.length)})</p>
+                    <span className="text-[11px] font-bold text-slate-400">{formatPortalNumber(docTypes.length)} {translatePortalText(" types submitted")}</span>
+                  </div>
+                  <div className="space-y-3">
+                    {docTypes.map(type => {
+                      const docs = groupedDocs[type];
+                      const latest = docs[0];
+                      const history = docs.slice(1);
+                      const isExpanded = expandedDocTypes[type];
+                      const isPdf = latest.fileUrl?.toLowerCase().endsWith('.pdf') || latest.fileName?.toLowerCase().endsWith('.pdf');
+
+                      return (
+                        <div key={type} className="rounded-2xl border border-slate-200 bg-white overflow-hidden shadow-2xs">
+                          <div className="p-3.5 bg-sand/60 border-b border-slate-100 flex flex-wrap items-center justify-between gap-2">
+                            <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                              <div className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-white border border-slate-200 text-teal-600 shadow-2xs">
+                                <FileText size={16} />
+                              </div>
+                              <div className="min-w-0 flex-1">
+                                <div className="flex items-center gap-2">
+                                  <a href={fileUrl(latest.fileUrl)} target="_blank" rel="noreferrer" className="truncate font-extrabold text-[13px] text-deep-900 hover:text-teal-600 flex items-center gap-1">
+                                    {latest.label || latest.docType.replace(/_/g, ' ')}
+                                    <ExternalLink size={12} className="text-slate-400" />
+                                  </a>
+                                  <ABadge dot={latest.status === 'approved'}>{translatePortalText(latest.status.replace(/_/g, ' '))}</ABadge>
+                                </div>
+                                <p className="text-[11px] text-slate-400 truncate">
+                                  {latest.fileName || 'Document scan'} {latest.uploadedAt ? `· ${formatPortalDate(new Date(latest.uploadedAt))}` : ''}
+                                </p>
+                              </div>
+                            </div>
+
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              {latest.confidence != null && (
+                                <span className="inline-flex items-center gap-1 rounded-lg bg-teal-50 px-2 py-1 text-[11px] font-extrabold text-teal-700">
+                                  <Sparkles size={11} /> {formatPortalPercent(latest.confidence)} {translatePortalText("AI\n                                    ")}</span>
+                              )}
+                              {latest.aiDocumentId && (
+                                <button
+                                  onClick={() => void inspectAi(latest.aiDocumentId)}
+                                  className="btn-ghost !py-1 !px-2.5 !text-[11px] !text-teal-700 bg-white border border-teal-200 hover:bg-teal-50"
+                                >
+                                  <Sparkles size={12} /> {translatePortalText(" Inspect AI\n                                    ")}</button>
+                              )}
+                              {latest.status === 'pending' && (() => {
+                                // A row that exists only as an AI record (no DocumentVerification
+                                // behind it) has the AI document's id as its `_id`; sending that
+                                // to /documents/:id/verify or /remind answers 404. Its review
+                                // happens in the AI inspection dialog instead.
+                                const aiOnly = !!latest.aiDocumentId && latest._id === latest.aiDocumentId
+                                const label = latest.label || String(latest.docType || 'document').replace(/_/g, ' ')
+                                return (
+                                  <>
+                                    <button
+                                      disabled={docBusy === latest._id}
+                                      onClick={() => (aiOnly ? void inspectAi(latest.aiDocumentId) : void verifyDoc(latest._id, 'approved'))}
+                                      title={aiOnly ? translatePortalText('Reviewed from the AI record — opens it') : undefined}
+                                      className="btn-admin !py-1 !px-2.5 !text-[11px] disabled:opacity-60"
+                                    >
+                                      <Check size={12} /> {translatePortalText(" Approve")}</button>
+                                    {/* The middle option. Rejecting ends the signup; this reopens
+                                        the step with a reason attached. */}
+                                    <button
+                                      disabled={aiOnly}
+                                      onClick={() => setReuploadFor({ id: latest._id, label, provider: detail?.business?.businessName || detail?.name })}
+                                      className="btn-ghost !py-1 !px-2.5 !text-[11px] !text-amber-600 border border-amber-200 bg-white hover:!bg-amber-50 disabled:opacity-50"
+                                      title={translatePortalText(aiOnly ? 'Only a document uploaded through the registration can be requested again' : 'Ask the provider to upload this one again')}
+                                    >
+                                      <BellRing size={12} /> {translatePortalText(" Ask again\n                                      ")}</button>
+                                    <button
+                                      disabled={docBusy === latest._id}
+                                      onClick={() => (aiOnly ? void inspectAi(latest.aiDocumentId) : void verifyDoc(latest._id, 'rejected'))}
+                                      title={translatePortalText('Reject this document')}
+                                      className="btn-ghost !py-1 !px-2 !text-[11px] !text-rose-500 hover:!bg-rose-50"
+                                    ><X size={12} /></button>
+                                  </>
+                                )
+                              })()}
+                              {history.length > 0 && (
+                                <button onClick={() => toggleDocHistory(type)} className="btn-ghost !py-1 !px-2 !text-[11px]">
+                                  {formatPortalNumber(history.length)} {translatePortalText(" Past ")}<Eye size={11} />
+                                </button>
+                              )}
+                            </div>
+                          </div>
+
+                          {/* AI Flags / Feedback Alert */}
+                          {/* Every finding on this document, with the reasoning behind each.
+                              Was a single line of headline, which told a reviewer that
+                              something was wrong and nothing about what. */}
+                          <DocumentFindingList
+                            findings={latest.aiFlags}
+                            severity={latest.aiSeverity}
+                            acknowledgedAt={latest.acknowledgedAt}
+                            acknowledgedNote={latest.acknowledgedNote}
+                            defaultOpen={latest.aiSeverity === 'critical'}
+                          />
+                          {!latest.aiFlags?.length && latest.aiFeedback && (
+                            <div className="mx-3.5 mt-3 flex items-start gap-2 rounded-xl bg-amber-50/80 border border-amber-200 p-2.5 text-[11.5px] text-amber-800">
+                              <AlertTriangle size={14} className="shrink-0 text-amber-600 mt-0.5" />
+                              <div className="flex-1">
+                                <strong className="font-bold">{translatePortalText("AI Flag:")}</strong> {latest.aiFeedback}
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Extracted Fields Summary */}
+                          {latest.extractedFields && Object.keys(latest.extractedFields).length > 0 && (
+                            <div className="p-3.5 grid grid-cols-2 sm:grid-cols-3 gap-2 bg-slate-50/50">
+                              {Object.entries(latest.extractedFields).map(([k, f]: [string, any]) => {
+                                const val = typeof f === 'object' && f !== null ? f.value : f;
+                                if (!val) return null;
+                                return (
+                                  <div key={k} className="rounded-xl bg-white border border-slate-100 p-2 text-xs">
+                                    <p className="text-[10px] font-bold uppercase text-slate-400 truncate">{f?.label || k.replace(/_/g, ' ')}</p>
+                                    <p className="font-extrabold text-deep-900 truncate mt-0.5">{String(val)}</p>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+
+                          {/* Preview Link */}
+                          <div className="px-3.5 py-2.5 bg-white border-t border-slate-100 flex items-center justify-between text-xs">
+                            <span className="text-slate-400 font-medium">{translatePortalText(!latest.fileUrl ? 'No file attached' : isPdf ? 'PDF Document' : 'Image Scan')}</span>
+                            <a
+                              href={fileUrl(latest.fileUrl)}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="font-bold text-teal-600 hover:text-teal-700 flex items-center gap-1"
+                            >
+                              {translatePortalText("\n                                  View Full Document ")}<ExternalLink size={12} />
+                            </a>
+                          </div>
+
+                          {/* History / Previous Revisions */}
+                          {isExpanded && history.length > 0 && (
+                            <div className="p-3 bg-slate-100/70 border-t border-slate-200 space-y-2">
+                              <p className="text-[10px] font-extrabold uppercase tracking-wider text-slate-400">{translatePortalText("Previous Versions")}</p>
+                              {history.map((hd, i) => (
+                                <div key={hd._id} className="flex items-center justify-between rounded-xl bg-white p-2.5 text-[11px] border border-slate-200">
+                                  <a href={fileUrl(hd.fileUrl)} target="_blank" rel="noreferrer" className="font-bold text-deep-900 hover:text-teal-600 flex items-center gap-2">
+                                    <span>{translatePortalText("Version ")}{formatPortalNumber(history.length - i)}</span>
+                                    <ABadge>{translatePortalText(hd.status.replace(/_/g, ' '))}</ABadge>
+                                  </a>
+                                  <span className="text-slate-500 text-[10.5px] truncate max-w-[250px]">{hd.aiFeedback || hd.rejectionReason || 'Superseded'}</span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                    {docTypes.length === 0 && (
+                      <div className="rounded-2xl border border-dashed border-slate-200 py-8 text-center text-xs text-slate-400">
+                        {translatePortalText(detail && isDiver(detail)
+                          ? 'Scuba diver account — no documents are required. This application can be approved on its business details alone.'
+                          : 'No verification documents uploaded for this provider yet.')}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })()}
+
             <div className="flex justify-end gap-2 border-t border-slate-100 pt-4">
               {detail.onboarding?.status === 'pending' && (<>
                 <button className="btn-ghost !text-rose-500" onClick={() => { setDetail(null); setRejecting(detail); setReason('') }}>{translatePortalText("Reject")}</button>
-                <button className="btn-admin" onClick={() => act(detail, () => adminApi.approve(detail.id), approvedMsg(detail))}>{translatePortalText("Approve provider")}</button>
+                <button className="btn-admin disabled:opacity-60" disabled={!!busyId || regLoading} onClick={() => void approveWithChecks(detail)}>{translatePortalText("Approve provider")}</button>
               </>)}
             </div>
           </div>

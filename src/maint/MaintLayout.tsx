@@ -541,7 +541,7 @@ export default function MaintLayout() {
             {/* Named a fixed business — "HarborTech Marine Service" — regardless
                 of who was signed in. `shopName` above already resolves the real
                 one, with a generic fallback. */}
-            <p>© {new Date().getFullYear()} {translatePortalText("HarborLink ·")} <bdi dir="auto">{footerName}</bdi> {translatePortalText("· Powered by BoatPro")}</p>
+            <p>© {new Date().getFullYear()} <bdi dir="auto">{footerName}</bdi> {translatePortalText("· Powered by BoatPro")}</p>
             {/* Was "All bays operational" beside a pulsing green dot — an
                 operational status claim with no bay-status data behind it
                 anywhere in the model, so it could never say anything else. The

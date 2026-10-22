@@ -480,6 +480,12 @@ export const ADMIN_ARABIC_MESSAGES: Record<string, string> = {
   'Boat rentals': 'تأجير القوارب',
   'Marina berths': 'أرصفة المرسى',
   'Fuel delivery': 'توصيل الوقود',
+  'Other charges': 'رسوم أخرى',
+  'No SMS provider is connected': 'لا يوجد مزوّد رسائل نصية متصل',
+  'SMS is not available: no SMS provider is connected.': 'الرسائل النصية غير متاحة: لا يوجد مزوّد رسائل نصية متصل.',
+  'Payment reference (optional)': 'مرجع الدفع (اختياري)',
+  'Your subscription has expired — new bookings are paused until you renew. Existing bookings keep running.': 'انتهى اشتراكك — الحجوزات الجديدة متوقفة حتى تجدد الاشتراك. الحجوزات الحالية مستمرة.',
+  'Renew subscription': 'تجديد الاشتراك',
   'Gross volume vs platform commission': 'إجمالي المبيعات مقارنة بعمولة المنصة',
   'Good morning': 'صباح الخير',
   'Review': 'مراجعة',
@@ -1363,4 +1369,24 @@ export const ADMIN_ARABIC_MESSAGES: Record<string, string> = {
   'Send Crew Invitation': 'إرسال دعوة للطاقم',
   'Seats per sailing': 'المقاعد لكل رحلة',
   'Max guests': 'الحد الأقصى للضيوف',
+  // ── Security & Auth → Security Policies (what each switch enforces) ──
+  'Locks password sign-in for 15 minutes after 5 consecutive wrong passwords (wrong 2FA codes count too). A successful sign-in resets the count and a password reset lifts the lock early. Unknown emails get the identical answer, so nothing is revealed. The sign-in rate limits (10 tries per account, 50 per network address, every 15 minutes) stay on regardless':
+    'يقفل تسجيل الدخول بكلمة المرور لمدة 15 دقيقة بعد 5 كلمات مرور خاطئة متتالية (وتُحتسب رموز التحقق الثنائي الخاطئة أيضًا). يعيد تسجيل الدخول الناجح العدّاد إلى الصفر، وتُرفع القفلة مبكرًا عند إعادة تعيين كلمة المرور. تتلقى رسائل البريد غير المسجلة الرد نفسه تمامًا، فلا يُكشف شيء. وتبقى حدود محاولات الدخول (10 محاولات لكل حساب و50 لكل عنوان شبكة كل 15 دقيقة) مفعّلة في جميع الأحوال',
+  'Admins and support agents enter a 6-digit code emailed to their account after their password — valid 10 minutes, 5 tries, single use, resend after 60 seconds. Customers and providers sign in as before. Needs email delivery configured on the server':
+    'يُدخل المشرفون ووكلاء الدعم رمزًا من 6 أرقام يُرسل إلى بريد حسابهم بعد كلمة المرور — صالح لمدة 10 دقائق، 5 محاولات، لاستخدام واحد، وإعادة الإرسال بعد 60 ثانية. يسجّل العملاء ومقدمو الخدمة الدخول كما في السابق. يتطلب تهيئة إرسال البريد الإلكتروني على الخادم',
+  'Signs portal users (admins, support agents, marina, fuel and maintenance staff) out after 30 minutes without activity — checked by the server on every request and by the console itself. Mobile-app users are not affected':
+    'يسجّل خروج مستخدمي البوابة (المشرفين ووكلاء الدعم وموظفي المارينا والوقود والصيانة) بعد 30 دقيقة دون نشاط — يتحقق منه الخادم في كل طلب وتتحقق منه لوحة التحكم نفسها. لا يتأثر مستخدمو تطبيقات الجوال',
+  'Not recommended — NIST SP 800-63B advises against forced periodic password changes. Passwords are changed on evidence of compromise (admin reset or user request).':
+    'غير موصى به — توصي إرشادات NIST SP 800-63B بعدم فرض تغيير دوري لكلمات المرور. تُغيَّر كلمات المرور عند وجود دليل على اختراقها (إعادة تعيين من المشرف أو بطلب من المستخدم).',
+  'Super-admin sign-in and every admin request must come from an address or range in the server’s ADMIN_IP_ALLOWLIST environment setting. It cannot be turned on unless your current address is on that list':
+    'يجب أن يأتي دخول المشرف العام وكل طلب للمشرف من عنوان أو نطاق مدرج في إعداد البيئة ADMIN_IP_ALLOWLIST على الخادم. لا يمكن تفعيله ما لم يكن عنوانك الحالي ضمن تلك القائمة',
+  'Not recommended — cannot be turned on': 'غير موصى به — لا يمكن تفعيله',
+  'Email delivery is not configured on the server, so this cannot be turned on yet.': 'إرسال البريد الإلكتروني غير مهيأ على الخادم، لذا لا يمكن تفعيل هذا الخيار بعد.',
+  'ADMIN_IP_ALLOWLIST is empty on the server, so this cannot be turned on yet.': 'القائمة ADMIN_IP_ALLOWLIST فارغة على الخادم، لذا لا يمكن تفعيل هذا الخيار بعد.',
+  'ADMIN_IP_ALLOWLIST has entries that are not IP addresses or CIDR ranges. Fix them on the server first.': 'تحتوي ADMIN_IP_ALLOWLIST على إدخالات ليست عناوين IP أو نطاقات CIDR. صحّحها على الخادم أولًا.',
+  'Your current address is not in ADMIN_IP_ALLOWLIST, so this cannot be turned on from here:': 'عنوانك الحالي غير مدرج في ADMIN_IP_ALLOWLIST، لذا لا يمكن تفعيل هذا الخيار من هنا:',
+  'ADMIN_IP_ALLOWLIST entries:': 'إدخالات ADMIN_IP_ALLOWLIST:',
+  'Your address:': 'عنوانك:',
+  'allowed': 'مسموح',
+  'not on the list': 'غير مدرج في القائمة',
 }

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Star, MessageSquareReply, ShieldCheck, User } from 'lucide-react'
-import { reviewsApi, type ApiReview } from '../api'
+import { reviewsApi, fileUrl, type ApiReview } from '../api'
 import { toast, ListRowSkeleton } from '../ui'
 import { formatPortalDate, formatPortalNumber, translatePortalText } from '../i18n/runtime'
 
@@ -123,7 +123,7 @@ export default function ReviewsPanel({ accentClass = 'btn-fuel' }: { accentClass
           <div key={r.id || r._id} className="rounded-2xl border border-slate-100 bg-white p-4">
             <div className="flex items-start gap-3">
               <span className="grid h-9 w-9 shrink-0 place-items-center overflow-hidden rounded-full bg-slate-100 text-slate-500">
-                {author?.avatar ? <img src={author.avatar} alt="" className="h-full w-full object-cover" /> : <User size={16} />}
+                {author?.avatar ? <img src={fileUrl(author.avatar)} alt="" className="h-full w-full object-cover" /> : <User size={16} />}
               </span>
               <div className="min-w-0 flex-1">
                 <div className="flex flex-wrap items-center gap-2">

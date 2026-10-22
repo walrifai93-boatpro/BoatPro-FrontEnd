@@ -6,8 +6,8 @@ import { money } from '../../format'
 import { PageWrap, BOOKING_TYPE_META, PAYMENT_STATUS_META, paymentTitle } from './_shared'
 import { Section, Modal, toast, Counter } from '../../ui'
 import { AdminHeader, ABadge, ViewToggle } from '../adminUi'
-import { adminPortalApi, type AdminPortalUser, type AdminUserStats, type ApiAdminPayment } from '../../api'
-import { confirmAndRun } from '../../async'
+import { adminPortalApi, fileUrl, type AdminPortalUser, type AdminUserStats, type ApiAdminPayment } from '../../api'
+import { confirm, confirmAndRun } from '../../async'
 import { errorMessage } from '../../async/errors'
 import { BASE_CURRENCY } from '../../currency'
 import {
@@ -76,7 +76,8 @@ function toRow(u: AdminPortalUser, stats?: AdminUserStats): CustomerRow {
     id,
     name: u.name,
     email: u.email,
-    avatar: u.avatar || avatar(1),
+    // Stored as a server path (/uploads/…): relative to the API host, not the portal.
+    avatar: fileUrl(u.avatar) || avatar(1),
     status: u.isActive ? 'Active' : 'Blocked',
     // A customer is verified by proving their phone number; `onboarding` is a
     // provider's approval and is never set for a customer, so the badge never showed.
@@ -101,6 +102,8 @@ export function AdminCustomers() {
   const [error, setError] = useState<string | null>(null)
   const [busyId, setBusyId] = useState<string | null>(null)
   const [composeOpen, setComposeOpen] = useState(false)
+  /** Every customer account on the platform — `rows` holds at most the newest 500. */
+  const [total, setTotal] = useState(0)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -113,6 +116,7 @@ export function AdminCustomers() {
       const res = await adminPortalApi.users({ role: 'customer', limit: 500, withStats: true })
       const stats = res.data.stats || {}
       setRows(res.data.items.map(u => toRow(u, stats[u.id || u._id])))
+      setTotal(res.data.pagination?.total ?? res.data.items.length)
     } catch (e) {
       setError(errorMessage(e))
     } finally {
@@ -225,7 +229,8 @@ export function AdminCustomers() {
       <div className="mb-5 grid grid-cols-2 gap-4 md:grid-cols-4">
         {(
           [
-            [translatePortalText('Total customers'), rows.length, undefined],
+            // The server's count — `rows.length` stopped at 500.
+            [translatePortalText('Total customers'), Math.max(total, rows.length), undefined],
             [translatePortalText('Lifetime spend'), totalSpend, BASE_CURRENCY],
             [translatePortalText('Total bookings'), totalBookings, undefined],
             [translatePortalText('Have ordered'), payingCount, undefined],
@@ -245,6 +250,14 @@ export function AdminCustomers() {
           </motion.div>
         ))}
       </div>
+
+      {/* Spend, bookings and "have ordered" are summed over the rows loaded;
+          past 500 customers that is not everyone, and the tiles said so nowhere. */}
+      {total > rows.length && (
+        <p className="mb-3 rounded-xl bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-700">
+          {translatePortalText('Showing the newest')} {formatPortalNumber(rows.length)} {translatePortalText('of')} {formatPortalNumber(total)} {translatePortalText('customers — spend, bookings, search and filters cover only these.')}
+        </p>
+      )}
 
       <TableToolbar
         state={tf}
@@ -403,7 +416,7 @@ export function AdminCustomers() {
                   }`}
                   title={u.status === 'Blocked' ? translatePortalText('Unblock') : translatePortalText('Block')}
                 >
-                  {busyId === u.id ? <Loader2 size={13} className="animate-spin" /> : <Ban size={13} />}
+                  {busyId === u.id ? <Loader2 size={13} className="animate-spin" /> : u.status === 'Blocked' ? <CheckCircle2 size={13} /> : <Ban size={13} />}
                 </button>
               </div>
             </motion.div>
@@ -424,7 +437,6 @@ export function AdminCustomers() {
       <AnnounceModal
         open={composeOpen}
         onClose={() => setComposeOpen(false)}
-        audienceCount={rows.length}
       />
     </PageWrap>
   )
@@ -436,17 +448,21 @@ export function AdminCustomers() {
 function AnnounceModal({
   open,
   onClose,
-  audienceCount,
 }: {
   open: boolean
   onClose: () => void
-  audienceCount: number
 }) {
   const [title, setTitle] = useState('')
   const [body, setBody] = useState('')
   const [titleAr, setTitleAr] = useState('')
   const [bodyAr, setBodyAr] = useState('')
   const [sending, setSending] = useState(false)
+  /*
+    Who it actually reaches, counted the way `announce` picks them: customer
+    accounts that are active. The count it showed was every loaded row —
+    blocked customers included, and capped at the 500 the list holds.
+  */
+  const [audienceCount, setAudienceCount] = useState<number | null>(null)
 
   useEffect(() => {
     if (open) {
@@ -454,11 +470,25 @@ function AnnounceModal({
       setBody('')
       setTitleAr('')
       setBodyAr('')
+      let alive = true
+      setAudienceCount(null)
+      adminPortalApi
+        .users({ role: 'customer', active: true, limit: 1 })
+        .then(res => { if (alive) setAudienceCount(res.data.pagination?.total ?? null) })
+        .catch(() => { if (alive) setAudienceCount(null) })
+      return () => { alive = false }
     }
   }, [open])
 
   const send = async () => {
-    if (!title.trim() || !body.trim() || !titleAr.trim() || !bodyAr.trim()) return
+    if (sending || !title.trim() || !body.trim() || !titleAr.trim() || !bodyAr.trim()) return
+    // Every customer, at once, unrecallable — asked once more before it goes.
+    const ok = await confirm({
+      title: translatePortalText('Send to all customers?'),
+      body: `${translatePortalText('This goes out now to')} ${audienceCount != null ? formatPortalNumber(audienceCount) : translatePortalText('every')} ${translatePortalText('active customer accounts and cannot be recalled.')}`,
+      confirmLabel: translatePortalText('Send'),
+    })
+    if (!ok) return
     setSending(true)
     try {
       const res = await adminPortalApi.announce({
@@ -482,7 +512,7 @@ function AnnounceModal({
     <Modal open={open} onClose={onClose} title={`✉️ ${translatePortalText('Message customers')}`}>
       <div className="space-y-3">
         <p className="text-xs text-slate-400">
-          {translatePortalText("\r\n          Goes to all ")}{formatPortalNumber(audienceCount)} {translatePortalText(" customer account")}{audienceCount === 1 ? '' : 's'} {translatePortalText(" as an in-app\r\n          notification. Providers are not included.\r\n        ")}</p>
+          {translatePortalText("\r\n          Goes to all ")}{audienceCount != null ? formatPortalNumber(audienceCount) : '…'} {translatePortalText(" active customer account")}{audienceCount === 1 ? '' : 's'} {translatePortalText(" as an in-app\r\n          notification. Providers are not included.\r\n        ")}</p>
         <div>
           <label className="label">{translatePortalText('Headline')}</label>
           <input

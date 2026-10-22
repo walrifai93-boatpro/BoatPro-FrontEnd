@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react'
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { TableToolbar, useTableFilters, type TableFiltersConfig } from '../../shared/TableFilters'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
@@ -29,23 +29,46 @@ export function ProviderWorkers({ cfg }: { cfg: DomainCfg }) {
   const [rejectReason, setRejectReason] = useState('')
   const [rejectBusy, setRejectBusy] = useState(false)
 
+  // A failed load used to leave "No worker requests found" on screen — an empty
+  // queue, as far as anyone reading it could tell.
+  const [loadError, setLoadError] = useState<string | null>(null)
+  // Latest request only: switching vertical mid-load must not let the older
+  // vertical's queue land here.
+  const loadSeq = useRef(0)
+
   const loadWorkers = useCallback(async (isSilent = false) => {
+    const seq = ++loadSeq.current
     if (!isSilent) setLoading(true)
     else setRefreshing(true)
     try {
       const res = await adminPortalApi.workerApprovals('all', kind)
+      if (seq !== loadSeq.current) return
       setItems(res.data.items || [])
+      setLoadError(null)
     } catch (err) {
-      toast(translatePortalText(err instanceof Error ? err.message : 'Could not load worker requests'), 'warn')
+      if (seq !== loadSeq.current) return
+      if (isSilent) toast(translatePortalText(err instanceof Error ? err.message : 'Could not load worker requests'), 'warn')
+      else { setItems([]); setLoadError(translatePortalText(err instanceof Error ? err.message : 'Could not load worker requests')) }
     } finally {
-      setLoading(false)
-      setRefreshing(false)
+      if (seq === loadSeq.current) {
+        setLoading(false)
+        setRefreshing(false)
+      }
     }
   }, [kind])
 
   useEffect(() => {
+    setItems([])
     loadWorkers()
   }, [loadWorkers])
+
+  /**
+   * A rejected worker of any type can be reconsidered and approved: the server
+   * (`assertWorkerDecision`) accepts rejected → approved and reactivates the
+   * account. Only a worker who is not rejected has nothing to re-approve.
+   */
+  const canReapprove = (w: AdminWorkerApproval) => w.status === 'rejected'
+  const reapproveBlockedHint = 'Re-approval is not supported for this worker type yet — the provider can add them again'
 
   // Counts
   const pendingCount = items.filter(w => w.status === 'pending').length
@@ -106,6 +129,7 @@ export function ProviderWorkers({ cfg }: { cfg: DomainCfg }) {
 
   // Approve action
   const handleApprove = async (worker: AdminWorkerApproval) => {
+    if (busyId) return
     setBusyId(worker.id)
     try {
       await adminPortalApi.reviewWorker(worker.kind, worker.id, 'approved')
@@ -116,6 +140,9 @@ export function ProviderWorkers({ cfg }: { cfg: DomainCfg }) {
       }
     } catch (err) {
       toast(translatePortalText(err instanceof Error ? err.message : 'Approval failed'), 'warn')
+      // Most often another admin decided first ("already been reviewed"); the
+      // row would otherwise keep offering a decision that no longer exists.
+      loadWorkers(true)
     } finally {
       setBusyId(null)
     }
@@ -143,6 +170,7 @@ export function ProviderWorkers({ cfg }: { cfg: DomainCfg }) {
       setRejectingWorker(null)
     } catch (err) {
       toast(translatePortalText(err instanceof Error ? err.message : 'Rejection failed'), 'warn')
+      loadWorkers(true) // see handleApprove
     } finally {
       setRejectBusy(false)
     }
@@ -211,7 +239,7 @@ export function ProviderWorkers({ cfg }: { cfg: DomainCfg }) {
               <Clock size={14} />
             </span>
           </div>
-          <p className="mt-2 font-display text-2xl font-black text-amber-800">{formatPortalNumber(pendingCount)}</p>
+          <p className="mt-2 font-display text-2xl font-black text-amber-800">{loading || loadError ? '—' : formatPortalNumber(pendingCount)}</p>
         </motion.div>
 
         <motion.div
@@ -231,7 +259,7 @@ export function ProviderWorkers({ cfg }: { cfg: DomainCfg }) {
               <CheckCircle2 size={14} />
             </span>
           </div>
-          <p className="mt-2 font-display text-2xl font-black text-emerald-800">{formatPortalNumber(approvedCount)}</p>
+          <p className="mt-2 font-display text-2xl font-black text-emerald-800">{loading || loadError ? '—' : formatPortalNumber(approvedCount)}</p>
         </motion.div>
 
         <motion.div
@@ -251,7 +279,7 @@ export function ProviderWorkers({ cfg }: { cfg: DomainCfg }) {
               <XCircle size={14} />
             </span>
           </div>
-          <p className="mt-2 font-display text-2xl font-black text-rose-800">{formatPortalNumber(rejectedCount)}</p>
+          <p className="mt-2 font-display text-2xl font-black text-rose-800">{loading || loadError ? '—' : formatPortalNumber(rejectedCount)}</p>
         </motion.div>
 
         <motion.div
@@ -271,7 +299,7 @@ export function ProviderWorkers({ cfg }: { cfg: DomainCfg }) {
               <Users size={14} />
             </span>
           </div>
-          <p className="mt-2 font-display text-2xl font-black text-deep-900">{formatPortalNumber(totalCount)}</p>
+          <p className="mt-2 font-display text-2xl font-black text-deep-900">{loading || loadError ? '—' : formatPortalNumber(totalCount)}</p>
         </motion.div>
       </div>
 
@@ -314,6 +342,11 @@ export function ProviderWorkers({ cfg }: { cfg: DomainCfg }) {
         <div className="card p-12 text-center text-sm text-slate-400">
           <Clock className="mx-auto mb-2 animate-spin text-emerald-500" size={24} />
           {translatePortalText("\r\n          Loading ")}{translatePortalText(cfg.name)} {translatePortalText(" worker requests…\r\n        ")}</div>
+      ) : loadError ? (
+        <div className="card flex flex-wrap items-center justify-between gap-3 !border-rose-200 !bg-rose-50 p-4 text-sm text-rose-700">
+          <span className="flex items-center gap-2"><AlertCircle size={15} className="shrink-0" /> {loadError}</span>
+          <button onClick={() => loadWorkers()} className="btn-ghost !py-1.5 !px-3 !text-xs !text-rose-700 border border-rose-200 bg-white"><RefreshCw size={12} /> {translatePortalText('Retry')}</button>
+        </div>
       ) : filtered.length === 0 ? (
         <div className="card p-12 text-center text-slate-400">
           <ShieldCheck size={36} className="mx-auto mb-2 text-slate-300" />
@@ -378,13 +411,21 @@ export function ProviderWorkers({ cfg }: { cfg: DomainCfg }) {
                     {/* Role */}
                     <div>
                       <span className="inline-block rounded-lg bg-sand px-2.5 py-1 text-xs font-bold text-slate-700 border border-slate-200/60 whitespace-nowrap">
-                        {translatePortalText(worker.role || 'Staff Attendant')}
+                        {/* No invented "Staff Attendant" for a worker with no role on record. */}
+                        {translatePortalText(worker.role || 'Role not set')}
                       </span>
                     </div>
 
                     {/* Status */}
                     <div className="whitespace-nowrap">
                       {getStatusBadge(worker.status)}
+                      {/* Marina staff can be approved before they accept: say which step they are on. */}
+                      {worker.stage === 'invited' && (
+                        <p className="mt-1 text-[11px] text-sky-700">{translatePortalText('Invite not accepted yet')}</p>
+                      )}
+                      {worker.stage === 'pending_approval' && worker.status === 'pending' && (
+                        <p className="mt-1 text-[11px] text-amber-700">{translatePortalText('Accepted — waiting on you')}</p>
+                      )}
                       {worker.rejectionReason && worker.status === 'rejected' && (
                         <p className="mt-1 text-[11px] text-rose-600 line-clamp-1 italic">
                           "{worker.rejectionReason}"
@@ -428,10 +469,10 @@ export function ProviderWorkers({ cfg }: { cfg: DomainCfg }) {
 
                       {worker.status === 'rejected' && (
                         <button
-                          disabled={busyId === worker.id}
+                          disabled={busyId === worker.id || !canReapprove(worker)}
                           onClick={() => handleApprove(worker)}
-                          className="btn-ghost !py-1.5 !px-2.5 !text-xs text-emerald-600 hover:bg-emerald-50"
-                          title={translatePortalText("Re-approve worker")}
+                          className="btn-ghost !py-1.5 !px-2.5 !text-xs text-emerald-600 hover:bg-emerald-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                          title={translatePortalText(canReapprove(worker) ? "Re-approve worker" : reapproveBlockedHint)}
                         >
                           <Check size={13} />
                           <span>{translatePortalText("Re-approve")}</span>
@@ -528,9 +569,10 @@ export function ProviderWorkers({ cfg }: { cfg: DomainCfg }) {
 
                 {worker.status === 'rejected' && (
                   <button
-                    disabled={busyId === worker.id}
+                    disabled={busyId === worker.id || !canReapprove(worker)}
                     onClick={() => handleApprove(worker)}
-                    className="btn-ghost !py-1.5 !px-3 text-xs text-emerald-600 hover:bg-emerald-50"
+                    className="btn-ghost !py-1.5 !px-3 text-xs text-emerald-600 hover:bg-emerald-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                    title={canReapprove(worker) ? undefined : translatePortalText(reapproveBlockedHint)}
                   >
                     <Check size={13} /> {translatePortalText(" Re-approve\r\n                  ")}</button>
                 )}
@@ -601,7 +643,7 @@ export function ProviderWorkers({ cfg }: { cfg: DomainCfg }) {
                     onClick={() => handleApprove(viewingWorker)}
                     className="btn-admin text-xs font-bold"
                   >
-                    <Check size={14} /> {translatePortalText(" Approve Access\r\n                  ")}</button>
+                    <Check size={14} /> {busyId === viewingWorker.id ? translatePortalText('Approving...') : translatePortalText(" Approve Access\r\n                  ")}</button>
                 </>
               )}
               <button className="btn-ghost" onClick={() => setViewingWorker(null)}>
@@ -645,7 +687,7 @@ export function ProviderWorkers({ cfg }: { cfg: DomainCfg }) {
                 disabled={rejectBusy || !rejectReason.trim()}
                 className="btn-ghost !bg-rose-600 !text-white hover:!bg-rose-700 text-xs font-bold disabled:opacity-50"
               >
-                {rejectBusy ? 'Rejecting...' : 'Confirm Rejection'}
+                {translatePortalText(rejectBusy ? 'Rejecting...' : 'Confirm Rejection')}
               </button>
             </div>
           </form>

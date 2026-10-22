@@ -21,6 +21,7 @@ import CheckboxGroup from '../components/CheckboxGroup'
 import { BankDetailsFields } from '../components/BankDetailsFields'
 import {
   EMPTY_BANK_DETAILS,
+  bankPayload,
   validateBankDetails,
   type BankDetailsErrors,
   type BankDetailsValue,
@@ -31,6 +32,15 @@ import { ThemeToggle } from '../theme'
 import { clearPendingInvite, getPendingInvite } from '../shared/pendingInvite'
 import { FakeFillButton, useFakeFillEnabled } from '../shared/FakeFillButton'
 import { fakeProvider, pick, type FakeTrade } from '../shared/fakeFill'
+import {
+  ChargeBreakdown,
+  PlanScheduleList,
+  amountsDiffer,
+  chargeFromCheckout,
+  planPaymentError,
+  useSubscriptionChargePreview,
+  type ChargePreview,
+} from '../shared/PlanPricing'
 import { formatPortalDate, formatPortalNumber, isPortalArabic, translatePortalText } from '../i18n/runtime'
 
 
@@ -132,7 +142,84 @@ const LIMIT_LABELS: Record<string, string> = {
   maxFeaturedListings: 'Featured', maxStations: 'Stations', maxWorkersPerStation: 'Workers/Station',
   maxFuelTypes: 'Fuel Types', maxDailyOrders: 'Daily Orders', maxDeliveryVehicles: 'Vehicles',
   maxActiveJobs: 'Active Jobs',
+  // Keys the package listing fills in for a plan saved without limits.
+  maxFuelStations: 'Stations', maxShops: 'Workshops', maxTechnicians: 'Technicians',
 }
+
+/**
+ * The billed period, from `durationMonths` — never from the package's free-text
+ * `duration`, which an admin can leave saying "1 Month" on a yearly plan.
+ * "month", "3 months", "year", "2 years".
+ */
+function periodText(months?: number): string {
+  const m = months && months > 0 ? Math.round(months) : 1
+  if (m % 12 === 0) {
+    const years = m / 12
+    return years === 1 ? translatePortalText('year') : `${formatPortalNumber(years)} ${translatePortalText('years')}`
+  }
+  return m === 1 ? translatePortalText('month') : `${formatPortalNumber(m)} ${translatePortalText('months')}`
+}
+
+/**
+ * An invited plan in the viewer's language. The API's `label` is assembled in
+ * English on the server ("SAR 1200 every 12 months"), so it is rebuilt here
+ * from the numbers it was made from.
+ */
+function invitePlanLine(plan: PlanSummary): string {
+  if (plan.kind === 'subscription' && typeof plan.price === 'number') {
+    return `${plan.currency} ${formatPortalNumber(plan.price)} / ${periodText(plan.durationMonths)}`
+  }
+  if (plan.kind === 'fixed_fee' && typeof plan.feePerTransaction === 'number') {
+    return `${plan.currency} ${formatPortalNumber(plan.feePerTransaction)} ${translatePortalText('per transaction')}`
+  }
+  if (plan.kind === 'commission' && typeof plan.commissionPercentage === 'number') {
+    return `${formatPortalNumber(plan.commissionPercentage)}${isPortalArabic() ? '٪' : '%'} ${translatePortalText('commission per booking')}`
+  }
+  return translatePortalText(plan.label)
+}
+
+/** What the upload endpoints accept (`middleware/upload.ts`) — checked here so a 20 MB scan fails before it is sent. */
+const DOC_MIME = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'application/pdf']
+const IMAGE_MIME = ['image/jpeg', 'image/png', 'image/webp', 'image/gif']
+const MB = 1024 * 1024
+const DOC_MAX_BYTES = 15 * MB
+const IMAGE_MAX_BYTES = 8 * MB
+/** The images route takes at most this many files per request. */
+const IMAGE_BATCH = 10
+/** Categories that describe one picture. A batch of twelve is not twelve logos. */
+const SINGLE_IMAGE_CATEGORIES = ['logo', 'cover']
+
+/**
+ * The plan the admin approved, as `/onboarding/me` returns it (populated). Read
+ * so the pay screen shows the figure the checkout will actually charge — the
+ * public list does not include invite-only plans.
+ */
+interface ApprovedPlan { id?: string; name: string; price: number; durationMonths: number; features?: string[] }
+function approvedPlanFrom(onboarding: unknown): ApprovedPlan | null {
+  const ob = (onboarding ?? {}) as {
+    subscriptionPackageId?: unknown
+    subscriptionPlan?: unknown
+  }
+  const pkg = ob.subscriptionPackageId as { _id?: string; id?: string; name?: string; price?: number; durationMonths?: number; features?: string[] } | string | null | undefined
+  if (pkg && typeof pkg === 'object' && typeof pkg.price === 'number') {
+    return { id: pkg._id || pkg.id, name: pkg.name || '', price: pkg.price, durationMonths: pkg.durationMonths || 1, features: pkg.features }
+  }
+  // Legacy platform plans bill by `interval`, which the checkout reads the same way.
+  const plan = ob.subscriptionPlan as { _id?: string; id?: string; name?: string; price?: number; interval?: string } | string | null | undefined
+  if (plan && typeof plan === 'object' && typeof plan.price === 'number') {
+    return { id: plan._id || plan.id, name: plan.name || '', price: plan.price, durationMonths: plan.interval === 'yearly' ? 12 : 1 }
+  }
+  return null
+}
+
+/**
+ * Whether an instalments refusal is something the provider can act on. "Not
+ * configured on this server" is a fact about our deployment, not advice, so it
+ * is not shown to them at all (QA W-13); an amount range or a missing mobile
+ * number is.
+ */
+const tamaraReasonIsActionable = (reason: string | null | undefined) =>
+  !!reason && !/not configured|not available for this charge/i.test(reason)
 
 export default function Onboarding() {
   const nav = useNavigate()
@@ -230,6 +317,14 @@ export default function Onboarding() {
   const [tamaraBusy, setTamaraBusy] = useState(false)
   const [payAgainWithTamara, setPayAgainWithTamara] = useState<(() => void) | null>(null)
   const [paying, setPaying] = useState(false)
+  /** The approved plan from `/onboarding/me`, and the one the checkout answered with once opened. */
+  const [approvedPlan, setApprovedPlan] = useState<ApprovedPlan | null>(null)
+  const [chargedPlan, setChargedPlan] = useState<{ name: string; price: number; durationMonths: number } | null>(null)
+  /** How the checkout's amount was reached (intro step, offer) — its own answer, once one is open. */
+  const [chargedQuote, setChargedQuote] = useState<ChargePreview | null>(null)
+  /** Set when `/provider-registration/me` failed: the wizard is not shown over blank fields that Continue would save. */
+  const [loadError, setLoadError] = useState('')
+  const [refreshing, setRefreshing] = useState(false)
 
   const steps = STEPS_BY_TYPE[providerType]
   /** Only maintenance vendors choose between a workshop and a boat ramp. */
@@ -271,11 +366,30 @@ export default function Onboarding() {
     return () => { alive = false; window.clearInterval(timer) }
   }, [analysingCount])
 
-  useEffect(() => {
+  /*
+    Nothing of the application is kept in browser storage: every step is saved
+    to the server against this account and read back from there, so a second
+    account signing in on the same browser starts from its own registration (the
+    mobile app's shared-draft leak has no counterpart here).
+  */
+  const loadRegistration = () => {
+    setLoading(true)
+    setLoadError('')
     providerRegistrationApi.me()
       .then((r) => {
         applyResult(r.data)
         const d = r.data.registration
+        /*
+          Resume where the application stands rather than at step one, which
+          had a returning provider click Continue through every finished step
+          (re-saving each) to reach the one still missing. A rejected
+          application starts at the beginning: the reason may concern any step.
+        */
+        if (d.status !== 'rejected') {
+          const sections = STEPS_BY_TYPE[providerType]
+          const firstOpen = r.data.issues.map((i) => sections.indexOf(i.section)).filter((i) => i >= 0).sort((a, b) => a - b)[0]
+          setStep(firstOpen ?? sections.length - 1)
+        }
         setIdentityType(d.account?.identityType || '')
         setCategory(d.business?.category || '')
         setBusinessNameEn(d.business?.businessNameEn || '')
@@ -318,8 +432,12 @@ export default function Onboarding() {
         setEmergEmail(d.emergency?.email || '')
         setEmergProcedures(d.emergency?.proceduresText || '')
       })
-      .catch((e) => toast(translatePortalText(e instanceof Error ? e.message : 'Could not load registration'), 'warn'))
+      .catch((e) => setLoadError(e instanceof Error ? e.message : 'Could not load registration'))
       .finally(() => setLoading(false))
+  }
+
+  useEffect(() => {
+    loadRegistration()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -329,10 +447,12 @@ export default function Onboarding() {
   }, [providerType])
 
   useEffect(() => {
-    if (!inviteCode) { setInvitePlan(null); setInviteError(''); return }
+    if (!inviteCode) { setInvitePlan(null); setInviteError(''); setInviteChecking(false); return }
     let alive = true
     setInviteChecking(true)
-    planInviteApi.resolve(inviteCode)
+    // Debounced: the field is typed into, and resolving every keystroke showed
+    // "no longer valid" for each half-typed code and spent a request on each.
+    const timer = window.setTimeout(() => planInviteApi.resolve(inviteCode)
       .then((r) => {
         if (!alive) return
         setInvitePlan(r.data.plan)
@@ -346,9 +466,50 @@ export default function Onboarding() {
         setInvitePlan(null)
         setInviteError(e instanceof Error ? e.message : 'This invite link is no longer valid.')
       })
-      .finally(() => { if (alive) setInviteChecking(false) })
-    return () => { alive = false }
+      .finally(() => { if (alive) setInviteChecking(false) }), 400)
+    return () => { alive = false; window.clearTimeout(timer) }
   }, [inviteCode])
+
+  /*
+    The plan the admin approved, for the pay and renewal screens. Its price is
+    what `/onboarding/subscription-checkout` charges when no package id is sent,
+    which this page no longer sends (see `handlePaySubscription`).
+  */
+  const needsPlanForPayment = status === 'pending_subscription_payment' || status === 'suspended'
+  useEffect(() => {
+    if (!needsPlanForPayment) return
+    let alive = true
+    onboardingApi.me()
+      .then((r) => { if (alive) setApprovedPlan(approvedPlanFrom(r.data.onboarding)) })
+      .catch(() => { /* the screen falls back to the registration's own choice */ })
+    return () => { alive = false }
+  }, [needsPlanForPayment])
+
+  /*
+    What the next period will actually charge — the package's intro step and
+    any offer an admin gave this provider — before a checkout exists. A first
+    payment may fall back to the package's public schedule; a renewal after a
+    lapse is not period 1, so only the server's own quote is used there.
+  */
+  const firstChargePreview = useSubscriptionChargePreview({
+    enabled: needsPlanForPayment,
+    packageId: approvedPlan?.id || subscriptionPackageId || null,
+    packages: subPkgs,
+    firstPayment: status === 'pending_subscription_payment',
+  })
+
+  const refreshStatus = async () => {
+    setRefreshing(true)
+    try {
+      // `refreshMe` reports failure instead of throwing; "refreshed" only when it was.
+      if (await refreshMe()) toast(translatePortalText('Account status refreshed'))
+      else toast(translatePortalText('Could not refresh your status'), 'warn')
+    } catch (e) {
+      toast(translatePortalText(e instanceof Error ? e.message : 'Could not refresh your status'), 'warn')
+    } finally {
+      setRefreshing(false)
+    }
+  }
 
   useEffect(() => { if (status === 'approved' && portal) nav(DEST[portal], { replace: true }) }, [status, portal, nav])
 
@@ -469,16 +630,39 @@ export default function Onboarding() {
     }
   }
 
-  const handlePaySubscription = async (pkgId?: string, gateway?: 'tamara') => {
+  const handlePaySubscription = async (gateway?: 'tamara') => {
     if (gateway) setTamaraBusy(true)
     else setPaying(true)
     try {
-      const targetId = pkgId || subscriptionPackageId || subPkgs[0]?._id || subPkgs[0]?.id
+      /*
+        No package id is sent. The server then charges the plan on the approved
+        application (`onboarding.subscriptionPackageId`), which is the plan the
+        activation will be recorded against. This used to send the first public
+        package whenever the chosen one was not in the public list — always the
+        case for an invite-only plan — so the provider paid one plan's price and
+        was activated on another.
+      */
       const res = await onboardingApi.subscriptionCheckout(
-        targetId,
+        undefined,
         undefined,
         gateway ? { gateway } : undefined
       )
+      const targetId = res.data.package?.id || ''
+      // `package.price` is what this checkout charges — intro step and offer
+      // applied — and `quote` says how it got there (absent on an older server).
+      const charge = chargeFromCheckout(res.data)
+      setChargedQuote(charge)
+      if (res.data.package) {
+        setChargedPlan({ name: res.data.package.name, price: charge?.amount ?? res.data.package.price, durationMonths: res.data.package.durationMonths })
+      }
+      // A plan priced at 0 is activated by that call itself: there is nothing
+      // to pay and no card form to open. Reloading the account moves the
+      // provider on to their console.
+      if (res.data.mode === 'free') {
+        await refreshMe()
+        toast(translatePortalText('Your free plan is active. Welcome aboard!'))
+        return
+      }
       /*
         Stashed against whichever reference the confirm call will carry - the
         checkout id for a card payment, Tamara's order id for instalments - so
@@ -487,22 +671,29 @@ export default function Onboarding() {
       const reference = res.data.orderId || res.data.checkoutId
       stashPendingCheckout(reference, {
         kind: 'onboarding_subscription',
-        refId: targetId || '',
+        refId: targetId,
         label: `${res.data.package?.name || 'Subscription'} Activation`,
       })
       if (res.data.mode === 'tamara' && res.data.checkoutUrl) {
         window.location.href = res.data.checkoutUrl
         return
       }
-      setTamaraUnavailable(res.data.tamaraUnavailable ?? null)
-      setPayAgainWithTamara(() => () => void handlePaySubscription(pkgId, 'tamara'))
+      const tamaraReason = res.data.tamaraUnavailable ?? null
+      setTamaraUnavailable(tamaraReason)
+      // Instalments are offered when the server would open them, explained when
+      // the provider can do something about it, and left out otherwise.
+      setPayAgainWithTamara(() => (tamaraReason === null || tamaraReasonIsActionable(tamaraReason)
+        ? () => void handlePaySubscription('tamara')
+        : null))
       setCheckoutInfo({
         checkoutId: res.data.checkoutId,
         hyperpayBaseUrl: res.data.hyperpayBaseUrl!,
       })
       setCheckoutOpen(true)
     } catch (e) {
-      toast(translatePortalText(e instanceof Error ? e.message : 'Failed to initialize payment'), 'warn')
+      // The server's own reason (e.g. a checkout priced before an offer ended),
+      // and a 403 worded for what it means here rather than "no permission".
+      toast(planPaymentError(e, 'Failed to initialize payment'), 'warn')
     } finally {
       setPaying(false)
       if (gateway) setTamaraBusy(false)
@@ -517,97 +708,231 @@ export default function Onboarding() {
     )
   }
 
-  // ── Pending Subscription Payment Screen ──────────────────────────────────
-  if (status === 'pending_subscription_payment') {
-    const selectedPkg = subPkgs.find((p) => p._id === subscriptionPackageId || p.id === subscriptionPackageId) || subPkgs[0]
-    const priceText = selectedPkg
-      ? `${formatPortalNumber(selectedPkg.price)} SAR`
-      : `${formatPortalNumber(500, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} SAR`
-    const durationMonths = selectedPkg?.durationMonths ?? 1
-    const durationText = `${formatPortalNumber(durationMonths)} ${translatePortalText(durationMonths === 1 ? 'Month' : 'Months')}`
+  // ── Could not load the application ───────────────────────────────────────
+  // Not the wizard over empty fields: Continue saves what is on screen, and a
+  // blank description or address would overwrite the one already on file.
+  if (loadError) {
+    return (
+      <Shell>
+        <ToastStack />
+        <div className="mx-auto grid h-16 w-16 place-items-center rounded-3xl bg-rose-50 text-rose-500"><AlertTriangle size={30} /></div>
+        <h1 className="mt-5 text-center font-display text-xl font-extrabold text-deep-900">{translatePortalText('We could not load your application')}</h1>
+        <p className="mx-auto mt-2 max-w-md text-center text-sm text-slate-500">{translatePortalText(loadError)}</p>
+        <button className="btn-primary mt-6 w-full !justify-center" onClick={loadRegistration}><RefreshCw size={15} /> {translatePortalText('Try again')}</button>
+      </Shell>
+    )
+  }
+
+  /*
+    A suspended provider is routed here too (any status other than approved is).
+    The nightly sweep suspends a subscriber whose plan ran out, and renewing is
+    the same checkout as the first payment — so that case gets the pay screen.
+    An admin's suspension has nothing to fill in, and the wizard's saves would
+    all be refused (the registration is already approved), so it gets an
+    explanation instead.
+  */
+  const expiryIso = user?.onboarding?.subscriptionExpiresAt || user?.onboarding?.subscriptionExpiry
+  const subscriptionLapsed = status === 'suspended'
+    && user?.onboarding?.billingModel === 'subscription'
+    && !!expiryIso && new Date(expiryIso).getTime() < Date.now()
+
+  if (status === 'suspended' && !subscriptionLapsed) {
+    return (
+      <Shell>
+        <ToastStack />
+        <div className="mx-auto grid h-20 w-20 place-items-center rounded-3xl bg-amber-50 text-amber-600"><AlertTriangle size={38} /></div>
+        <h1 className="mt-6 text-center font-display text-2xl font-extrabold text-deep-900">{translatePortalText('Your provider account is suspended')}</h1>
+        <p className="mx-auto mt-2 max-w-md text-center text-sm text-slate-500">
+          {translatePortalText('A BoatPro administrator has suspended this account, so your console and new bookings are closed for now. Contact the BoatPro team to find out why and what is needed to restore it.')}</p>
+        <button className="btn-primary mt-6 w-full !justify-center disabled:opacity-60" disabled={refreshing} onClick={refreshStatus}>
+          {refreshing ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />} {translatePortalText('Refresh status')}</button>
+      </Shell>
+    )
+  }
+
+  // ── Pending Subscription Payment Screen (and renewal after a lapse) ──────
+  if (status === 'pending_subscription_payment' || subscriptionLapsed) {
+    /*
+      Every figure here comes from the API — the checkout's own answer once it
+      has been opened, the approved plan before that, the registration's pick
+      as a last resort. There used to be a "500 SAR" / "Standard Provider Plan"
+      stand-in when none matched, and it was shown on the pay button.
+    */
+    const registeredPkg = subPkgs.find((p) => p._id === subscriptionPackageId || p.id === subscriptionPackageId)
+    const listPlan = approvedPlan
+      ?? (registeredPkg ? { name: registeredPkg.name, price: registeredPkg.price, durationMonths: registeredPkg.durationMonths ?? 1, features: undefined } : null)
+      ?? (invitePlan?.kind === 'subscription' && typeof invitePlan.price === 'number'
+        ? { name: invitePlan.name, price: invitePlan.price, durationMonths: invitePlan.durationMonths ?? 1, features: undefined }
+        : null)
+    /*
+      The amount this period actually charges, best source first: the open
+      checkout's own answer, then the server's quote (intro step and offer
+      applied), then the package's first intro step. The plan's list price is
+      the last resort — and what an older server charges anyway.
+    */
+    const preview = chargedQuote ?? firstChargePreview.preview
+    const shownPlan = chargedPlan
+      ?? (listPlan && preview ? { ...listPlan, price: preview.amount } : listPlan)
+      ?? (preview?.quote?.packageName
+        ? { name: preview.quote.packageName, price: preview.amount, durationMonths: preview.quote.durationMonths ?? 1, features: undefined }
+        : null)
+    const shownQuote = preview?.quote ?? null
+    const shownRegular = shownPlan && shownQuote && typeof shownQuote.regularPrice === 'number' && amountsDiffer(shownQuote.regularPrice, shownPlan.price)
+      ? shownQuote.regularPrice
+      : null
+    const shownSchedule = firstChargePreview.pkg?.schedule ?? registeredPkg?.schedule
+    // A plan priced at 0 is activated, never paid for: no card form, no
+    // "Pay … (0 SAR)" button, and no payment wording anywhere on the screen.
+    const freePlan = !!shownPlan && shownPlan.price <= 0
+    const priceText = freePlan
+      ? translatePortalText('Free')
+      : shownPlan ? `${formatPortalNumber(shownPlan.price)} ${translatePortalText('SAR')}` : ''
+    const planFeatures = (shownPlan as { features?: string[] } | null)?.features?.filter(Boolean) ?? []
 
     return (
       <Shell>
-        <div className="mx-auto grid h-20 w-20 place-items-center rounded-3xl bg-gradient-to-br from-emerald-400 to-teal-600 text-white shadow-lg shadow-emerald-500/20">
-          <ShieldCheck size={42} />
+        <ToastStack />
+        <div className={`mx-auto grid h-20 w-20 place-items-center rounded-3xl text-white shadow-lg ${subscriptionLapsed ? 'bg-gradient-to-br from-amber-400 to-orange-500 shadow-amber-500/20' : 'bg-gradient-to-br from-emerald-400 to-teal-600 shadow-emerald-500/20'}`}>
+          {subscriptionLapsed ? <CalendarClock size={40} /> : <ShieldCheck size={42} />}
         </div>
-        <h1 className="mt-6 text-center font-display text-2xl font-extrabold text-deep-900">{translatePortalText("Application Approved!")}</h1>
-        <p className="mx-auto mt-2 max-w-md text-center text-sm text-slate-500">
-          {translatePortalText("Congratulations")}{user?.name ? `, ${user.name.split(' ')[0]}` : ''}{translatePortalText("! The platform administrator has accepted your ")}{translatePortalText(PORTAL_META[role].label)} {translatePortalText("registration. Complete your subscription payment to activate your provider portal and go live.\r\n        ")}</p>
+        {subscriptionLapsed ? (
+          <>
+            <h1 className="mt-6 text-center font-display text-2xl font-extrabold text-deep-900">{translatePortalText('Your subscription has expired')}</h1>
+            <p className="mx-auto mt-2 max-w-md text-center text-sm text-slate-500">
+              {translatePortalText('Your plan ended on')} {formatPortalDate(expiryIso!, { day: 'numeric', month: 'short', year: 'numeric' })}. {translatePortalText('Renew it to reopen your console and start receiving new bookings again. Bookings customers have already made stay in place.')}</p>
+          </>
+        ) : (
+          <>
+            <h1 className="mt-6 text-center font-display text-2xl font-extrabold text-deep-900">{translatePortalText("Application Approved!")}</h1>
+            <p className="mx-auto mt-2 max-w-md text-center text-sm text-slate-500">
+              {translatePortalText("Congratulations")}{user?.name ? `, ${user.name.split(' ')[0]}` : ''}{translatePortalText("! The platform administrator has accepted your ")}{translatePortalText(PORTAL_META[role].label)} {freePlan
+                ? translatePortalText('registration. Your plan is free, so there is nothing to pay — activate it to open your provider portal and go live.')
+                : translatePortalText("registration. Complete your subscription payment to activate your provider portal and go live.\r\n        ")}</p>
+          </>
+        )}
 
         {/* Selected Package Card */}
         <div className="mt-6 overflow-hidden rounded-2xl border border-emerald-100 bg-gradient-to-b from-emerald-50/50 via-white to-sand p-6 shadow-sm">
-          <div className="flex items-center justify-between border-b border-slate-100 pb-4">
-            <div>
+          <div className="flex items-center justify-between gap-3 border-b border-slate-100 pb-4">
+            <div className="min-w-0">
               <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2.5 py-0.5 text-[11px] font-bold text-emerald-800">
                 <Sparkles size={11} /> {translatePortalText("Selected Tier\r\n              ")}</span>
-              <h2 className="mt-1 font-display text-lg font-bold text-deep-900">{selectedPkg?.name || translatePortalText('Standard Provider Plan')}</h2>
+              <h2 className="mt-1 break-words font-display text-lg font-bold text-deep-900">{shownPlan?.name || translatePortalText('Your subscription plan')}</h2>
             </div>
-            <div className="text-right">
-              <p className="font-display text-2xl font-black text-emerald-600">{priceText}</p>
-              <p className="text-[11px] font-semibold text-slate-400">{translatePortalText("for ")}{durationText}</p>
+            <div className="shrink-0 text-end">
+              {shownPlan ? (
+                <>
+                  <p className="font-display text-2xl font-black text-emerald-600">{priceText}</p>
+                  {shownRegular !== null && (
+                    <p className="text-xs font-semibold text-slate-400 line-through">{formatPortalNumber(shownRegular)} {translatePortalText('SAR')}</p>
+                  )}
+                  <p className="text-[11px] font-semibold text-slate-400">/ {periodText(shownPlan.durationMonths)}</p>
+                </>
+              ) : firstChargePreview.loading ? (
+                <Loader2 size={18} className="animate-spin text-slate-300" />
+              ) : (
+                <p className="max-w-[10rem] text-[11px] font-semibold text-slate-400">{translatePortalText('The amount is shown on the secure payment form.')}</p>
+              )}
             </div>
           </div>
 
+          {/* How this payment was priced (intro step, offer) and the schedule
+              the plan moves on to. Both render nothing on a plain plan. */}
+          {(shownQuote || shownSchedule) && (
+            <div className="mt-4 space-y-3">
+              <ChargeBreakdown quote={shownQuote} />
+              <PlanScheduleList
+                schedule={shownSchedule}
+                kind="subscription"
+                durationMonths={shownPlan?.durationMonths}
+              />
+            </div>
+          )}
+
           <div className="mt-4 space-y-2 text-xs text-slate-600">
-            <div className="flex items-center gap-2">
-              <Check size={14} className="text-emerald-500 shrink-0" />
-              <span>{translatePortalText("Full ")}{translatePortalText(PORTAL_META[role].label)} {translatePortalText("operational dashboard & tools")}</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <Check size={14} className="text-emerald-500 shrink-0" />
-              <span>{translatePortalText("Live listing on customer mobile app & marketplace")}</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <Check size={14} className="text-emerald-500 shrink-0" />
-              <span>{translatePortalText("Direct customer bookings, messaging, and reviews")}</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <Check size={14} className="text-emerald-500 shrink-0" />
-              <span>{translatePortalText("Automated invoicing and financial analytics")}</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <Check size={14} className="text-emerald-500 shrink-0" />
-              <span>{translatePortalText("Verified Provider Badge with 24/7 priority support")}</span>
-            </div>
+            {/* The plan's own features when the admin wrote any; otherwise what
+                every active provider gets. "Verified badge with 24/7 priority
+                support" and "automated financial analytics" were promised here
+                with nothing on the platform behind either. */}
+            {planFeatures.length > 0 ? planFeatures.map((f, i) => (
+              <div key={`${f}-${i}`} className="flex items-center gap-2">
+                <Check size={14} className="text-emerald-500 shrink-0" />
+                <span>{f}</span>
+              </div>
+            )) : (
+              <>
+                <div className="flex items-center gap-2">
+                  <Check size={14} className="text-emerald-500 shrink-0" />
+                  <span>{translatePortalText("Full ")}{translatePortalText(PORTAL_META[role].label)} {translatePortalText("operational dashboard & tools")}</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Check size={14} className="text-emerald-500 shrink-0" />
+                  <span>{translatePortalText("Live listing on customer mobile app & marketplace")}</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Check size={14} className="text-emerald-500 shrink-0" />
+                  <span>{translatePortalText("Direct customer bookings, messaging, and reviews")}</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Check size={14} className="text-emerald-500 shrink-0" />
+                  <span>{translatePortalText("Invoices, earnings and reports in your console")}</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Check size={14} className="text-emerald-500 shrink-0" />
+                  <span>{translatePortalText("Help from the BoatPro team through your inbox")}</span>
+                </div>
+              </>
+            )}
           </div>
         </div>
 
-        {/* Payment CTA */}
+        {/* Payment CTA — or, on a free plan, the one click that activates it
+            (the same call: the server activates a 0-priced plan outright). */}
         <button
           disabled={paying}
-          onClick={() => handlePaySubscription(selectedPkg?._id || selectedPkg?.id)}
+          onClick={() => handlePaySubscription()}
           className="btn-primary mt-6 w-full !justify-center !py-3.5 !text-sm !font-bold shadow-lg shadow-ocean-500/25 transition hover:shadow-ocean-500/40 disabled:opacity-50"
         >
-          {paying ? (
+          {paying && freePlan ? (
+            <>
+              <Loader2 size={16} className="animate-spin" /> {translatePortalText('Activating your plan…')}</>
+          ) : paying ? (
             <>
               <Loader2 size={16} className="animate-spin" /> {translatePortalText("Preparing secure checkout…\r\n            ")}</>
-          ) : (
+          ) : freePlan ? (
+            <>
+              <Sparkles size={17} /> {translatePortalText(subscriptionLapsed ? 'Renew free plan' : 'Activate free plan')}
+            </>
+          ) : shownPlan ? (
             <>
               <CreditCard size={17} /> {translatePortalText("Pay Subscription Fee (")}{priceText})
+            </>
+          ) : (
+            <>
+              <CreditCard size={17} /> {translatePortalText('Pay subscription fee')}
             </>
           )}
         </button>
 
-        <p className="mt-2 text-center text-[11px] text-slate-400">
-          {translatePortalText("Secure payment processed via HyperPay · Supports ")}<span className="font-semibold text-deep-900">{translatePortalText("mada")}</span>, <span className="font-semibold text-deep-900">{translatePortalText("Visa")}</span>, <span className="font-semibold text-deep-900">{translatePortalText("Mastercard")}</span> {translatePortalText("& Apple Pay\r\n        ")}</p>
+        {/* The card form is HyperPay's widget with mada, Visa and Mastercard
+            (`data-brands`). Apple Pay was promised here and is not on it. */}
+        {freePlan ? (
+          <p className="mt-2 text-center text-[11px] text-slate-400">{translatePortalText('No card needed — this plan is free.')}</p>
+        ) : (
+          <p className="mt-2 text-center text-[11px] text-slate-400">
+            {translatePortalText("Secure payment processed via HyperPay · Supports ")}<span className="font-semibold text-deep-900">{translatePortalText("mada")}</span>, <span className="font-semibold text-deep-900">{translatePortalText("Visa")}</span> {translatePortalText('and')} <span className="font-semibold text-deep-900">{translatePortalText("Mastercard")}</span></p>
+        )}
 
-        <button
-          className="btn-ghost mt-4 w-full !justify-center text-xs"
-          onClick={async () => {
-            await refreshMe()
-            toast(translatePortalText('Account status refreshed'))
-          }}
-        >
-          <RefreshCw size={13} /> {translatePortalText("Refresh status\r\n        ")}</button>
+        <button className="btn-ghost mt-4 w-full !justify-center text-xs disabled:opacity-60" disabled={refreshing} onClick={refreshStatus}>
+          {refreshing ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />} {translatePortalText("Refresh status\r\n        ")}</button>
 
         <HyperpayCheckoutModal
-          open={checkoutOpen}
+          open={checkoutOpen && !freePlan}
           onClose={() => { setCheckoutOpen(false); setTamaraBusy(false) }}
           checkout={checkoutInfo}
-          amountLabel={priceText}
+          amountLabel={priceText || undefined}
           onPayWithTamara={payAgainWithTamara ?? undefined}
-          tamaraUnavailable={tamaraUnavailable}
+          tamaraUnavailable={tamaraReasonIsActionable(tamaraUnavailable) ? tamaraUnavailable : null}
           tamaraBusy={tamaraBusy}
         />
       </Shell>
@@ -655,7 +980,11 @@ export default function Onboarding() {
         <p className="mx-auto mt-2 max-w-md text-center text-sm text-slate-500">
           {translatePortalText("Thanks")}{user?.name ? `, ${user.name.split(' ')[0]}` : ''}{translatePortalText("! Your ")}{translatePortalText(PORTAL_META[role].label)} {translatePortalText("application is under review.\r\n          You'll get full access as soon as an admin approves it.\r\n        ")}</p>
         <div className="mt-6 space-y-3">
-          {[['Registered', true], ['Registration submitted', true], ['Admin review', 'active'], ['Go live', false]].map(([label, s]) => (
+          {/* A subscription plan has a payment between approval and going live
+              (`pending_subscription_payment`); leaving it off had the timeline
+              promise "Go live" straight after review. */}
+          {([['Registered', true], ['Registration submitted', true], ['Admin review', 'active'],
+            ...(billingModel === 'subscription' ? [['Subscription payment', false]] : []), ['Go live', false]] as [string, boolean | 'active'][]).map(([label, s]) => (
             <div key={label as string} className="flex items-center gap-3 rounded-xl bg-sand px-4 py-3">
               <span className={`grid h-6 w-6 place-items-center rounded-full ${s === true ? 'bg-emerald-500 text-white' : s === 'active' ? 'bg-ocean-500 text-white' : 'bg-slate-200'}`}>
                 {s === true ? <Check size={13} /> : s === 'active' ? <Loader2 size={12} className="animate-spin" /> : null}
@@ -664,7 +993,8 @@ export default function Onboarding() {
             </div>
           ))}
         </div>
-        <button className="btn-primary mt-6 w-full !justify-center" onClick={refreshMe}><RefreshCw size={15} /> {translatePortalText("Refresh status")}</button>
+        <button className="btn-primary mt-6 w-full !justify-center disabled:opacity-60" disabled={refreshing} onClick={refreshStatus}>
+          {refreshing ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />} {translatePortalText("Refresh status")}</button>
       </Shell>
     )
   }
@@ -681,8 +1011,13 @@ export default function Onboarding() {
       <RouteProgressBar />
       <ConfirmHost />
       {status === 'rejected' && (
-        <div className="mb-5 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-600">
-          {translatePortalText("Your previous application was rejected")}{reg?.rejectionReason ? `: ${reg.rejectionReason}` : user?.onboarding?.rejectionReason ? `: ${user.onboarding.rejectionReason}` : ''}{translatePortalText(". Please review and resubmit.\r\n        ")}</div>
+        <div dir="auto" className="mb-5 break-words rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-600">
+          {/* The reviewer's own full stop is dropped: the sentence supplies one,
+              and "…blurry.. Please review" read as a typo (QA W-09). */}
+          {translatePortalText("Your previous application was rejected")}{(() => {
+            const reason = (reg?.rejectionReason || user?.onboarding?.rejectionReason || '').trim().replace(/[.\s]+$/, '')
+            return reason ? `: ${reason}` : ''
+          })()}{translatePortalText(". Please review and resubmit.\r\n        ")}</div>
       )}
 
       <div className="mb-6 flex flex-wrap items-center gap-3">
@@ -713,7 +1048,10 @@ export default function Onboarding() {
       )}
 
       {key === 'business' && (
-        <StepBody onBack={goBack} onNext={async () => goNext(await save('business', { category, businessNameEn, businessNameAr: businessNameAr.trim() || undefined, crNumber: crNumber.trim() || undefined, vatNumber: vatNumber.trim() || undefined, businessEmail: businessEmail.trim() || undefined, businessPhone, website: website.trim() || undefined }))} busy={busy}
+        // CR, VAT and website go as '' when emptied, not undefined: the section
+        // save merges, so a dropped key left the old number on file and it came
+        // back on the next load.
+        <StepBody onBack={goBack} onNext={async () => goNext(await save('business', { category, businessNameEn, businessNameAr: businessNameAr.trim() || undefined, crNumber: crNumber.trim(), vatNumber: vatNumber.trim(), businessEmail: businessEmail.trim() || undefined, businessPhone, website: website.trim() }))} busy={busy}
           disabled={!category || !businessNameEn || !businessPhone || !!emailError(businessEmail) || !!phoneError(businessPhone) || !!crError(crNumber) || !!vatError(vatNumber)}>
           <FieldLabel>{translatePortalText("Business type")}</FieldLabel>
           <div className="flex flex-wrap gap-1.5">
@@ -855,11 +1193,19 @@ export default function Onboarding() {
             const errors = validateBankDetails(bank)
             setBankErrors(errors)
             if (Object.keys(errors).length) return
+            // `bankPayload` is the canonicaliser the other bank editors use: it
+            // fills the bank name and SWIFT from the IBAN when left blank, and
+            // keeps an account number already on file instead of dropping it.
+            const payload = bankPayload(bank)
+            // Skipped (nothing entered): nothing to save. The section save
+            // merges, so blank fields could not clear stored details anyway.
+            if (!payload) { goNext(true); return }
             goNext(await save('bank', {
-              bankName: bank.bankName || undefined,
-              accountHolderName: bank.accountHolderName || undefined,
-              iban: bank.iban || undefined,
-              swiftCode: bank.swiftCode || undefined,
+              bankName: payload.bankName || undefined,
+              accountHolderName: payload.accountHolderName || undefined,
+              iban: payload.iban || undefined,
+              accountNumber: payload.accountNumber || undefined,
+              swiftCode: payload.swiftCode || undefined,
             }))
           }}
           busy={busy}
@@ -897,11 +1243,20 @@ export default function Onboarding() {
                   <p className="flex items-center gap-1.5"><Check size={13} className="shrink-0" /> {translatePortalText("No commission percentage")}</p>
                   <p className="flex items-center gap-1.5"><Check size={13} className="shrink-0" /> {translatePortalText("No monthly subscription")}</p>
                   <p className="flex items-center gap-1.5"><Check size={13} className="shrink-0" /> {translatePortalText("Never more than the booking itself")}</p>
-                  <p className="flex items-center gap-1.5"><Check size={13} className="shrink-0" /> {translatePortalText("Paid out by monthly bank transfer")}</p>
+                  <p className="flex items-center gap-1.5"><Check size={13} className="shrink-0" /> {translatePortalText("Paid out by weekly bank transfer")}</p>
                 </div>
               </>
             ) : (
-              <p className="mt-4 font-display text-xl font-extrabold text-amber-700">{invitePlan.label}</p>
+              <>
+                <p className="mt-4 font-display text-xl font-extrabold text-amber-700">{invitePlanLine(invitePlan)}</p>
+                {/* An invited plan can carry intro steps too. */}
+                <PlanScheduleList
+                  schedule={invitePlan.schedule}
+                  kind={invitePlan.kind === 'subscription' ? 'subscription' : 'commission'}
+                  durationMonths={invitePlan.durationMonths}
+                  className="mt-2"
+                />
+              </>
             )}
 
             <p className="mt-4 text-[11px] text-amber-800/80 dark:text-amber-200">
@@ -947,13 +1302,14 @@ export default function Onboarding() {
             <div className="grid gap-3 sm:grid-cols-3">
               {subPkgs.map((p) => {
                 const on = subscriptionPackageId === (p.id || p._id)
-                const durationMonths = p.durationMonths ?? 1
                 return (
                   <button key={p.id || p._id} type="button" onClick={() => setSubscriptionPackageId(p.id || p._id || '')}
                     className={`relative rounded-2xl border-2 p-4 text-left transition ${on ? 'border-ocean-400 shadow-lift bg-ocean-50/20' : 'border-slate-200 hover:border-ocean-200 bg-white'}`}>
                     {on && <span className="absolute end-3 top-3 grid h-5 w-5 place-items-center rounded-full bg-ocean-500 text-white"><Check size={12} /></span>}
                     <p className="font-display text-base font-extrabold text-deep-900">{p.name}</p>
-                    <p className="mt-1 font-display text-lg font-extrabold text-ocean-600">{translatePortalText("SAR ")}{formatPortalNumber(p.price)}<span className="text-[11px] font-semibold text-slate-400">/{formatPortalNumber(durationMonths)} {translatePortalText(durationMonths === 1 ? 'month' : 'months')}</span></p>
+                    <p className="mt-1 font-display text-lg font-extrabold text-ocean-600">{translatePortalText("SAR ")}{formatPortalNumber(p.price)}<span className="text-[11px] font-semibold text-slate-400"> / {periodText(p.durationMonths)}</span></p>
+                    {/* Intro steps before the price above, when the package has any. */}
+                    <PlanScheduleList schedule={p.schedule} kind="subscription" durationMonths={p.durationMonths} className="mt-2" />
 
                     {p.description && <p className="mt-2 text-xs text-slate-500 leading-relaxed">{p.description}</p>}
 
@@ -993,6 +1349,8 @@ export default function Onboarding() {
                           described two different ways across screens. */}
                       {p.commissionType === 'fixed' ? `SAR ${formatPortalNumber(p.fixedAmountSar)} ${translatePortalText('per transaction')}` : `${formatPortalNumber(p.commissionPercentage)}${isPortalArabic() ? '٪' : '%'}`}
                     </p>
+                    {/* Intro rates before the tier's own, when it has any. */}
+                    <PlanScheduleList schedule={p.schedule} kind="commission" commissionType={p.commissionType} className="mt-2" />
 
                     {p.description && <p className="mt-2 text-xs text-slate-500 leading-relaxed">{p.description}</p>}
 
@@ -1029,7 +1387,34 @@ export default function Onboarding() {
           disabled={(reg?.images?.length ?? 0) < 5 || (reg?.images?.length ?? 0) > 20}>
           <p className="text-xs text-slate-500 flex items-center gap-1"><ImageIcon size={13} /> {translatePortalText("Upload 5–20 photos of your ")}{entityLabel(providerType).toLowerCase()}.</p>
           <ImageGalleryUpload images={reg?.images || []} categories={IMAGE_CATEGORIES[providerType]}
-            onUpload={async (files, cat) => { await providerRegistrationApi.uploadImages(files, cat); await reload() }}
+            onUpload={async (picked, cat) => {
+              // The API's limits (jpeg/png/webp/gif, 8 MB, ten per request),
+              // applied before upload so one HEIC photo does not sink the batch.
+              const files = picked.filter((f) => IMAGE_MIME.includes(f.type) && f.size <= IMAGE_MAX_BYTES)
+              if (files.length < picked.length) {
+                toast(translatePortalText('Some photos were skipped — use JPG, PNG, WebP or GIF files of up to 8 MB'), 'warn')
+              }
+              if (!files.length) return
+              // "Logo" and "cover" name one picture, and the picker's default
+              // (the first category, "logo") used to be stamped on the whole
+              // batch (QA W-07). Only the first file takes it; the rest go up
+              // untagged.
+              const single = !!cat && SINGLE_IMAGE_CATEGORIES.includes(cat) && files.length > 1
+              const groups: { files: File[]; category?: string }[] = single
+                ? [{ files: files.slice(0, 1), category: cat }, { files: files.slice(1) }]
+                : [{ files, category: cat }]
+              try {
+                for (const g of groups) {
+                  for (let i = 0; i < g.files.length; i += IMAGE_BATCH) {
+                    await providerRegistrationApi.uploadImages(g.files.slice(i, i + IMAGE_BATCH), g.category)
+                  }
+                }
+                if (single) toast(`${translatePortalText('Only the first photo was tagged as')} "${translatePortalText(cat!)}". ${translatePortalText('The others were added without a category.')}`)
+              } finally {
+                // Whatever reached the server is shown, even if a later batch failed.
+                await reload().catch(() => {})
+              }
+            }}
             onDelete={async (i) => { await providerRegistrationApi.deleteImage(i); await reload() }} />
         </StepBody>
       )}
@@ -1054,8 +1439,20 @@ export default function Onboarding() {
             {/* The field's own placeholder ("Ch 16 / 68 (156.8 MHz)") has people type the
                 "Ch", so only add it when they did not — it read "Ch Ch 16 / 68". */}
             <ReviewRow label="VHF Radio Channel" value={vhfChannel ? (/^\s*ch\b/i.test(vhfChannel) ? vhfChannel : `Ch ${vhfChannel}`) : translatePortalText('Not set')} />
-            <ReviewRow label="Payment model" value={invitePlan ? translatePortalText(invitePlan.label) : translatePortalText(billingModel === 'subscription' ? 'Subscription' : 'Commission')} />
-            <ReviewRow label="Documents uploaded" value={`${formatPortalNumber(docChecklist.uploaded.length)} / ${formatPortalNumber(docChecklist.required.length + docChecklist.optional.length)}`} />
+            <ReviewRow label="Payment model" value={invitePlan ? invitePlanLine(invitePlan) : translatePortalText(billingModel === 'subscription' ? 'Subscription' : 'Commission')} />
+            {/* Required and optional counted apart. One "4 / 5" over both read
+                as a missing document beside "Everything looks complete", when
+                the fifth was an optional one (QA W-08). */}
+            {(() => {
+              // Counted the way the submit gate counts them (any file on the
+              // slot), so this row and the checklist below cannot disagree.
+              const onFile = new Set(docChecklist.uploaded.map((d) => d.docType))
+              const reqDone = docChecklist.required.filter((d) => onFile.has(d)).length
+              const optDone = docChecklist.optional.filter((d) => onFile.has(d)).length
+              const value = `${formatPortalNumber(reqDone)} / ${formatPortalNumber(docChecklist.required.length)} ${translatePortalText('required')}`
+                + (docChecklist.optional.length ? ` · ${formatPortalNumber(optDone)} / ${formatPortalNumber(docChecklist.optional.length)} ${translatePortalText('optional')}` : '')
+              return <ReviewRow label="Documents uploaded" value={value} />
+            })()}
             {asksVat && <ReviewRow label="VAT certificate" value={hasVat === undefined ? translatePortalText('Not answered') : hasVat ? translatePortalText('Yes') : translatePortalText('No — not required')} />}
             <ReviewRow label="Photos" value={`${formatPortalNumber((reg?.images || []).length)} ${translatePortalText('uploaded')}`} />
           </div>
@@ -1229,11 +1626,18 @@ function DocRow({ label, required, uploaded, onUpload, onAcknowledge }: {
 
   const ai = uploaded?.ai
   const analysing = !!uploaded && (ai?.status === 'queued' || ai?.status === 'analyzing')
-  const severity = analysing ? 'clear' : (ai?.severity ?? 'clear')
+  /*
+    A person's decision outranks the machine's. A document a reviewer turned
+    down kept showing the reading's green "looks good" headline, so after a
+    rejection nothing on this step said which file had been the problem.
+  */
+  const reviewerRejected = uploaded?.status === 'rejected'
+  const reviewerApproved = uploaded?.status === 'approved'
+  const severity = analysing ? 'clear' : reviewerRejected ? 'critical' : (ai?.severity ?? 'clear')
   const tone = VERDICT_TONE[severity]
   const flags = ai?.flags ?? []
-  const waivable = flags.length > 0 && !flags.some((f) => UNWAIVABLE.includes(f.code))
-  const needsAttention = !analysing && severity !== 'clear' && !uploaded?.acknowledgedAt
+  const waivable = !reviewerRejected && flags.length > 0 && !flags.some((f) => UNWAIVABLE.includes(f.code))
+  const needsAttention = !analysing && severity !== 'clear' && (reviewerRejected || !uploaded?.acknowledgedAt)
   const pendingReminder = uploaded?.reminder && !uploaded.reminder.resolvedAt
 
   // Expiry gets its own line rather than sitting in the field list: it is the one
@@ -1243,10 +1647,20 @@ function DocRow({ label, required, uploaded, onUpload, onAcknowledge }: {
 
   const pick = async () => {
     const input = document.createElement('input')
-    input.type = 'file'; input.accept = 'image/*,application/pdf'
+    input.type = 'file'; input.accept = DOC_MIME.join(',')
     input.onchange = async () => {
       const file = input.files?.[0]
       if (!file) return
+      // The server's own limits, so a phone's HEIC photo or a 40 MB scan is
+      // turned away with the reason before it uploads, not after.
+      if (!DOC_MIME.includes(file.type)) {
+        toast(translatePortalText('Upload a PDF or a JPG, PNG, WebP or GIF image'), 'warn')
+        return
+      }
+      if (file.size > DOC_MAX_BYTES) {
+        toast(translatePortalText('That file is larger than 15 MB — upload a smaller copy'), 'warn')
+        return
+      }
       setBusy(true)
       try { await onUpload(file); toast(translatePortalText(`${label} uploaded — checking it now`)) }
       catch (e) { toast(translatePortalText(e instanceof Error ? e.message : 'Upload failed'), 'warn') }
@@ -1263,7 +1677,7 @@ function DocRow({ label, required, uploaded, onUpload, onAcknowledge }: {
     finally { setWaiving(false) }
   }
 
-  const showDetail = !!uploaded && !analysing && (flags.length > 0 || !!expiry || otherFields.length > 0)
+  const showDetail = !!uploaded && !analysing && (reviewerRejected || flags.length > 0 || !!expiry || otherFields.length > 0)
 
   return (
     <div className={`overflow-hidden rounded-xl border transition-colors ${uploaded ? tone.ring : 'border-slate-200 dark:border-slate-700'} ${needsAttention || pendingReminder ? tone.wash : ''}`}>
@@ -1286,9 +1700,13 @@ function DocRow({ label, required, uploaded, onUpload, onAcknowledge }: {
               <>
                 <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${tone.dot}`} />
                 <p className={`truncate text-[11px] font-medium ${tone.text}`}>
-                  {translatePortalText(uploaded.acknowledgedAt && severity !== 'clear'
-                    ? 'You chose to continue with this document'
-                    : (ai?.headline || `${translatePortalText('Uploaded')} — ${translatePortalText(uploaded.status.charAt(0).toUpperCase() + uploaded.status.slice(1))}`))}
+                  {translatePortalText(reviewerRejected
+                    ? 'Not accepted by our review team'
+                    : reviewerApproved
+                      ? 'Approved by our review team'
+                      : uploaded.acknowledgedAt && severity !== 'clear'
+                        ? 'You chose to continue with this document'
+                        : (ai?.headline || `${translatePortalText('Uploaded')} — ${translatePortalText(uploaded.status.charAt(0).toUpperCase() + uploaded.status.slice(1))}`))}
                 </p>
               </>
             ) : (
@@ -1321,6 +1739,14 @@ function DocRow({ label, required, uploaded, onUpload, onAcknowledge }: {
       {showDetail && (
         <div className="border-t border-slate-200/70 dark:border-slate-700/70">
           <div className="space-y-2.5 px-3 py-2.5">
+            {reviewerRejected && (
+              <div className="flex items-start gap-2">
+                <FileWarning size={13} className="mt-0.5 shrink-0 text-rose-500" />
+                <p dir="auto" className="break-words text-xs leading-relaxed text-slate-600 dark:text-slate-300">
+                  {uploaded.rejectionReason || translatePortalText('A reviewer did not accept this file. If it was the reason your application was turned down, upload a new one.')}</p>
+              </div>
+            )}
+
             {/* Expiry first — the value this whole pass exists to find. */}
             {expiry && (
               <div className="flex items-center gap-1.5 text-xs">
@@ -1366,13 +1792,13 @@ function DocRow({ label, required, uploaded, onUpload, onAcknowledge }: {
                 {waivable ? (
                   <button type="button" onClick={waive} disabled={waiving} className="btn-ghost !py-1.5 !px-3 text-xs">
                     {waiving ? <Loader2 size={13} className="animate-spin" /> : null} {translatePortalText("This is correct — continue\r\n                  ")}</button>
-                ) : (
+                ) : reviewerRejected ? null : (
                   <p className="text-[11px] text-slate-400">{translatePortalText("Our team will review this one before your account opens.")}</p>
                 )}
               </div>
             )}
 
-            {uploaded.acknowledgedAt && severity !== 'clear' && (
+            {uploaded.acknowledgedAt && severity !== 'clear' && !reviewerRejected && (
               <p className="text-[11px] text-slate-400">
                 {translatePortalText("You told us this document is correct, so we will pass it to a reviewer as it is.\r\n              ")}</p>
             )}
@@ -1391,7 +1817,12 @@ function Shell({ children, wide }: { children: React.ReactNode; wide?: boolean }
       <div className="pointer-events-none absolute inset-0 opacity-[0.15]" style={{ backgroundImage: 'radial-gradient(rgba(255,255,255,0.5) 1px, transparent 1px)', backgroundSize: '26px 26px' }} />
       <div className="absolute end-4 top-4 z-30 flex items-center gap-2">
         <ThemeToggle onDark />
-        <button className="btn-ghost !bg-white/10 !border-white/20 !text-white !py-2 text-xs" onClick={() => { logout(); nav('/login') }}>{translatePortalText("Sign out")}</button>
+        <button className="btn-ghost !bg-white/10 !border-white/20 !text-white !py-2 text-xs" onClick={() => {
+          // The invite code sits in session storage under one key for the tab,
+          // so it would otherwise be offered to the next account that signs up here.
+          clearPendingInvite()
+          logout(); nav('/login')
+        }}>{translatePortalText("Sign out")}</button>
       </div>
       <div className="relative z-10 flex min-h-screen items-center justify-center p-5">
         <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className={`card w-full ${wide ? 'max-w-3xl' : 'max-w-md'} !rounded-3xl p-7 shadow-lift`}>

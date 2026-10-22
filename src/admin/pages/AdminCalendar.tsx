@@ -119,14 +119,25 @@ export default function AdminCalendar() {
     setLoading(true)
     setError(null)
     try {
-      // Both lists are small and cover every month, so they are fetched once
-      // rather than per month — paging back and forth stays instant.
-      const [ov, dc] = await Promise.all([
-        monetizationApi.overview(),
-        documentsApi.all({ status: 'approved', limit: 500 }),
-      ])
+      // Both lists cover every month, so they are fetched once rather than per
+      // month — paging back and forth stays instant.
+      //
+      // Documents are read page by page: `/documents/all` caps a page at 100
+      // and sorts newest first, so the old single `limit: 500` request got the
+      // 100 newest approvals and every older document's expiry silently never
+      // reached the grid.
+      const fetchAllApproved = async () => {
+        const out: ApiKycDocument[] = []
+        for (let page = 1; page <= 50; page++) {
+          const res = await documentsApi.all({ status: 'approved', limit: 100, page })
+          out.push(...(res.data.items || []))
+          if (page >= (res.data.pagination?.totalPages ?? 1)) break
+        }
+        return out
+      }
+      const [ov, allDocs] = await Promise.all([monetizationApi.overview(), fetchAllApproved()])
       setProviders(ov.data.providers || [])
-      setDocs(dc.data.items || [])
+      setDocs(allDocs)
     } catch (e) {
       setError(errorMessage(e))
     } finally {
@@ -143,6 +154,11 @@ export default function AdminCalendar() {
     const all: CalEvent[] = [...payoutMondays(year, month)]
 
     for (const p of providers) {
+      // `/monetization/overview` lists every provider account — rejected,
+      // incomplete and commission-model ones included, some carrying an old
+      // expiry. "Stops receiving bookings" is only true of an approved
+      // subscriber, so only theirs is a renewal date.
+      if (p.paymentModel !== 'subscription' || p.status !== 'approved') continue
       if (!p.subscriptionExpiry) continue
       const d = new Date(p.subscriptionExpiry)
       if (Number.isNaN(d.valueOf()) || d.getFullYear() !== year || d.getMonth() !== month) continue
@@ -282,7 +298,7 @@ export default function AdminCalendar() {
                 }`}
               >
                 <p className={`text-xs font-extrabold ${isToday ? 'text-emerald-600' : 'text-slate-400'}`}>
-                  {d}
+                  {formatPortalNumber(d)}
                   {isToday && (
                     <span className="ms-1 rounded-full bg-emerald-500 px-1.5 py-0.5 text-[9px] font-bold text-white">
                       {translatePortalText('TODAY')}

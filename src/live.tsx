@@ -310,15 +310,22 @@ export function asIssued(n: number | null | undefined, currency: string = BASE_C
   return formatMoney(n, currency, { display: currency });
 }
 
+/**
+ * Marinas run on the platform clock (Saudi Arabia). Times and dates are shown
+ * in it whatever the browser's zone, so an arrival scheduled for 14:00 reads
+ * 14:00 for every operator — it read 11:00 in a UTC browser and 16:30 in India.
+ */
+export const PLATFORM_TIME_ZONE = 'Asia/Riyadh';
+
 export function fmtDate(value?: string | Date | null): string {
   if (!value) return '—';
   const d = value instanceof Date ? value : new Date(value);
-  return isNaN(d.getTime()) ? '—' : formatPortalDate(d, { day: '2-digit', month: 'short', year: 'numeric' });
+  return isNaN(d.getTime()) ? '—' : formatPortalDate(d, { day: '2-digit', month: 'short', year: 'numeric', timeZone: PLATFORM_TIME_ZONE });
 }
 export function fmtTime(value?: string | Date | null): string {
   if (!value) return '—';
   const d = value instanceof Date ? value : new Date(value);
-  return isNaN(d.getTime()) ? '—' : new Intl.DateTimeFormat(portalLocale(), { hour: '2-digit', minute: '2-digit', hour12: false }).format(d);
+  return isNaN(d.getTime()) ? '—' : new Intl.DateTimeFormat(portalLocale(), { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: PLATFORM_TIME_ZONE }).format(d);
 }
 export function fmtDateTime(value?: string | Date | null): string {
   if (!value) return '—';
@@ -369,10 +376,10 @@ export function daysUntil(isoDate?: string | null): number | null {
  * Built from the local date parts instead, which is the only way to get the
  * day the person in front of the screen is actually having.
  */
-export const todayIso = () => {
-  const n = new Date();
-  return `${n.getFullYear()}-${String(n.getMonth() + 1).padStart(2, '0')}-${String(n.getDate()).padStart(2, '0')}`;
-};
+export const todayIso = () =>
+  // The marina's day, not the browser's: an operator abroad (or a browser in
+  // UTC) saw tomorrow's arrivals as today's until 03:00.
+  new Intl.DateTimeFormat('en-CA', { timeZone: PLATFORM_TIME_ZONE, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
 
 /** The same conversion for an arbitrary date. */
 export const localIso = (d: Date) =>

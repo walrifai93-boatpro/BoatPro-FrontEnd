@@ -31,6 +31,12 @@ interface AiDocumentVerificationModalProps {
   isOpen: boolean;
   onClose: () => void;
   onStatusUpdated?: (updatedDoc: AIDocument) => void;
+  /**
+   * Whether Approve/Reject are offered. False for the document's own owner
+   * (the marina vault): the review endpoint is admin-only, so the buttons
+   * could only ever fail with 403.
+   */
+  reviewable?: boolean;
 }
 
 export const AiDocumentVerificationModal: React.FC<AiDocumentVerificationModalProps> = ({
@@ -39,6 +45,7 @@ export const AiDocumentVerificationModal: React.FC<AiDocumentVerificationModalPr
   isOpen,
   onClose,
   onStatusUpdated,
+  reviewable = true,
 }) => {
   const [zoom, setZoom] = useState(1);
   const [previewFailed, setPreviewFailed] = useState(false);
@@ -50,7 +57,9 @@ export const AiDocumentVerificationModal: React.FC<AiDocumentVerificationModalPr
 
   if (!isOpen || !doc) return null;
 
-  const confidencePct = Math.round((doc.confidence?.overall ?? 0.85) * 100);
+  // No invented confidence: a reading without one used to show 85% (and each
+  // field 90%), which looked like a strong AI verdict nobody had produced.
+  const confidencePct = typeof doc.confidence?.overall === 'number' ? Math.round(doc.confidence.overall * 100) : null;
 
   // Rebased onto the API origin. See the comment at the preview surface.
   const previewUrl = fileUrl(doc.fileUrl);
@@ -146,7 +155,7 @@ export const AiDocumentVerificationModal: React.FC<AiDocumentVerificationModalPr
   const isFlagged = doc.status === 'needs_review' || doc.status === 'analyzed';
   const isExpired = doc.expiry?.status === 'expired';
   const isRejected = doc.status === 'rejected';
-  const canReview = !['approved', 'rejected', 'queued', 'analyzing', 'failed'].includes(doc.status);
+  const canReview = reviewable && !['approved', 'rejected', 'queued', 'analyzing', 'failed'].includes(doc.status);
 
   const handleApprove = async () => {
     try {
@@ -239,17 +248,23 @@ export const AiDocumentVerificationModal: React.FC<AiDocumentVerificationModalPr
             {/* AI Confidence Meter */}
             <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-800/80 border border-slate-700">
               <span className="text-xs text-slate-400 font-medium">{translatePortalText("AI Confidence:")}</span>
-              <div className="w-16 h-2 bg-slate-700 rounded-full overflow-hidden">
-                <div
-                  className={`h-full rounded-full ${
-                    confidencePct >= 85 ? 'bg-emerald-400' : confidencePct >= 65 ? 'bg-amber-400' : 'bg-rose-400'
-                  }`}
-                  style={{ width: `${confidencePct}%` }}
-                />
-              </div>
-              <span className={`text-xs font-bold ${confidencePct >= 85 ? 'text-emerald-400' : 'text-amber-400'}`}>
-                {formatPortalPercent(confidencePct)}
-              </span>
+              {confidencePct == null ? (
+                <span className="text-xs font-bold text-slate-400">—</span>
+              ) : (
+                <>
+                  <div className="w-16 h-2 bg-slate-700 rounded-full overflow-hidden">
+                    <div
+                      className={`h-full rounded-full ${
+                        confidencePct >= 85 ? 'bg-emerald-400' : confidencePct >= 65 ? 'bg-amber-400' : 'bg-rose-400'
+                      }`}
+                      style={{ width: `${confidencePct}%` }}
+                    />
+                  </div>
+                  <span className={`text-xs font-bold ${confidencePct >= 85 ? 'text-emerald-400' : 'text-amber-400'}`}>
+                    {formatPortalPercent(confidencePct)}
+                  </span>
+                </>
+              )}
             </div>
 
             <button
@@ -480,7 +495,7 @@ export const AiDocumentVerificationModal: React.FC<AiDocumentVerificationModalPr
                     <div className="space-y-2">
                       {doc.fields && doc.fields.length > 0 ? (
                         doc.fields.map((f, idx) => {
-                          const fieldConf = Math.round((f.confidence ?? 0.9) * 100);
+                          const fieldConf = typeof f.confidence === 'number' ? Math.round(f.confidence * 100) : null;
                           return (
                             <div
                               key={idx}
@@ -494,12 +509,12 @@ export const AiDocumentVerificationModal: React.FC<AiDocumentVerificationModalPr
                               </div>
                               <span
                                 className={`text-[11px] font-mono px-2 py-0.5 rounded-md shrink-0 ${
-                                  fieldConf >= 85
+                                  fieldConf != null && fieldConf >= 85
                                     ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
                                     : 'bg-amber-500/10 text-amber-400 border border-amber-500/20'
                                 }`}
                               >
-                                {fieldConf}%
+                                {fieldConf == null ? '—' : `${fieldConf}%`}
                               </span>
                             </div>
                           );

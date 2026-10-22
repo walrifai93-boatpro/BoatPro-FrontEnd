@@ -3,8 +3,8 @@ import { NavLink, useOutlet, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '../auth'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
-  LayoutDashboard, Fuel, Warehouse, BookMarked, Truck, Tags, Receipt,
-  MapPin, LifeBuoy, MessagesSquare, Bell, BarChart3, Settings, Search, Menu, X, Plus, Flame, LogOut, Droplets, CalendarDays, ShieldCheck,
+  LayoutDashboard, Fuel, Warehouse, BookMarked, ClipboardList, Tags, Receipt,
+  LifeBuoy, MessagesSquare, Bell, BarChart3, Settings, Search, Menu, X, Plus, Flame, LogOut, Droplets, CalendarDays, ShieldCheck,
   ChevronDown, Check,
   Star,
 } from 'lucide-react'
@@ -35,11 +35,12 @@ const NAV: { group: string; items: NavItem[] }[] = [
   { group: 'Overview', items: [
     { to: '/fuel', label: translatePortalText("Dashboard"), icon: LayoutDashboard },
     { to: '/fuel/calendar', label: translatePortalText("Fuel Calendar"), icon: CalendarDays, perm: 'calendar' },
-    { to: '/fuel/tracking', label: translatePortalText("Live Tracking"), icon: MapPin, perm: 'tracking' },
+    // No Live Tracking: fuel is served at the station only, so there is no
+    // barge or truck out on the water to follow.
   ]},
   { group: 'Operations', items: [
     { to: '/fuel/bookings', label: translatePortalText("Fuel Booking Request"), icon: BookMarked, badge: 'pendingOrders', perm: 'bookings' },
-    { to: '/fuel/deliveries', label: translatePortalText("Fuel Booking Management"), icon: Truck, badge: 'activeDeliveries', perm: 'deliveries' },
+    { to: '/fuel/deliveries', label: translatePortalText("Fuel Booking Management"), icon: ClipboardList, badge: 'openOrders', perm: 'deliveries' },
     { to: '/fuel/inventory', label: translatePortalText("Inventory & Tanks"), icon: Warehouse, badge: 'lowStock', perm: 'inventory' },
   ]},
   { group: 'Business', items: [
@@ -75,7 +76,7 @@ function visibleNav(access: ApiFuelAccess | null) {
 
 // Type helper so NAV's `badge` keys stay in step with the store's counters.
 function badgeKeys() {
-  return { pendingOrders: 0, activeDeliveries: 0, lowStock: 0, unread: 0, emergencies: 0 }
+  return { pendingOrders: 0, openOrders: 0, lowStock: 0, unread: 0, emergencies: 0 }
 }
 
 function Sidebar({ open, desktopOpen, onClose, onDesktopClose }: { open: boolean; desktopOpen: boolean; onClose: () => void; onDesktopClose: () => void }) {
@@ -264,8 +265,8 @@ function NotifDrawer({ open, onClose }: { open: boolean; onClose: () => void }) 
 function QuickDrawer({ open, onClose }: { open: boolean; onClose: () => void }) {
   const nav = useNavigate()
   const acts = [
-    { icon: '⛽', label: translatePortalText("New Fuel Order"), to: '/fuel/bookings' }, { icon: '🛳️', label: translatePortalText("Dispatch Barge"), to: '/fuel/deliveries' },
-    { icon: '🚚', label: translatePortalText("Dispatch Truck"), to: '/fuel/deliveries' }, { icon: '🧾', label: translatePortalText("Create Invoice"), to: '/fuel/billing' },
+    { icon: '⛽', label: translatePortalText("New Fuel Order"), to: '/fuel/bookings' }, { icon: '🗂️', label: translatePortalText("Manage Orders"), to: '/fuel/deliveries' },
+    { icon: '🗓️', label: translatePortalText("Fuel Calendar"), to: '/fuel/calendar' }, { icon: '🧾', label: translatePortalText("Create Invoice"), to: '/fuel/billing' },
     { icon: '🛢️', label: translatePortalText("Refill Tank"), to: '/fuel/inventory' }, { icon: '💲', label: translatePortalText("Update Prices"), to: '/fuel/pricing' },
     { icon: '🚨', label: translatePortalText("Emergency Order"), to: '/fuel/bookings' }, { icon: '📊', label: translatePortalText("View Reports"), to: '/fuel/reports' },
   ]
@@ -350,7 +351,7 @@ function GlobalSearch() {
           else if (e.key === 'ArrowUp') { e.preventDefault(); setActive(a => Math.max(a - 1, 0)) }
           else if (e.key === 'Enter' && hits[active]) { e.preventDefault(); go(hits[active]) }
         }}
-        placeholder={translatePortalText("Search orders, tanks, fleet…")}
+        placeholder={translatePortalText("Search orders, tanks, invoices…")}
         className="h-10 w-full rounded-full border border-slate-200/90 bg-slate-50/80 ps-9 pe-12 text-xs font-medium text-deep-900 placeholder:text-slate-400 transition-all hover:bg-white hover:border-slate-300 focus:bg-white focus:border-amber-500 focus:ring-2 focus:ring-amber-500/20 focus:outline-none" />
       <kbd className="pointer-events-none absolute end-3 top-1/2 -translate-y-1/2 rounded-md border border-slate-200 bg-white px-1.5 py-0.5 text-[9px] font-extrabold text-slate-400 shadow-2xs">{translatePortalText("⌘K")}</kbd>
       <AnimatePresence>

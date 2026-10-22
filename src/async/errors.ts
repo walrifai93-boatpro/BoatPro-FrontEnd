@@ -214,10 +214,17 @@ export function apiErrorFromResponse(status: number, body: any, opts?: { signIn?
   */
   const useServerMsg = !!serverMsg && kind !== 'server' && (kind !== 'auth' || (!!opts?.signIn && status === 401));
   const described = kind === 'validation' ? describeFieldErrors(body?.errors) : undefined;
+  /*
+    A 403 normally reads as a generic permission error. The exception is a
+    refusal the server marks as written for the user — today only an account
+    suspended by the BoatPro team (`errors.code: 'ACCOUNT_SUSPENDED'`), whose
+    holder needs to know why a payment is refused and who to contact.
+  */
+  const userFacing403 = status === 403 && !!serverMsg && body?.errors?.code === 'ACCOUNT_SUSPENDED';
   const message =
-    status === 403
+    status === 403 && !userFacing403
       ? "You don't have permission to do that."
-      : described ?? (useServerMsg ? serverMsg! : MESSAGES[kind]);
+      : described ?? (useServerMsg || userFacing403 ? serverMsg! : MESSAGES[kind]);
   return new ApiError(message, kind, status, body?.errors);
 }
 

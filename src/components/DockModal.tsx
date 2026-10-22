@@ -76,7 +76,9 @@ export default function DockModal({
   const [maxLength, setMaxLength] = useState<number | undefined>(12)
   const [maxBeam, setMaxBeam] = useState<number | undefined>(4.5)
   const [maxDraft, setMaxDraft] = useState<number | undefined>(2.5)
-  const [monthlyPrice, setMonthlyPrice] = useState<number | undefined>(1200)
+  // No invented tariff: a 1,200 default went live on every berth the operator
+  // did not stop to edit.
+  const [monthlyPrice, setMonthlyPrice] = useState<number | undefined>(undefined)
   const [water, setWater] = useState(true)
   const [wifi, setWifi] = useState(true)
   const [power, setPower] = useState('32A')
@@ -95,7 +97,7 @@ export default function DockModal({
       setMaxLength(12)
       setMaxBeam(4.5)
       setMaxDraft(2.5)
-      setMonthlyPrice(1200)
+      setMonthlyPrice(undefined)
       setWater(true)
       setWifi(true)
       setPower('32A')
@@ -138,6 +140,7 @@ export default function DockModal({
         .find(([v]) => v !== undefined && Number(v) <= 0)
       if (bad) { toast(translatePortalText(`${bad[1]} must be more than 0 m`), 'warn'); return }
       if (monthlyPrice !== undefined && monthlyPrice < 0) { toast(translatePortalText('Monthly price cannot be negative'), 'warn'); return }
+      if (generateBerths && !(monthlyPrice && monthlyPrice > 0)) { toast(translatePortalText('Set the monthly price for the new berths'), 'warn'); return }
     }
 
     const marinaId = marina?._id || marina?.id
@@ -166,11 +169,14 @@ export default function DockModal({
 
       // 2. If initial berths requested, generate them under the new pontoon
       if (generateBerths && berthCount > 0 && pontoonId) {
+        // As entered. These fell back to 12 / 4.5 / 2.5 m when the operator
+        // cleared a box, so "no limit" silently became a 12 m LOA limit that
+        // turned larger boats away from every berth on the dock.
         const specs = {
           category,
-          maxLength: maxLength || 12,
-          maxWidth: maxBeam || 4.5,
-          maxDepth: maxDraft || 2.5,
+          maxLength,
+          maxWidth: maxBeam,
+          maxDepth: maxDraft,
           powerSupply: power,
           hasWater: water,
           hasWifi: wifi,

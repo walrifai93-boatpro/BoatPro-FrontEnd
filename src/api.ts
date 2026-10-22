@@ -544,7 +544,41 @@ interface WorkerInviteAcceptResponse {
 }
 
 export const authApi = {
-  login: (email: string, password: string) => post<AuthResponse>('/auth/login', { email, password }),
+  /**
+   * Either a session, or — for an admin or support agent while the
+   * "Two-Factor Authentication" policy is on — `mfaRequired` with no tokens,
+   * finished by `loginMfa`. `devCode` is development-only.
+   */
+  login: (email: string, password: string) =>
+    post<
+      | AuthResponse
+      | { success: boolean; data: { mfaRequired: true; mfaToken: string; emailHint: string }; devCode?: string }
+    >('/auth/login', { email, password }),
+
+  /** Second step of a two-factor sign-in: the emailed 6-digit code. Answers like `login`. */
+  loginMfa: (mfaToken: string, code: string) => post<AuthResponse>('/auth/login/mfa', { mfaToken, code }),
+
+  /** Emails a fresh code for the same pending sign-in (60-second cooldown). */
+  resendLoginMfa: (mfaToken: string) =>
+    post<{ success: boolean; data: { emailHint: string; resendAvailableIn: number }; devCode?: string }>(
+      '/auth/login/mfa/resend',
+      { mfaToken },
+    ),
+
+  /** Public sign-in configuration; the portal reads the inactivity policy from it. */
+  methods: () =>
+    get<{ success: boolean; policies?: { sessionTimeout?: boolean; sessionIdleTimeoutMinutes?: number } }>(
+      '/auth/methods',
+      undefined,
+      { silent: true },
+    ),
+
+  /**
+   * Tells the server the operator is still here. The server measures idle time
+   * by requests, so someone typing a long form for half an hour must not come
+   * back to a refused session.
+   */
+  heartbeat: () => get<Ok<{ user: ApiUser }>>('/auth/me', undefined, { silent: true }),
 
   /** `emailOtpCode` — the 6-digit code from `sendSignupEmailOtp`; the API refuses email sign-up without it. */
   register: (data: { name: string; email: string; password: string; phone?: string; role: string; emailOtpCode?: string }) =>
@@ -593,6 +627,102 @@ export const maintWorkerInviteApi = {
 export const crewInviteApi = {
   verify: (token: string) => post<Ok<{ name: string; email: string }>>('/auth/crew-invite/verify', { token }),
   accept: (token: string, password: string) => post<WorkerInviteAcceptResponse>('/auth/crew-invite/accept', { token, password }),
+};
+
+/** Marina staff invites — the accept page signs them into the marina console. */
+export const marinaWorkerInviteApi = {
+  verify: (token: string) =>
+    post<Ok<{ name: string; email: string; marinaName?: string; role?: string }>>('/auth/marina-invite/verify', { token }),
+  accept: (token: string, password: string) => post<WorkerInviteAcceptResponse>('/auth/marina-invite/accept', { token, password }),
+};
+
+// ---------------------------------------------------------------------------
+// Marina staff (the marina console's team) — see backend staff.controller
+// ---------------------------------------------------------------------------
+export const MARINA_STAFF_PERMISSIONS = [
+  'manage_bookings',
+  'check_in',
+  'manage_slots',
+  'manage_pricing',
+  'manage_services',
+  'manage_fuel',
+  'view_reports',
+  'manage_staff',
+] as const;
+export type MarinaStaffPermission = (typeof MARINA_STAFF_PERMISSIONS)[number];
+export type MarinaStaffRole = 'manager' | 'fuel_staff' | 'dock_staff' | 'security' | 'reception';
+export type MarinaStaffStatus = 'invited' | 'pending_approval' | 'active' | 'disabled' | 'revoked' | 'removed';
+
+/** Who the signed-in account is at its marina — hydrates the console's nav and guards. */
+export interface ApiMarinaAccess {
+  isOwner: boolean;
+  kind: 'owner' | 'admin' | 'staff';
+  permissions: MarinaStaffPermission[];
+  marinaId: string;
+  marinaName: string;
+  staffId?: string;
+  role?: MarinaStaffRole;
+}
+
+export interface ApiMarinaTeamMember {
+  id: string;
+  marina: string;
+  name: string;
+  email?: string;
+  phone?: string;
+  avatar?: string;
+  role: MarinaStaffRole;
+  roleLabel: string;
+  title?: string;
+  permissions: MarinaStaffPermission[];
+  status: MarinaStaffStatus;
+  approvalStatus: 'pending' | 'approved' | 'rejected';
+  rejectionReason?: string;
+  isActive: boolean;
+  invitedAt?: string;
+  acceptedAt?: string;
+  inviteExpires?: string;
+  removedAt?: string;
+  userId?: string;
+  accountRole?: string;
+}
+
+/** What an invite/resend answers with — the link only comes back when the email did not go. */
+export interface MarinaInviteDelivery {
+  emailSent: boolean;
+  inviteUrl?: string;
+  devInviteToken?: string;
+}
+
+export const marinaStaffApi = {
+  list: (params?: { status?: MarinaStaffStatus | 'all'; marinaId?: string }) =>
+    get<
+      Ok<
+        Paginated<ApiMarinaTeamMember> & {
+          permissionKeys: MarinaStaffPermission[];
+          roleKeys: MarinaStaffRole[];
+          roleLabels: Record<MarinaStaffRole, string>;
+          grantable: MarinaStaffPermission[];
+          isOwner: boolean;
+          marinaId: string;
+        }
+      >
+    >('/staff', { limit: 100, ...(params ?? {}) }),
+  invite: (data: {
+    name: string;
+    email: string;
+    phone?: string;
+    role: MarinaStaffRole;
+    title?: string;
+    permissions: MarinaStaffPermission[];
+  }) => post<Ok<{ staff: ApiMarinaTeamMember } & MarinaInviteDelivery>>('/staff/invite', data),
+  resend: (id: string) => post<Ok<{ staff: ApiMarinaTeamMember } & MarinaInviteDelivery>>(`/staff/${id}/resend-invite`),
+  revoke: (id: string) => post<Ok<{ staff: ApiMarinaTeamMember }>>(`/staff/${id}/revoke-invite`),
+  update: (id: string, data: { role?: MarinaStaffRole; title?: string; phone?: string; permissions?: MarinaStaffPermission[] }) =>
+    patch<Ok<{ staff: ApiMarinaTeamMember }>>(`/staff/${id}`, data),
+  setStatus: (id: string, status: 'active' | 'disabled') =>
+    patch<Ok<{ staff: ApiMarinaTeamMember }>>(`/staff/${id}/status`, { status }),
+  remove: (id: string) => del<Ok<unknown>>(`/staff/${id}`),
 };
 
 export const profileApi = {
@@ -810,8 +940,9 @@ export const marinaApi = {
   createSlot: (pontoonId: string, data: Partial<ApiDockSlot> & { code: string }) =>
     post<Ok<{ slot: ApiDockSlot }>>(`/pontoons/${pontoonId}/slots`, data),
   updateSlot: (id: string, data: Partial<ApiDockSlot>) => patch<Ok<{ slot: ApiDockSlot }>>(`/slots/${id}`, data),
-  setSlotStatus: (id: string, status: SlotStatus, notes?: string) =>
-    patch<Ok<{ slot: ApiDockSlot }>>(`/slots/${id}/status`, { status, notes }),
+  /** `force`: confirmed by the operator — required to take a berth a lease holds out of service. */
+  setSlotStatus: (id: string, status: SlotStatus, notes?: string, force?: boolean) =>
+    patch<Ok<{ slot: ApiDockSlot }>>(`/slots/${id}/status`, { status, notes, ...(force ? { force: true } : {}) }),
   deleteSlot: (id: string) => del<Ok<unknown>>(`/slots/${id}`),
   uploadSlotImages: (id: string, files: File[]) => {
     const fd = new FormData();
@@ -920,6 +1051,15 @@ export interface ApiReservation {
   createdAt: string;
 }
 
+/** What cancelling this lease would refund, from the same rule the cancel endpoint applies. */
+export interface ApiRefundPreview {
+  paidSar: number
+  marinaCancel: { pct: number; amountSar: number }
+  boaterCancel: { pct: number; amountSar: number }
+  fullRefundWindowHours?: number
+  settlementBusinessDays?: string | number
+}
+
 export const reservationsApi = {
   list: (params?: { status?: string; search?: string; page?: number; limit?: number }) =>
     get<Ok<Paginated<ApiReservation> & { statusCounts: Record<string, number> }>>(
@@ -927,7 +1067,7 @@ export const reservationsApi = {
       params
     ),
 
-  one: (id: string) => get<Ok<{ subscription: ApiReservation; movements: ApiMovement[] }>>(`/dock-subscriptions/${id}`),
+  one: (id: string) => get<Ok<{ subscription: ApiReservation; movements: ApiMovement[]; refundPreview?: ApiRefundPreview }>>(`/dock-subscriptions/${id}`),
 
   /** A booking the marina keys in at the desk for an existing BoatPro account. */
   walkIn: (data: {
@@ -1132,6 +1272,8 @@ export interface ApiTrends {
 
 export interface ApiOverview {
   marina: ApiMarina;
+  /** True for a staff account without `view_reports`: the revenue figures are zeroed, not real. */
+  moneyHidden?: boolean;
   berths: Record<string, number>;
   occupancyRate: number;
   trends: ApiTrends;
@@ -1187,6 +1329,8 @@ export interface ApiBerthMapEntry {
     endDate: string;
     totalSar: number;
     subscriber: ApiSubscriber | string;
+    /** True once the boat has been checked in and not yet out — the server's word, not a guess. */
+    isAlongside?: boolean;
   } | null;
   workOrder: { _id: string; code: string; title: string; priority: string; status: string; dueDate?: string } | null;
 }
@@ -1435,6 +1579,8 @@ export interface ApiNotification {
 }
 
 export const portalApi = {
+  /** The caller's standing at their marina — owner (everything) or staff (their permissions). */
+  myAccess: () => get<Ok<ApiMarinaAccess>>('/marina-portal/my-access'),
   overview: (options?: ApiRequestOptions) => get<Ok<ApiOverview>>('/marina-portal/overview', undefined, options),
   berthMap: () =>
     get<
@@ -1471,7 +1617,8 @@ export const portalApi = {
     get<
       Ok<
         Paginated<ApiInvoice> & {
-          totals: { gross: number; commission: number; net: number; count: number };
+          /** `commission` is everything between gross and net; the split below comes from the server when it has it. */
+          totals: { gross: number; commission: number; net: number; count: number; platformCommission?: number; processingFees?: number; refundCardFees?: number; netAfterRefundFees?: number };
           outstanding: { items: ApiReservation[]; amount: number };
           currency: string;
         }
@@ -1519,7 +1666,7 @@ export const portalApi = {
 // Arrivals & departures
 // ---------------------------------------------------------------------------
 export const movementsApi = {
-  list: (params?: { date?: string; direction?: string; status?: string; from?: string; to?: string; limit?: number }) =>
+  list: (params?: { date?: string; direction?: string; status?: string; from?: string; to?: string; limit?: number; page?: number; sort?: string }) =>
     get<Ok<Paginated<ApiMovement>>>('/berth-movements', params),
   create: (data: {
     subscriptionId?: string;
@@ -1645,8 +1792,12 @@ export const servicesApi = {
     post<Ok<{ service: ApiMarinaService }>>(`/marina-services/manage/${marinaId}`, data),
   update: (id: string, data: Partial<ApiMarinaService>) => patch<Ok<{ service: ApiMarinaService }>>(`/marina-services/${id}`, data),
   remove: (id: string) => del<Ok<unknown>>(`/marina-services/${id}`),
-  setBookingStatus: (id: string, status: 'pending' | 'confirmed' | 'completed' | 'cancelled') =>
-    patch<Ok<{ booking: ApiServiceBooking }>>(`/marina-services/bookings/${id}/status`, { status }),
+  /** `reason` is required when declining (`cancelled`) — the boater is told it. */
+  setBookingStatus: (id: string, status: 'pending' | 'confirmed' | 'completed' | 'cancelled', reason?: string) =>
+    patch<Ok<{ booking: ApiServiceBooking }>>(`/marina-services/bookings/${id}/status`, reason ? { status, reason } : { status }),
+  /** A payment taken at the desk (cash, transfer, card machine) — the board could not complete unpaid requests. */
+  recordPayment: (id: string, method: 'cash' | 'bank_transfer' | 'mada' | 'visa' | 'mastercard') =>
+    post<Ok<{ booking: ApiServiceBooking }>>(`/marina-services/bookings/${id}/pay`, { method }),
 };
 
 // ---------------------------------------------------------------------------
@@ -2487,8 +2638,9 @@ export const onboardingApi = {
     longitude?: number;
     vhfChannel?: string;
   }) => post<Ok<{ user: ApiUser }>>('/onboarding/submit', data),
+  /** A 0-priced plan is activated by this call itself (`mode: 'free'`) — nothing to pay. */
   subscriptionCheckout: (packageId?: string, shopperResultUrl?: string, opts?: CheckoutGatewayChoice) =>
-    post<Ok<GatewayCheckoutData & { package: { id: string; name: string; price: number; durationMonths: number } }>>(
+    post<Ok<SubscriptionCheckoutData>>(
       '/onboarding/subscription-checkout',
       { packageId, shopperResultUrl, ...opts }
     ),
@@ -2819,7 +2971,8 @@ export interface AdminBoatApproval {
 export const adminApi = {
   listProviders: (params?: { role?: string; status?: string }) =>
     get<Ok<{ providers: AdminProvider[]; statusCounts: Record<string, number> }>>('/admin/providers', params),
-  approve: (id: string, options?: { forceBypassPayment?: boolean }) =>
+  // `expectedStatus`: the status the screen showed — the server answers 409 if it changed meanwhile.
+  approve: (id: string, options?: { forceBypassPayment?: boolean; expectedStatus?: string }) =>
     patch<Ok<{ user: AdminProvider }>>(`/admin/providers/${id}/approve`, options),
   getRegistration: (id: string) =>
     get<
@@ -2842,7 +2995,8 @@ export const adminApi = {
         documentChecklist?: ApiApplicantDocChecklist
       }>
     >(`/admin/providers/${id}/registration`),
-  reject: (id: string, reason: string) => patch<Ok<{ user: AdminProvider }>>(`/admin/providers/${id}/reject`, { reason }),
+  reject: (id: string, reason: string, expectedStatus?: string) =>
+    patch<Ok<{ user: AdminProvider }>>(`/admin/providers/${id}/reject`, { reason, expectedStatus }),
   suspend: (id: string) => patch<Ok<{ user: AdminProvider }>>(`/admin/providers/${id}/suspend`),
   sendSubscriptionReminder: (id: string, message?: string) =>
     post<Ok<{ recipient: string; title: string; body: string; status: string }>>(`/admin/providers/${id}/subscription-reminder`, { message }),
@@ -3363,6 +3517,8 @@ export interface AdminWorkerApproval {
   /** Where they work: a crew member's boats, a station, a marina. */
   location?: string;
   status: WorkerApprovalStatus;
+  /** Marina staff: where the membership is (an invite not yet accepted, waiting on approval…). */
+  stage?: 'invited' | 'pending_approval' | 'active' | 'disabled' | 'revoked' | 'removed';
   rejectionReason?: string;
   createdAt: string;
 }
@@ -3495,6 +3651,8 @@ export interface ApiDocRequirements {
   }[];
   rules: Record<DocumentedProviderType, DocRequirementRule>;
   defaults: Record<DocumentedProviderType, DocRequirementRule>;
+  /** Per provider type, documents the server never asks for whatever is saved (fuel: no identity document). */
+  neverAsked?: Partial<Record<DocumentedProviderType, string[]>>;
   /** Types the admin has saved; the rest are on the defaults. */
   customised: DocumentedProviderType[];
   /** Per document type: does a clean automated reading approve the upload without a person? */
@@ -3808,8 +3966,8 @@ export const adminPortalApi = {
   reviewWorker: (kind: AdminWorkerApproval['kind'], id: string, decision: 'approved' | 'rejected', reason?: string) =>
     patch<Ok<{ id: string; kind: string; status: WorkerApprovalStatus }>>(`/admin-portal/worker-approvals/${kind}/${id}`, { decision, reason }),
   // 100, the API's cap — without it the queue served its default of 20.
-  fuelStationApprovals: (approvalStatus?: string) =>
-    get<Ok<{ stations: any[]; total: number; statusCounts: Record<string, number> }>>('/admin-portal/fuel-station-approvals', { limit: 100, ...(approvalStatus ? { approvalStatus } : {}) }),
+  fuelStationApprovals: (approvalStatus?: string, page = 1) =>
+    get<Ok<{ stations: any[]; total: number; statusCounts: Record<string, number> }>>('/admin-portal/fuel-station-approvals', { limit: 100, page, ...(approvalStatus ? { approvalStatus } : {}) }),
   approveFuelStation: (id: string) => patch<Ok<{ station: any }>>(`/admin-portal/fuel-station-approvals/${id}/approve`),
   rejectFuelStation: (id: string, reason: string) => patch<Ok<{ station: any }>>(`/admin-portal/fuel-station-approvals/${id}/reject`, { reason }),
   marinaApprovals: (approvalStatus?: string) =>
@@ -3849,7 +4007,9 @@ export const adminPortalApi = {
     get<Ok<Paginated<ApiAdminEmergency> & { statusCounts: Record<string, number> }>>('/admin-portal/emergencies', params),
   // Admin resolves an SOS — hits the existing customer-emergency endpoint (not admin-portal-prefixed).
   resolveEmergency: (id: string) => patch<Ok<{ emergency: ApiAdminEmergency }>>(`/emergency/${id}/resolve`),
-  announce: (body: { title: string; body: string; titleAr?: string; bodyAr?: string; role?: string }) => post<Ok<{ recipients: number }>>('/admin-portal/announcements', body),
+  /** `role`: one role or several; `channels`: push is always sent, add 'email' to email it too. */
+  announce: (body: { title: string; body: string; titleAr?: string; bodyAr?: string; role?: string | string[]; channels?: Array<'push' | 'email'> }) =>
+    post<Ok<{ recipients: number }>>('/admin-portal/announcements', body),
   reports: () => get<Ok<any>>('/admin-portal/reports'),
   commissionRevenue: (params?: { role?: string }) => get<Ok<{ totals: ApiRevenueTotals; providers: ApiCommissionRevenueRow[] }>>('/admin-portal/revenue/commission', params),
   packageRevenue: (params?: { role?: string }) => get<Ok<ApiPackageRevenue>>('/admin-portal/revenue/packages', params),
@@ -3913,6 +4073,57 @@ export interface ApiFraudAlert {
 /** Admin-configured resource caps, keyed by the vocabulary in `packageLimitApi.limitKeys()`. `null` = unlimited. */
 export type PackageLimits = Record<string, number | null>;
 
+/**
+ * One introductory price step of a subscription package. Steps run back to back
+ * from a provider's first paid period; `periods` counts billing cycles of the
+ * package's `durationMonths` (so months, on a monthly package). After the last
+ * step the package's regular `price` applies.
+ */
+export interface SubscriptionPricingPhaseData {
+  periods: number;
+  /** What the step charges per period. The server resolves it for discount steps. */
+  price: number;
+  /**
+   * How the step was written: `percent` = `discountValue`% off the regular price,
+   * `amount` = `discountValue` SAR off it, absent/`price` = `price` as typed.
+   * Discount steps follow the regular price if it is edited later.
+   */
+  discountType?: 'percent' | 'amount' | 'price';
+  discountValue?: number;
+  label?: string;
+}
+
+/** One introductory step of a commission tier, in calendar months from the day the provider joined it. */
+export interface CommissionPricingPhaseData {
+  months: number;
+  /** For a percentage tier. The server resolves it for discount steps. */
+  commissionPercentage?: number;
+  /** For a fixed-fee tier. The server resolves it for discount steps. */
+  fixedAmountSar?: number;
+  /** `percent` = `discountValue`% off the tier's regular rate / fee; absent/`rate` = the figure as typed. */
+  discountType?: 'percent' | 'rate';
+  discountValue?: number;
+  label?: string;
+}
+
+/** A package's schedule, ready to print — built by the server so every screen words it the same way. */
+export interface PricingStepView {
+  /** 1-based introductory step, or `null` for the regular price that follows them. */
+  index: number | null;
+  fromMonth: number;
+  /** `null` = "and every month after". */
+  toMonth: number | null;
+  price?: number;
+  rate?: number;
+  fixedAmount?: number;
+  /** Set when the step was written as a discount on the regular price. */
+  discountType?: 'percent' | 'amount';
+  discountValue?: number;
+  label?: string;
+  /** e.g. "Months 2–4: SAR 250 / month (50% off)". */
+  text: string;
+}
+
 export interface SubscriptionPackageData {
   _id?: string;
   id?: string;
@@ -3923,6 +4134,10 @@ export interface SubscriptionPackageData {
   price: number;
   description?: string;
   limits?: PackageLimits;
+  /** Introductory pricing before `price`. Send `[]` to remove every step. */
+  pricingPhases?: SubscriptionPricingPhaseData[];
+  /** Read-only: the full schedule including the regular price, from the listing endpoint. */
+  schedule?: PricingStepView[];
   sortOrder?: number;
   isActive?: boolean;
   /** false = hidden — only selectable via a `PlanInvite` code. */
@@ -3942,11 +4157,187 @@ export interface CommissionPackageData {
   fixedAmountSar?: number;
   description?: string;
   limits?: PackageLimits;
+  /** Introductory steps before the tier's own rate. Send `[]` to remove every step. */
+  pricingPhases?: CommissionPricingPhaseData[];
+  /** Read-only: the full schedule including the regular rate, from the listing endpoint. */
+  schedule?: PricingStepView[];
   sortOrder?: number;
   isActive?: boolean;
   /** false = hidden — only selectable via a `PlanInvite` code. */
   isPublic?: boolean;
 }
+
+// ── Provider offers & plan control (admin) ──────────────────────────────────
+
+/**
+ * How an admin offer changes a provider's price.
+ * Subscription: `percent_off` (value = %), `amount_off` (SAR off each period), `fixed_price` (SAR per period).
+ * Commission: `percent_off` (value = % off the commission), `rate_override` (value = % per booking), `fee_override` (SAR per booking).
+ */
+export type OfferKind = 'percent_off' | 'amount_off' | 'fixed_price' | 'rate_override' | 'fee_override';
+export type OfferTarget = 'subscription' | 'commission';
+export type OfferStatus = 'active' | 'scheduled' | 'revoked' | 'expired' | 'used_up' | 'superseded';
+
+export const SUBSCRIPTION_OFFER_KINDS: OfferKind[] = ['percent_off', 'amount_off', 'fixed_price'];
+export const COMMISSION_OFFER_KINDS: OfferKind[] = ['percent_off', 'rate_override', 'fee_override'];
+
+/** An offer as the provider may see it. */
+export interface OfferView {
+  id: string;
+  appliesTo: OfferTarget;
+  kind: OfferKind;
+  value: number;
+  title: string;
+  startsAt?: string;
+  endsAt?: string;
+  maxCycles?: number;
+  usedCycles: number;
+  /** Periods still to be discounted on a capped subscription offer; `null` = uncapped. */
+  remainingCycles: number | null;
+  /** Effective status now — an `active` row past its end date reads `expired`. */
+  status: OfferStatus;
+  /** "50% off", "SAR 100 off", "SAR 250 per period", "5% commission", "SAR 3 per booking". */
+  summary: string;
+}
+
+/** An offer in the admin console — adds who it is for and the internal bookkeeping. */
+export interface AdminOfferData extends OfferView {
+  providerId: string;
+  providerName?: string;
+  businessName?: string;
+  providerType?: ProviderTypeKey;
+  /** Internal note, never shown to the provider. */
+  note?: string;
+  createdAt: string;
+  createdByName?: string;
+  revokedAt?: string;
+  revokeReason?: string;
+}
+
+export interface CreateOfferInput {
+  /** One or more providers; one offer row is created per provider. */
+  providerIds: string[];
+  appliesTo: OfferTarget;
+  kind: OfferKind;
+  value: number;
+  title: string;
+  note?: string;
+  /** ISO date; omitted = now. */
+  startsAt?: string;
+  /** ISO date; omitted = open-ended. */
+  endsAt?: string;
+  /** Subscription only: how many paid periods it discounts. */
+  maxCycles?: number;
+}
+
+/** What the next subscription period costs this provider, and why. */
+export interface SubscriptionQuoteData {
+  packageId: string;
+  packageName: string;
+  durationMonths: number;
+  currency: string;
+  regularPrice: number;
+  /** Which paid period of the package this is (1 = first). */
+  cycleNumber: number;
+  phase: { index: number; label?: string; firstPeriod: number; lastPeriod: number; price: number } | null;
+  /** Price before the provider's offer. */
+  listPrice: number;
+  offer: OfferView | null;
+  discount: number;
+  /** What will actually be charged. */
+  amount: number;
+}
+
+export interface CommissionFiguresData {
+  commissionType: 'percentage' | 'fixed';
+  rate: number;
+  fixedAmount: number;
+}
+
+/** The commission in force right now — the tier, stepped by its intro phase and the provider's offer. */
+export interface EffectiveCommissionData extends CommissionFiguresData {
+  regular: CommissionFiguresData;
+  monthNumber: number | null;
+  phase: { index: number; label?: string; fromMonth: number; toMonth: number } | null;
+  offer: { offerId: string; kind: OfferKind; value: number; title?: string; endsAt?: string } | null;
+}
+
+/**
+ * Why `nextRenewal` is not a plain renewal of the current package.
+ * - `scheduled_change`: another subscription package takes over on `effectiveAt`;
+ *   `nextRenewal` is quoted for that package (`packageName`). Renewing early is
+ *   refused until the change has taken effect.
+ * - `switching_to_commission`: the account moves to commission on `effectiveAt`;
+ *   there is no next renewal (`nextRenewal` is null).
+ * - `cancelling`: the provider cancelled; the plan ends on `effectiveAt` and
+ *   `nextRenewal` is null unless they reactivate.
+ */
+export interface RenewalNote {
+  reason: 'scheduled_change' | 'switching_to_commission' | 'cancelling';
+  effectiveAt?: string;
+  packageName?: string;
+}
+
+/** `pricing` on the provider's own dashboard: what their next period costs, the commission in force, their offers. */
+export interface ProviderPricingView {
+  subscription: { nextRenewal: SubscriptionQuoteData | null; schedule: PricingStepView[]; renewalNote?: RenewalNote | null } | null;
+  commission: { effective: EffectiveCommissionData; schedule: PricingStepView[] } | null;
+  offers: OfferView[];
+}
+
+/** Everything the admin needs to see and change about one provider's plan. */
+export interface ProviderBillingSnapshot {
+  provider: { id: string; name: string; email: string; businessName: string; providerType: ProviderTypeKey; status: string };
+  billingModel: 'subscription' | 'commission' | null;
+  planKind: PlanKind | null;
+  subscription: {
+    package: SubscriptionPackageData | null;
+    startedAt?: string | null;
+    expiry?: string | null;
+    /** From the server's subscription lifecycle (active / expiring / grace / expired …). */
+    lifecycleStatus?: string | null;
+    cancelAtPeriodEnd?: boolean;
+    /** Quoted for the package that will actually renew — see `RenewalNote`. */
+    nextRenewal: SubscriptionQuoteData | null;
+    renewalNote?: RenewalNote | null;
+    schedule: PricingStepView[];
+  } | null;
+  commission: {
+    package: CommissionPackageData | null;
+    effective: EffectiveCommissionData;
+    planStartedAt?: string | null;
+    schedule: PricingStepView[];
+  } | null;
+  scheduledChange: { billingModel?: 'subscription' | 'commission'; packageId?: string; packageName?: string; effectiveAt?: string } | null;
+  /** Every offer for this provider, newest first, ended ones included. */
+  offers: AdminOfferData[];
+  /** Most recent plan changes. */
+  history: PackageHistoryEntry[];
+  /** Active packages for this provider's type, hidden ones included. */
+  availablePackages: { subscription: SubscriptionPackageData[]; commission: CommissionPackageData[] };
+}
+
+export interface ChangeProviderPlanInput {
+  billingModel: 'subscription' | 'commission';
+  packageId: string;
+  /** `period_end` is only valid while the provider has an unexpired subscription. */
+  when: 'now' | 'period_end';
+  /**
+   * Subscription target, when the provider has no unexpired subscription to keep:
+   * `complimentary` grants the first period free (recorded at SAR 0),
+   * `require_payment` makes the provider pay before the plan is live.
+   * Ignored (the current expiry is kept) when they are already mid-period.
+   */
+  firstPeriod?: 'complimentary' | 'require_payment';
+  /** Commission target: restart the tier's introductory steps from today (default true). */
+  restartIntro?: boolean;
+  /** Recorded on the plan history and audit log. */
+  note?: string;
+  /** Default true. */
+  notifyProvider?: boolean;
+}
+
+/** A provider row in the monetization overview. */
 
 export type ProviderTypeKey = 'boat_provider' | 'marina_provider' | 'fuel_provider' | 'maintenance_provider';
 
@@ -3971,6 +4362,10 @@ export interface MonetizationProvider {
   /** The flat cut per transaction on a fixed-fee plan; 0 otherwise. */
   commissionFixedAmount?: number;
   walletBalance: number;
+  /** Live and upcoming admin offers for this provider. */
+  offers?: OfferView[];
+  /** Commission provider: the terms in force today (intro step / offer applied). `null` for subscribers. */
+  effectiveCommission?: EffectiveCommissionData | null;
 }
 
 export interface MonetizationStats {
@@ -4115,7 +4510,7 @@ export interface ModelChangeRequest {
   toModel: 'subscription' | 'commission';
   requestedPackageId?: string;
   reason?: string;
-  status: 'pending' | 'approved' | 'rejected' | 'cancelled';
+  status: 'pending' | 'approved' | 'rejected' | 'cancelled' | 'completed';
   rejectionReason?: string;
   reviewedAt?: string;
   createdAt: string;
@@ -4367,8 +4762,10 @@ export const monetizationApi = {
   overview: (params?: Record<string, string | number | boolean | undefined>) =>
     get<Ok<{ stats: MonetizationStats; providers: MonetizationProvider[] }>>('/monetization/overview', params),
   /** The signed-in provider's own subscription/commission dashboard (plan, usage-adjacent revenue, renewal/payout history). */
-  providerDashboard: () => get<Ok<Record<string, any>>>('/monetization/provider-dashboard'),
-  renewSubscription: (providerId: string, durationMonths = 1, packageId?: string) => post<Ok<any>>('/monetization/renew-subscription', { providerId, durationMonths, packageId }),
+  providerDashboard: () => get<Ok<Record<string, any> & { pricing?: ProviderPricingView }>>('/monetization/provider-dashboard'),
+  /** `paymentReference` set → recorded as paid revenue; blank → a complimentary extension (SAR 0). */
+  renewSubscription: (providerId: string, durationMonths = 1, packageId?: string, paymentReference?: string) =>
+    post<Ok<any>>('/monetization/renew-subscription', { providerId, durationMonths, packageId, paymentReference }),
   suspendExpired: () => post<Ok<{ suspendedCount: number }>>('/monetization/suspend-expired'),
   /**
    * One week's payouts, built on demand.
@@ -4425,9 +4822,9 @@ export const monetizationApi = {
   /** The resolved payout account — own, or admin `?providerId=`. IBAN comes back masked. */
   payoutBank: (providerId?: string) => get<Ok<PayoutBankView>>('/monetization/payout-bank', { providerId }),
   setPayoutBank: (data: PayoutBankInput) => put<Ok<{ bank: PayoutBankView['bank'] }>>('/monetization/payout-bank', data),
-  /** Self-serve platform subscription (re)payment — prepares a HyperPay checkout. */
+  /** Self-serve platform subscription (re)payment — prepares a HyperPay checkout, or renews a free plan outright. */
   subscriptionCheckout: (packageId?: string, opts?: CheckoutGatewayChoice) =>
-    post<Ok<GatewayCheckoutData & { package: { id: string; name: string; price: number; durationMonths: number } }>>(
+    post<Ok<SubscriptionCheckoutData>>(
       '/monetization/subscription/checkout',
       { packageId, ...opts }
     ),
@@ -4472,6 +4869,30 @@ export const monetizationApi = {
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   },
+};
+
+/**
+ * Admin control over one provider's plan: see what they are on and what they
+ * will pay, move them to another package or billing model, and give them
+ * discounts and offers.
+ */
+export const providerBillingApi = {
+  /** The provider's plan, effective price/rate, schedule, offers, history and the packages they can be moved to. */
+  get: (providerId: string) =>
+    get<Ok<ProviderBillingSnapshot>>(`/monetization/admin/providers/${providerId}/billing`),
+  /** Move the provider to another package / billing model, now or at the end of their period. */
+  changePlan: (providerId: string, data: ChangeProviderPlanInput) =>
+    post<Ok<{ applied: boolean; effectiveAt: string; billing: ProviderBillingSnapshot }>>(`/monetization/admin/providers/${providerId}/plan`, data),
+  /** Drop a plan change that was queued for the end of the period. */
+  cancelScheduledChange: (providerId: string) =>
+    post<Ok<{ billing: ProviderBillingSnapshot }>>(`/monetization/admin/providers/${providerId}/plan/cancel-scheduled`),
+  listOffers: (params?: { providerId?: string; status?: OfferStatus | 'all'; appliesTo?: OfferTarget; providerType?: ProviderTypeKey }) =>
+    get<Ok<{ offers: AdminOfferData[] }>>('/monetization/admin/offers', params),
+  /** One offer per provider in `providerIds`. A provider's previous live offer on the same bill is superseded. */
+  createOffers: (data: CreateOfferInput) =>
+    post<Ok<{ offers: AdminOfferData[] }>>('/monetization/admin/offers', data),
+  revokeOffer: (id: string, reason?: string) =>
+    patch<Ok<{ offer: AdminOfferData }>>(`/monetization/admin/offers/${id}/revoke`, { reason }),
 };
 
 // ---------------------------------------------------------------------------
@@ -4548,6 +4969,8 @@ export interface PlanSummary {
   durationMonths?: number
   label: string
   currency: string
+  /** The plan's intro steps and regular price, when the server sends them. */
+  schedule?: PricingStepView[]
 }
 
 export interface PlanInviteData {
@@ -4655,6 +5078,35 @@ export interface GatewayCheckoutData {
   currency: string
   tamaraUnavailable?: string | null
 }
+
+/** The plan a subscription checkout was opened (or activated) for. */
+export interface SubscriptionCheckoutPackage {
+  id: string;
+  name: string;
+  /** What this checkout charges — the intro step and any offer already applied. */
+  price: number;
+  durationMonths: number;
+  /** The package's catalogue price, when it differs from `price`. */
+  regularPrice?: number;
+  /** How `price` was reached. */
+  quote?: SubscriptionQuoteData;
+}
+
+/**
+ * What a subscription checkout answers with. A plan priced at 0 comes back as
+ * `mode: 'free'`: the server has already activated it, so there is no checkout
+ * id and nothing to open — check for it before reading `checkoutId`.
+ */
+export type SubscriptionCheckoutData =
+  | (GatewayCheckoutData & { package: SubscriptionCheckoutPackage })
+  | {
+      mode: 'free'
+      activated: true
+      amount: 0
+      currency: string
+      subscriptionExpiry: string
+      package: SubscriptionCheckoutPackage
+    }
 
 export interface BillingSettingsData {
   allowImmediateModelSwitch: boolean;

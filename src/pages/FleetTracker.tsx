@@ -4,19 +4,65 @@ import { Radar, Ship, Navigation, Gauge, MapPin, Maximize2, Minimize2 } from 'lu
 import { PageHeader, Badge, Img, toast, Modal, LoadingState, ErrorState, EmptyState } from '../ui'
 import { FleetMap, Fleet3DMap, MapModeToggle, type MapPoint } from '../fuel/fuelUi'
 import { boatPhoto } from '../images'
-import { useAsync, useMarina, berthLabel, fmtDate, fmtTime, formatMoney, humanize, personOf, todayIso } from '../live'
+import { useAsync, useMarina, berthLabel, fmtDate, formatMoney, humanize, personOf } from '../live'
 import { chatApi, idOf, movementsApi, portalApi, fileUrl, type ApiBerthMapEntry, type ApiMovement } from '../api'
-import { formatPortalNumber, translatePortalText } from '../i18n/runtime'
+import { onSocket } from '../socket'
+import { formatPortalDate, formatPortalNumber, translatePortalText } from '../i18n/runtime'
 
 
 /**
  * Live Fleet Map — every vessel the marina knows about, positioned from what the
  * harbour actually knows: berth check-ins put a boat at the marina, and a
  * skipper's reported ETA/distance puts an approaching boat offshore. There is no
- * AIS feed, so nothing is plotted that the marina hasn't been told.
+ * AIS feed, so nothing is plotted that the marina hasn't been told — and what is
+ * plotted is approximate: a checked-in boat is drawn somewhere in the marina, an
+ * inbound one at its reported distance on an arbitrary bearing. The detail panel
+ * says so rather than printing those points as four-decimal coordinates.
  */
 
 type LiveStatus = 'Docked' | 'Anchored' | 'Approaching' | 'Underway'
+
+/**
+ * Arrival times are Riyadh time. `fmtTime` formats in the browser's zone, so an
+ * operator travelling (or a laptop left on UTC) read every ETA hours off.
+ */
+const MARINA_TZ = 'Asia/Riyadh'
+/** `YYYY-MM-DD` in the marina's day. */
+const marinaDay = (value: string | Date = new Date()) => {
+  const d = value instanceof Date ? value : new Date(value)
+  return isNaN(d.getTime()) ? '' : new Intl.DateTimeFormat('en-CA', { timeZone: MARINA_TZ }).format(d)
+}
+const marinaTime = (value?: string | null) =>
+  value ? formatPortalDate(value, { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: MARINA_TZ }) : '—'
+
+type MovementQuery = Parameters<typeof movementsApi.list>[0]
+
+/**
+ * Every page of a movements query.
+ *
+ * This page used to ask for `date: 'all', limit: 100` — but the server sorts
+ * movements oldest-first and caps a page at 100, so once a marina had logged a
+ * hundred movements the map was drawn from the *first* hundred it ever had:
+ * today's inbound boats and today's departures simply were not in the answer.
+ */
+async function listAllMovements(params: MovementQuery, maxPages = 10) {
+  const items: ApiMovement[] = []
+  let total = 0
+  for (let page = 1; page <= maxPages; page++) {
+    const query = { ...params, limit: 100, page }
+    const res = await movementsApi.list(query)
+    const batch = res.data.items ?? []
+    items.push(...batch)
+    total = res.data.pagination?.total ?? items.length
+    if (!batch.length || items.length >= total) break
+  }
+  return { items, truncated: items.length < total }
+}
+
+/** What the chips call each state — "Anchored" read as a boat lying at anchor. */
+const STATUS_LABEL: Record<LiveStatus, string> = {
+  Docked: 'Docked', Anchored: 'Berth held', Approaching: 'Approaching', Underway: 'Underway',
+}
 
 const STATUS_TONE: Record<LiveStatus, MapPoint['tone']> = {
   Docked: 'idle', Anchored: 'idle', Underway: 'active', Approaching: 'active',
@@ -96,11 +142,20 @@ export interface LiveBoat {
 export default function FleetTracker() {
   const { marina, currency } = useMarina()
   const berthState = useAsync(() => portalApi.berthMap().then(r => r.data), [])
-  const moveState = useAsync(() => movementsApi.list({ date: 'all', limit: 100 }).then(r => r.data), [])
+  // Two targeted reads rather than "everything": boats still to arrive (any
+  // date — the filter below keeps today's and those under way), and the last
+  // month's check-outs, of which today's are listed as having cleared out.
+  const moveState = useAsync(async () => {
+    const since = new Date(Date.now() - 30 * 86_400_000).toISOString()
+    const [inbound, cleared] = await Promise.all([
+      listAllMovements({ date: 'all', direction: 'arrival', status: 'expected,en_route' }),
+      listAllMovements({ direction: 'departure', status: 'checked_out', from: since }),
+    ])
+    return { items: [...inbound.items, ...cleared.items], truncated: inbound.truncated || cleared.truncated }
+  }, [])
 
   const [filter, setFilter] = useState<'All' | LiveStatus>('All')
   const [selId, setSelId] = useState<string | null>(null)
-  const [ago, setAgo] = useState(3)
   const [hailing, setHailing] = useState(false)
   const [vhf, setVhf] = useState('16')
   const [hailMsg, setHailMsg] = useState('')
@@ -109,16 +164,34 @@ export default function FleetTracker() {
   const [isFull, setIsFull] = useState(false)
   const [mapMode, setMapMode] = useState<'2d' | '3d'>('2d')
 
-  // Refresh countdown for the LIVE chip.
+  /**
+   * The LIVE chip reports the real age of the data.
+   *
+   * It used to count 1→59 on its own timer and reset to "1s ago" whenever the
+   * minute came round — whether or not the refetch had succeeded — so a map
+   * that had lost the server kept insisting it was fresh. It now moves only
+   * when both reads actually come back, and says so when they don't.
+   */
+  const [lastSync, setLastSync] = useState(() => Date.now())
+  const [ago, setAgo] = useState(0)
+  const [syncFailed, setSyncFailed] = useState(false)
   useEffect(() => {
-    const t = setInterval(() => setAgo(a => (a >= 59 ? 1 : a + 1)), 1000)
-    return () => clearInterval(t)
-  }, [])
-  useEffect(() => {
-    const t = setInterval(() => { void berthState.reload(); void moveState.reload(); setAgo(1) }, 60_000)
-    return () => clearInterval(t)
+    const refreshAll = async () => {
+      // `silent`: a background poll never blanks the map the operator is reading.
+      const [b, m] = await Promise.all([berthState.reload({ silent: true }), moveState.reload({ silent: true })])
+      if (b && m) { setLastSync(Date.now()); setSyncFailed(false) } else setSyncFailed(true)
+    }
+    const t = setInterval(() => void refreshAll(), 60_000)
+    // Check-ins, check-outs and "en route" reports land as they happen
+    // (owner account), instead of on the next minute.
+    const off = onSocket('movement:updated', () => void refreshAll())
+    return () => { clearInterval(t); off() }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+  useEffect(() => {
+    const t = setInterval(() => setAgo(Math.round((Date.now() - lastSync) / 1000)), 1000)
+    return () => clearInterval(t)
+  }, [lastSync])
 
   /**
    * The harbour every position on this map is measured from.
@@ -146,19 +219,24 @@ export default function FleetTracker() {
   const fleet = useMemo<LiveBoat[]>(() => {
     const berths: ApiBerthMapEntry[] = berthState.data?.berths ?? []
     const movements: ApiMovement[] = moveState.data?.items ?? []
-    // Local, not UTC: at +3 the UTC date is yesterday until 03:00, which made
-    // the early shift's departures vanish from the map.
-    const today = todayIso()
+    // The marina's day, not UTC's and not the browser's: at +3 the UTC date is
+    // yesterday until 03:00, which made the early shift's departures vanish.
+    const today = marinaDay()
 
     const byBoat = new Map<string, LiveBoat>()
 
-    // 1. Boats holding a berth — they are at the marina.
+    // 1. Boats holding a berth.
     for (const berth of berths) {
       const r = berth.reservation
       if (!r) continue
-      const checkedIn = movements.some(
-        m => m.direction === 'arrival' && m.status === 'checked_in' && (typeof m.subscription === 'object' ? m.subscription?.id : m.subscription) === r.id,
-      )
+      // The berth map also carries requests the marina has not accepted and
+      // leases still waiting on payment. Neither is a boat the harbour expects
+      // yet, and both used to be drawn inside the marina as "Anchored".
+      if (r.status !== 'active') continue
+      // Alongside *now*, as the server works it out from every movement of the
+      // stay — not "has a checked-in arrival somewhere in the list", which kept
+      // a boat that had since checked out showing as docked.
+      const checkedIn = (r as { isAlongside?: boolean }).isAlongside === true
       const rand = mulberry32(hash(r.id))
       const owner = personOf(r.subscriber)
       byBoat.set(r.boatName + r.plate, {
@@ -168,9 +246,11 @@ export default function FleetTracker() {
         type: r.boatType,
         lengthFt: r.lengthFt,
         live: checkedIn ? 'Docked' : 'Anchored',
-        // Scattered a few metres along the pontoons — they really are here.
-        lat: MARINA.lat + (rand() - 0.5) * 0.004,
-        lng: MARINA.lng + (rand() - 0.5) * 0.004,
+        // A checked-in boat is drawn a few metres off the marina's pin — it is
+        // here, but which spot on the chart is decoration. A boat that has not
+        // arrived has no position at all.
+        lat: checkedIn ? MARINA.lat + (rand() - 0.5) * 0.004 : null,
+        lng: checkedIn ? MARINA.lng + (rand() - 0.5) * 0.004 : null,
         distanceNm: null,
         berth: berthLabel(berth.pontoon, berth.number),
         endDate: r.endDate,
@@ -184,7 +264,10 @@ export default function FleetTracker() {
     // 2. Inbound boats — placed at the distance the skipper reported.
     for (const m of movements) {
       if (m.direction !== 'arrival') continue
-      if (m.status !== 'expected' && m.status !== 'en_route') continue
+      // Under way, or expected today. An arrival booked for next month is not
+      // "approaching", and one from last week that never came is a no-show.
+      const inbound = m.status === 'en_route' || (m.status === 'expected' && marinaDay(m.scheduledAt) === today)
+      if (!inbound) continue
       const key = m.boatName + (m.plate ?? '')
       const rand = mulberry32(hash(m.id))
       const bearing = rand() * Math.PI * 2
@@ -197,8 +280,10 @@ export default function FleetTracker() {
         type: typeof m.subscription === 'object' ? m.subscription?.boatType ?? '' : '',
         lengthFt: 0,
         live: 'Approaching',
-        lat: nm > 0 ? MARINA.lat + Math.cos(bearing) * nm * NM_IN_DEG : MARINA.lat + 0.01,
-        lng: nm > 0 ? MARINA.lng + Math.sin(bearing) * nm * NM_IN_DEG : MARINA.lng + 0.012,
+        // No reported distance, no position: this used to park the boat at a
+        // fixed point ~1 km out, which read as a fix nobody had.
+        lat: nm > 0 ? MARINA.lat + Math.cos(bearing) * nm * NM_IN_DEG : null,
+        lng: nm > 0 ? MARINA.lng + Math.sin(bearing) * nm * NM_IN_DEG : null,
         distanceNm: m.distanceNm ?? null,
         berth: m.pontoon ? berthLabel(m.pontoon, m.slot) : null,
         endDate: null,
@@ -212,7 +297,7 @@ export default function FleetTracker() {
     // 3. Boats that cleared out today — listed, but no position is known.
     for (const m of movements) {
       if (m.direction !== 'departure' || m.status !== 'checked_out') continue
-      if (!m.actualAt || m.actualAt.slice(0, 10) !== today) continue
+      if (!m.actualAt || marinaDay(m.actualAt) !== today) continue
       const key = m.boatName + (m.plate ?? '')
       if (byBoat.has(key)) continue
       const owner = personOf(m.boater)
@@ -231,7 +316,7 @@ export default function FleetTracker() {
         totalSar: null,
         owner: owner ?? null,
         eta: null,
-        note: fmtTime(m.actualAt),
+        note: marinaTime(m.actualAt),
       })
     }
 
@@ -262,7 +347,7 @@ export default function FleetTracker() {
 
   /** Sends the hail as a real chat message to the boat's owner. */
   const transmit = async () => {
-    const ownerId = sel?.owner?._id || (sel?.owner as any)?.id
+    const ownerId = sel?.owner ? idOf(sel.owner) : ''
     if (!ownerId) { toast(translatePortalText('No BoatPro account on file for this vessel'), 'warn'); return }
     if (!hailMsg.trim()) { toast(translatePortalText('Write the hailing message'), 'warn'); return }
     setSending(true)
@@ -300,8 +385,21 @@ export default function FleetTracker() {
     <div className="space-y-4">
       {!isFull && (
         <PageHeader title={translatePortalText("Live Fleet Map")} icon={<Radar className="text-ocean-500" />}
-          sub="Every vessel the harbour knows about — docked, holding a berth, inbound or cleared out. Positions come from berth check-ins and skippers' reported ETAs. Click any point to inspect the vessel."
-              actions={<span className="chip bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200"><span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse-soft" /> {translatePortalText("LIVE · refreshed ")}{translatePortalText(`${ago}s ago`)}</span>} />
+          sub="Every vessel the harbour knows about — docked, holding a berth, inbound or cleared out. Positions are approximate: they come from berth check-ins and skippers' reported distances, not GPS or AIS. Click any point to inspect the vessel."
+              actions={syncFailed ? (
+                <span className="chip bg-amber-50 text-amber-700 ring-1 ring-amber-200">{translatePortalText("Refresh failed — data from")} {translatePortalText(`${ago}s ago`)}</span>
+              ) : (
+                <span className="chip bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200"><span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse-soft" /> {translatePortalText("LIVE · refreshed ")}{translatePortalText(ago < 5 ? 'just now' : `${ago}s ago`)}</span>
+              )} />
+      )}
+
+      {/* The berth map alone still draws; say what is missing rather than
+          showing a fleet with no inbound or departed boats as if complete. */}
+      {!isFull && moveState.error && (
+        <div className="rounded-2xl bg-amber-50 px-4 py-3 text-[13px] text-amber-800 ring-1 ring-amber-200">
+          {translatePortalText("Arrivals and departures could not be loaded — only boats holding a berth are shown.")}{' '}
+          <button className="font-bold underline underline-offset-2" onClick={() => void moveState.reload()}>{translatePortalText("Retry")}</button>
+        </div>
       )}
 
       {/* ── Full Screen Map Container ── */}
@@ -313,7 +411,7 @@ export default function FleetTracker() {
             <button onClick={() => setFilter('All')} className={`chip transition ${filter === 'All' ? 'bg-deep-900 text-white' : 'bg-white ring-1 ring-slate-200 text-slate-600 hover:ring-ocean-300'}`}>{translatePortalText("All · ")}{formatPortalNumber(fleet.length)}</button>
             {(Object.keys(counts) as LiveStatus[]).map(s => (
               <button key={s} onClick={() => setFilter(s)} title={translatePortalText(STATUS_HINT[s])} className={`chip transition ${filter === s ? 'bg-deep-900 text-white' : 'bg-white ring-1 ring-slate-200 text-slate-600 hover:ring-ocean-300'}`}>
-                <span className="h-2.5 w-2.5 rounded-full" style={{ background: STATUS_COLOR[s] }} /> {translatePortalText(s)} · {formatPortalNumber(counts[s])}
+                <span className="h-2.5 w-2.5 rounded-full" style={{ background: STATUS_COLOR[s] }} /> {translatePortalText(STATUS_LABEL[s])} · {formatPortalNumber(counts[s])}
               </button>
             ))}
           </div>
@@ -378,7 +476,7 @@ export default function FleetTracker() {
             <div className="relative overflow-hidden rounded-2xl">
               <Img src={boatPhoto(sel.name)} className="h-48 w-full object-cover" />
               <div className="absolute top-3 end-3">
-                <Badge dot={sel.live === 'Underway' || sel.live === 'Approaching'}>{sel.live}</Badge>
+                <Badge dot={sel.live === 'Underway' || sel.live === 'Approaching'}>{translatePortalText(STATUS_LABEL[sel.live])}</Badge>
               </div>
             </div>
 
@@ -414,10 +512,14 @@ export default function FleetTracker() {
 
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
               {[
-                ['Distance', sel.distanceNm != null ? `${formatPortalNumber(sel.distanceNm)} ${translatePortalText('nm')}` : sel.lat != null ? translatePortalText('Alongside') : '—', <Gauge size={14} key="g" />],
-                ['ETA', sel.eta ? fmtTime(sel.eta) : '—', <Navigation size={14} key="n" />],
-                ['Latitude', sel.lat != null ? formatPortalNumber(sel.lat, { minimumFractionDigits: 4, maximumFractionDigits: 4 }) : '—', <MapPin size={14} key="la" />],
-                ['Longitude', sel.lng != null ? formatPortalNumber(sel.lng, { minimumFractionDigits: 4, maximumFractionDigits: 4 }) : '—', <MapPin size={14} key="lo" />],
+                // "Alongside" only for a boat that is — a held berth whose boat
+                // has not arrived used to read "Alongside" too.
+                ['Distance', sel.distanceNm != null ? `${formatPortalNumber(sel.distanceNm)} ${translatePortalText('nm')}` : sel.live === 'Docked' ? translatePortalText('Alongside') : '—', <Gauge size={14} key="g" />],
+                // Riyadh time, with the date when it is not today.
+                ['ETA', sel.eta ? (marinaDay(sel.eta) === marinaDay() ? marinaTime(sel.eta) : `${fmtDate(sel.eta)} ${marinaTime(sel.eta)}`) : '—', <Navigation size={14} key="n" />],
+                // "≈": these are where the chart drew the boat, not a fix.
+                ['Latitude', sel.lat != null ? `≈ ${formatPortalNumber(sel.lat, { minimumFractionDigits: 3, maximumFractionDigits: 3 })}` : '—', <MapPin size={14} key="la" />],
+                ['Longitude', sel.lng != null ? `≈ ${formatPortalNumber(sel.lng, { minimumFractionDigits: 3, maximumFractionDigits: 3 })}` : '—', <MapPin size={14} key="lo" />],
               ].map(([l, v, ic]) => (
                 <div key={l as string} className="rounded-xl border border-slate-100 bg-white p-3 text-center shadow-sm">
                   <p className="flex items-center justify-center gap-1 text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-1">{ic}{translatePortalText(String(l))}</p>
@@ -426,9 +528,18 @@ export default function FleetTracker() {
               ))}
             </div>
 
-            {sel.lat == null && (
+            {sel.lat == null ? (
               <p className="rounded-xl bg-slate-50 px-3 py-2 text-[11px] text-slate-500">
-                {translatePortalText("The marina has no position for this vessel — it is listed from its departure record.\r\n              ")}</p>
+                {translatePortalText(
+                  sel.live === 'Underway'
+                    ? 'The marina has no position for this vessel — it is listed from its departure record.'
+                    : sel.live === 'Anchored'
+                      ? 'This boat holds a berth but has not checked in, so it is not drawn on the map.'
+                      : 'No distance has been reported for this boat, so it is not drawn on the map.',
+                )}</p>
+            ) : (
+              <p className="rounded-xl bg-slate-50 px-3 py-2 text-[11px] text-slate-500">
+                {translatePortalText("Approximate position — BoatPro has no GPS or AIS feed. Checked-in boats are drawn at the marina; inbound boats at the distance the skipper reported, on an arbitrary bearing.")}</p>
             )}
 
             <div className="flex gap-2 pt-2">

@@ -38,13 +38,36 @@ export function AdminRisk() {
   const setTab = (t: Tab) => setParams(t === 'flags' ? {} : { tab: t }, { replace: true })
 
   const [counts, setCounts] = useState<ContentFlagCounts | null>(null)
-  const [providers, setProviders] = useState<{ rows: ProviderBalanceRow[]; thresholds: Record<string, number> } | null>(null)
+  /**
+   * The two provider tiles, counted on their own. They used to be filtered out
+   * of whatever rows Provider scores last loaded — the first 100, and only
+   * those above the score filter the admin had picked on that tab — so raising
+   * the filter to 75 quietly changed "Cash withdrawn" too.
+   */
+  const [providerTiles, setProviderTiles] = useState<{ aboveReview: number; cashBlocked: number; cashBlockedPartial: boolean } | null>(null)
+  const [tileError, setTileError] = useState(false)
   const [sweeping, setSweeping] = useState(false)
+  /** Bumped to remount the open tab so it re-reads. */
+  const [reloadKey, setReloadKey] = useState(0)
 
   // Tile numbers for whichever tab opens first; the tabs keep them fresh after.
   const refreshTiles = () => {
-    riskApi.flags({ limit: 1 }).then(r => setCounts(r.data.counts)).catch(() => {})
-    riskApi.queue({ limit: 100 }).then(r => setProviders({ rows: r.data.items, thresholds: r.data.thresholds ?? {} })).catch(() => {})
+    setTileError(false)
+    riskApi.flags({ limit: 1 }).then(r => setCounts(r.data.counts)).catch(() => setTileError(true))
+    ;(async () => {
+      // The queue lists providers at or above `minScore`, highest first. Its
+      // `pagination.total` is the exact count above the review line; cash
+      // withdrawal has no server filter, so it is counted from the top 100 of
+      // everyone scored and marked as partial when there are more.
+      const all = await riskApi.queue({ minScore: 0, limit: 100 })
+      const review = all.data.thresholds?.REVIEW ?? 75
+      const above = await riskApi.queue({ minScore: review, limit: 1 })
+      setProviderTiles({
+        aboveReview: above.data.pagination?.total ?? 0,
+        cashBlocked: all.data.items.filter((r: ProviderBalanceRow) => r.enforcement?.cashBlocked).length,
+        cashBlockedPartial: (all.data.pagination?.total ?? 0) > all.data.items.length,
+      })
+    })().catch(() => setTileError(true))
   }
   useEffect(refreshTiles, [])
 
@@ -53,12 +76,21 @@ export function AdminRisk() {
     try {
       const res = await riskApi.sweepAll()
       const d = res.data as any
+      // Per detector: customers → `{ created }`, providers → `{ raised }`; the
+      // pattern detectors report their own sum as `total`. The listings
+      // detector returns `{ photos, prices }`, which the old per-key reading
+      // counted as 0. A detector that threw comes back as `{ error }`.
       const n = (x: any) => (typeof x?.raised === 'number' ? x.raised : typeof x?.created === 'number' ? x.created : 0)
-      const total = n(d.customers) + n(d.providers) + n(d.linkedAccounts) + n(d.reviewRings) + n(d.listings)
-      toast(translatePortalText(`Detectors finished — ${formatPortalNumber(total)} new finding(s)`))
+      const total = n(d.customers) + n(d.providers) + (typeof d.total === 'number' ? d.total : 0)
+      const failed = (['customers', 'providers', 'linkedAccounts', 'reviewRings', 'listings'] as const).filter(k => d?.[k]?.error)
+      if (failed.length) {
+        toast(translatePortalText(`Detectors finished with errors (${failed.join(', ')}) — ${formatPortalNumber(total)} new finding(s)`), 'warn')
+      } else {
+        toast(translatePortalText(`Detectors finished — ${formatPortalNumber(total)} new finding(s)`))
+      }
       refreshTiles()
-      // Remount the open tab so it reloads.
-      setTab(tab)
+      // `setTab(tab)` set the same value and remounted nothing; a new key does.
+      setReloadKey(k => k + 1)
     } catch (e) {
       toast(translatePortalText(e instanceof Error ? e.message : 'The detectors did not finish'), 'warn')
     } finally {
@@ -66,13 +98,14 @@ export function AdminRisk() {
     }
   }
 
-  const review = providers?.thresholds.REVIEW ?? 75
-  const tiles: [string, number, Tab][] = [
-    [translatePortalText('Flags to decide'), counts?.openFlags ?? 0, 'flags'],
-    [translatePortalText('Customer alerts'), counts?.openCustomers ?? 0, 'customers'],
-    [translatePortalText('Appeals waiting'), counts?.pendingAppeals ?? 0, 'appeals'],
-    [translatePortalText('Providers above review'), providers?.rows.filter(r => (r.enforcement?.riskScore ?? 0) >= review).length ?? 0, 'providers'],
-    [translatePortalText('Cash withdrawn'), providers?.rows.filter(r => r.enforcement?.cashBlocked).length ?? 0, 'providers'],
+  // `null` until answered: an unanswered request shows a dash, not a 0 that
+  // reads as "nothing to do".
+  const tiles: [string, number | null, Tab, string?][] = [
+    [translatePortalText('Flags to decide'), counts ? counts.openFlags ?? 0 : null, 'flags'],
+    [translatePortalText('Customer alerts'), counts ? counts.openCustomers ?? 0 : null, 'customers'],
+    [translatePortalText('Appeals waiting'), counts ? counts.pendingAppeals ?? 0 : null, 'appeals'],
+    [translatePortalText('Providers above review'), providerTiles ? providerTiles.aboveReview : null, 'providers'],
+    [translatePortalText('Cash withdrawn'), providerTiles ? providerTiles.cashBlocked : null, 'providers', providerTiles?.cashBlockedPartial ? '+' : ''],
   ]
   const tabLabel: Record<Tab, string> = {
     flags: `${translatePortalText('Flagged')}${counts?.openFlags ? ` (${formatPortalNumber(counts.openFlags)})` : ''}`,
@@ -95,11 +128,20 @@ export function AdminRisk() {
         }
       />
 
+      {tileError && (
+        <div className="card mb-4 flex flex-wrap items-center justify-between gap-3 !border-rose-200 !bg-rose-50 p-4 text-sm text-rose-600">
+          <p>{translatePortalText('Some Risk & Fraud figures could not be loaded.')}</p>
+          <button className="btn-ghost !py-1.5 !px-3 text-xs" onClick={refreshTiles}>{translatePortalText('Retry')}</button>
+        </div>
+      )}
+
       <div className="mb-5 grid grid-cols-2 gap-4 md:grid-cols-5">
-        {tiles.map(([l, v, target], i) => (
+        {tiles.map(([l, v, target, more], i) => (
           <motion.button key={l} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: i * 0.04 }}
             onClick={() => setTab(target)} className="card p-4 text-start transition hover:ring-1 hover:ring-slate-200">
-            <p className={`font-display text-2xl font-extrabold ${v > 0 && target !== 'providers' ? 'text-rose-600' : 'text-deep-900'}`}>{formatPortalNumber(v)}</p>
+            <p className={`font-display text-2xl font-extrabold ${v !== null && v > 0 && target !== 'providers' ? 'text-rose-600' : 'text-deep-900'}`}>
+              {v === null ? '—' : `${formatPortalNumber(v)}${more ?? ''}`}
+            </p>
             <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400">{l}</p>
           </motion.button>
         ))}
@@ -116,11 +158,13 @@ export function AdminRisk() {
         ))}
       </div>
 
-      {tab === 'flags' && <FlagQueue key="flags" group="flags" onCounts={setCounts} />}
-      {tab === 'customers' && <FlagQueue key="customers" group="customers" onCounts={setCounts} />}
-      {tab === 'providers' && <ProviderScores onRows={(rows, thresholds) => setProviders({ rows, thresholds })} />}
-      {tab === 'appeals' && <Appeals onCount={n => setCounts(c => (c ? { ...c, pendingAppeals: n } : c))} />}
-      {tab === 'settings' && <RiskSettings />}
+      {tab === 'flags' && <FlagQueue key={`flags-${reloadKey}`} group="flags" onCounts={setCounts} />}
+      {tab === 'customers' && <FlagQueue key={`customers-${reloadKey}`} group="customers" onCounts={setCounts} />}
+      {/* Its rows are filtered by its own score slider, so they refresh the
+          tiles by re-counting rather than standing in for the counts. */}
+      {tab === 'providers' && <ProviderScores key={`providers-${reloadKey}`} onRows={() => refreshTiles()} />}
+      {tab === 'appeals' && <Appeals key={`appeals-${reloadKey}`} onCount={n => setCounts(c => (c ? { ...c, pendingAppeals: n } : c))} />}
+      {tab === 'settings' && <RiskSettings key={`settings-${reloadKey}`} />}
     </PageWrap>
   )
 }

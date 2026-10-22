@@ -1,12 +1,13 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { NavLink, useOutlet, useLocation, useNavigate } from 'react-router-dom'
-import { useAuth } from './auth'
+import { useAuth, useMarinaPermissions, isLapsedSubscription } from './auth'
+import { marinaRouteAllowed } from './marinaAccess'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
   LayoutDashboard, Map, Radar, CalendarDays, BookMarked, ArrowLeftRight, TableProperties,
   Anchor, UserRound, Users, Ship, Receipt, BarChart3,
   MessagesSquare, Star, Bell, FileCheck2, Settings, Search, Menu, X, Waves, LifeBuoy, Plus, LogOut, MapPin,
-  Wind, Droplets, Eye, Sun, Moon, Sparkles, ShieldCheck,
+  Wind, Droplets, Eye, Sun, Moon, Sparkles, ShieldCheck, UsersRound,
 } from 'lucide-react'
 import { ToastStack, toast, CoverPhoto } from './ui'
 import { ConfirmHost, RouteProgressBar } from './async'
@@ -15,9 +16,82 @@ import { LanguageToggle } from './i18n/LanguageToggle'
 import { formatPortalDate, formatPortalNumber, formatPortalTime, isPortalArabic, localizedField, translatePortalText, meterUnit } from './i18n/runtime'
 import { notificationsApi, portalApi, fileUrl, type ApiNotification } from './api'
 import { fmtRelative, marinaCoverPhotos, useMarina, windDir, formatMoney, weatherText } from './live'
-import { useOps } from './opsStore'
+import { monthRevenueGross, useOps } from './opsStore'
 import MarinaStatusBanner from './components/MarinaStatusBanner'
 import { CurrencyToggle } from './CurrencyToggle'
+import type { ApiMarina } from './api'
+
+/**
+ * The harbour's wall clock. Every marina on the platform keeps Riyadh time —
+ * the backend's LOCAL_TZ_OFFSET and Open-Meteo's `timezone=auto` tide rows both
+ * read in it — so the browser's own zone is the wrong reference for an
+ * operator who happens to be abroad.
+ */
+const HARBOUR_TZ = 'Asia/Riyadh'
+function harbourNow(): { day: number; minutes: number } {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: HARBOUR_TZ, weekday: 'short', hour: '2-digit', minute: '2-digit', hour12: false,
+  }).formatToParts(new Date())
+  const get = (type: string) => parts.find(p => p.type === type)?.value ?? ''
+  const day = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(get('weekday'))
+  return { day, minutes: (Number(get('hour')) % 24) * 60 + Number(get('minute')) }
+}
+const clockMinutes = (hhmm?: string) => {
+  const [h, m] = (hhmm ?? '').split(':').map(Number)
+  return Number.isFinite(h) ? h * 60 + (Number.isFinite(m) ? m : 0) : null
+}
+
+/**
+ * The tide sample nearest to now. The feed is the day's curve at 3-hour steps;
+ * reading its *last* element labelled the 21:00 height as the current tide all
+ * day long.
+ */
+function tideNow(tides?: { time: string; height: number }[] | null): number | null {
+  if (!tides?.length) return null
+  const now = harbourNow().minutes
+  let best: { time: string; height: number } | null = null
+  let bestGap = Infinity
+  for (const t of tides) {
+    const at = clockMinutes(t.time)
+    if (at == null) continue
+    const gap = Math.abs(at - now)
+    if (gap < bestGap) { best = t; bestGap = gap }
+  }
+  return (best ?? tides[tides.length - 1]).height
+}
+
+/**
+ * Whether the marina is open right now by its own published hours. `isActive`
+ * is the platform's account switch, not the gate — reading it as "Open" told
+ * every visitor the harbour was open at 3 a.m. `null` when no hours are set.
+ */
+function marinaOpenNow(marina: ApiMarina | null): boolean | null {
+  if (!marina) return null
+  if (marina.isActive === false) return false
+  const hours = marina.operatingHours
+  if (!hours) return null
+  if (hours.open24h) return true
+  if (!hours.workingDays?.length) return null
+  const { day, minutes } = harbourNow()
+  if (!hours.workingDays.includes(day)) return false
+  const open = clockMinutes(hours.openTime)
+  const close = clockMinutes(hours.closeTime)
+  if (open == null || close == null) return true
+  // An overnight window (e.g. 18:00–02:00) wraps past midnight.
+  return close > open ? minutes >= open && minutes < close : minutes >= open || minutes < close
+}
+
+/** Every page the marina console actually routes (App.tsx), for search hits. */
+const MARINA_ROUTES = new Set([
+  '/', '/live', '/fleet-map', '/calendar', '/reservations', '/reservation-table', '/movements', '/services',
+  '/maintenance', '/facilities', '/utilities', '/emergency', '/integrations', '/berths', '/profile', '/customers',
+  '/boats', '/billing', '/reports', '/inbox', '/standing', '/messages', '/support', '/reviews', '/notifications',
+  '/documents', '/documents/vault', '/vault', '/settings', '/staff',
+])
+const isMarinaRoute = (href: string) => {
+  const path = href.split(/[?#]/)[0] || '/'
+  return MARINA_ROUTES.has(path) || path.startsWith('/reports/')
+}
 
 const NAV: { group: string; items: { to: string; label: string; icon: any; badge?: number }[] }[] = [
   { group: 'Overview', items: [
@@ -52,13 +126,14 @@ const NAV: { group: string; items: { to: string; label: string; icon: any; badge
   { group: 'Admin', items: [
     { to: '/vault', label: 'AI Document Vault', icon: Sparkles },
     { to: '/documents', label: 'Documents & Compliance', icon: FileCheck2 },
+    { to: '/staff', label: 'Staff & Access', icon: UsersRound },
     { to: '/settings', label: 'Settings', icon: Settings },
   ]},
 ]
 
 function Sidebar({ open, desktopOpen, onClose, onDesktopClose, onOpenWeather }: { open: boolean; desktopOpen: boolean; onClose: () => void; onDesktopClose: () => void; onOpenWeather?: () => void }) {
-  const { marina } = useMarina()
-  const { badges, weather } = useOps()
+  const { marina, loading: marinaLoading, error: marinaError } = useMarina()
+  const { badges, weather, weatherError } = useOps()
   // Live counters on the nav, from the marina's real numbers.
   const liveBadge: Record<string, number> = {
     '/reservations': badges.pending ?? 0,
@@ -67,7 +142,13 @@ function Sidebar({ open, desktopOpen, onClose, onDesktopClose, onOpenWeather }: 
     '/notifications': badges.alerts ?? 0,
     '/documents': badges.documents ?? 0,
   }
-  const tide = weather?.tides?.length ? weather.tides[weather.tides.length - 1].height : null
+  const tide = tideNow(weather?.tides)
+  const openNow = marinaOpenNow(marina)
+  // A staff member sees only the pages their owner granted (same table as the route guard).
+  const access = useMarinaPermissions()
+  const nav = NAV
+    .map((grp) => ({ ...grp, items: grp.items.filter((it) => marinaRouteAllowed(it.to, access)) }))
+    .filter((grp) => grp.items.length > 0)
 
   return (
     <>
@@ -96,22 +177,26 @@ function Sidebar({ open, desktopOpen, onClose, onDesktopClose, onOpenWeather }: 
             <div className="absolute bottom-2 start-3">
               <p className="font-display text-sm font-bold"><bdi dir="auto">{localizedField(marina, 'name') || translatePortalText('Your Marina')}</bdi></p>
               <p className="flex items-center gap-1.5 text-[11px] text-ocean-200">
+                {/* Green only when the published hours say the gate is open now;
+                    no claim at all while the marina hasn't loaded or set hours. */}
                 <span className="relative flex h-2 w-2">
-                  <span className={`absolute inline-flex h-full w-full rounded-full opacity-60 ${marina?.isActive === false ? 'bg-slate-400' : 'animate-ping bg-emerald-400'}`} />
-                  <span className={`relative inline-flex h-2 w-2 rounded-full ${marina?.isActive === false ? 'bg-slate-400' : 'bg-emerald-400'}`} />
+                  <span className={`absolute inline-flex h-full w-full rounded-full opacity-60 ${openNow ? 'animate-ping bg-emerald-400' : 'bg-slate-400'}`} />
+                  <span className={`relative inline-flex h-2 w-2 rounded-full ${openNow ? 'bg-emerald-400' : 'bg-slate-400'}`} />
                 </span>
-                {[
-                  translatePortalText(marina?.isActive === false ? 'Closed' : 'Open'),
-                  localizedField(marina, 'city'),
-                  marina?.settings?.vhfChannel ? `VHF ${marina.settings.vhfChannel}` : null,
-                ].filter(Boolean).join(' · ')}
+                {!marina
+                  ? translatePortalText(marinaLoading && !marinaError ? 'Loading marina…' : 'Marina details unavailable')
+                  : [
+                      openNow == null ? null : translatePortalText(openNow ? 'Open' : 'Closed'),
+                      localizedField(marina, 'city'),
+                      marina?.settings?.vhfChannel ? `VHF ${marina.settings.vhfChannel}` : null,
+                    ].filter(Boolean).join(' · ')}
               </p>
             </div>
           </div>
         </div>
 
         <nav className="flex-1 space-y-5 px-3 py-2 overflow-y-auto">
-          {NAV.map((grp) => (
+          {nav.map((grp) => (
             <div key={grp.group}>
               <p className="px-3 pb-1 text-[10px] font-extrabold uppercase tracking-wider text-white/65">{translatePortalText(grp.group)}</p>
               <div className="space-y-0.5">
@@ -159,7 +244,9 @@ function Sidebar({ open, desktopOpen, onClose, onDesktopClose, onOpenWeather }: 
                 {weather?.temperature != null ? `${formatPortalNumber(Math.round(weather.temperature))}°C` : '—'}
               </p>
               <p className="text-[11px] text-white/60">
-                {weather?.windSpeed != null ? `${formatPortalNumber(Math.round(weather.windSpeed))} kn ${windDir(weather.windDirection)}` : translatePortalText('Conditions loading')}
+                {weather?.windSpeed != null
+                  ? `${formatPortalNumber(Math.round(weather.windSpeed))} kn ${windDir(weather.windDirection)}`
+                  : translatePortalText(weather ? 'Wind not reported' : weatherError ? 'Weather unavailable' : 'Conditions loading')}
                 {tide != null ? ` · ${translatePortalText('Tide')} ${formatPortalNumber(tide)} m` : ''}
               </p>
             </div>
@@ -202,10 +289,12 @@ const NOTIF_META: Record<string, { icon: string; tone: 'info' | 'success' | 'war
 function NotifDrawer({ open, onClose }: { open: boolean; onClose: () => void }) {
   const tones: any = { info: 'bg-ocean-50 text-ocean-600', success: 'bg-emerald-50 text-emerald-600', warn: 'bg-amber-50 text-amber-600', danger: 'bg-rose-50 text-rose-600' }
   const nav = useNavigate()
-  const { alerts, unread, reloadAlerts } = useOps()
+  const { alerts, alertsError, unread, reloadAlerts } = useOps()
   const [busy, setBusy] = useState(false)
+  const [opening, setOpening] = useState<string | null>(null)
 
   const markAll = async () => {
+    if (busy) return
     setBusy(true)
     try {
       await notificationsApi.markAllRead()
@@ -217,8 +306,16 @@ function NotifDrawer({ open, onClose }: { open: boolean; onClose: () => void }) 
   }
 
   const openOne = async (n: ApiNotification) => {
-    if (!n.isRead) await notificationsApi.markRead(n.id).catch(() => {})
-    await reloadAlerts()
+    const id = String(n.id ?? n._id)
+    // One open at a time — a double click fired two mark-read calls and two navigations.
+    if (opening) return
+    setOpening(id)
+    try {
+      if (!n.isRead) await notificationsApi.markRead(id).catch(() => {})
+      await reloadAlerts()
+    } finally {
+      setOpening(null)
+    }
     onClose()
     nav('/notifications')
   }
@@ -237,13 +334,21 @@ function NotifDrawer({ open, onClose }: { open: boolean; onClose: () => void }) 
             </div>
           </div>
           <div className="flex-1 overflow-y-auto p-4 space-y-2">
-            {alerts.length === 0 && <p className="py-10 text-center text-sm text-slate-400">{translatePortalText("Nothing new — you're all caught up.")}</p>}
+            {/* A failed fetch is not an empty inbox — say which it is. */}
+            {alertsError && (
+              <div className="flex items-center justify-between gap-3 rounded-2xl bg-rose-50 px-3.5 py-3 text-xs font-semibold text-rose-700">
+                <span>{translatePortalText("Couldn't load notifications.")} {translatePortalText(alertsError)}</span>
+                <button className="btn-ghost !py-1 !px-2.5 text-xs" onClick={() => void reloadAlerts()}>{translatePortalText('Try again')}</button>
+              </div>
+            )}
+            {alerts.length === 0 && !alertsError && <p className="py-10 text-center text-sm text-slate-400">{translatePortalText("Nothing new — you're all caught up.")}</p>}
             {alerts.map((n, i) => {
               const meta = NOTIF_META[n.type] ?? NOTIF_META.general
+              const nid = String(n.id ?? n._id)
               return (
-                <motion.button key={n.id} initial={{ opacity: 0, x: 30 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: i * 0.04 }}
-                  onClick={() => openOne(n)}
-                  className={`flex w-full gap-3 rounded-2xl border p-3.5 text-left transition hover:shadow-soft ${!n.isRead ? 'border-ocean-100 bg-ocean-50/40' : 'border-slate-100 bg-white'}`}>
+                <motion.button key={nid} initial={{ opacity: 0, x: 30 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: i * 0.04 }}
+                  onClick={() => openOne(n)} disabled={opening != null}
+                  className={`flex w-full gap-3 rounded-2xl border p-3.5 text-left transition hover:shadow-soft disabled:cursor-wait ${opening === nid ? 'opacity-60' : ''} ${!n.isRead ? 'border-ocean-100 bg-ocean-50/40' : 'border-slate-100 bg-white'}`}>
                   <span className={`grid h-10 w-10 shrink-0 place-items-center rounded-xl text-lg ${tones[meta.tone]}`}>{meta.icon}</span>
                   <div className="min-w-0">
                     <p className="text-xs font-extrabold uppercase tracking-wide text-slate-400">{localizedField<string>(n, 'title') ?? translatePortalText(n.title)} · {fmtRelative(n.createdAt)}</p>
@@ -262,12 +367,13 @@ function NotifDrawer({ open, onClose }: { open: boolean; onClose: () => void }) 
 
 function QuickDrawer({ open, onClose }: { open: boolean; onClose: () => void }) {
   const nav = useNavigate()
+  const access = useMarinaPermissions()
   const acts = [
     { icon: '🛥️', label: 'New Reservation', to: '/reservations' }, { icon: '⚓', label: 'Check-In Boat', to: '/movements' },
     { icon: '🧾', label: 'Create Invoice', to: '/billing' }, { icon: '🔧', label: 'New Work Order', to: '/maintenance' },
     { icon: '🅿️', label: 'Add Berth', to: '/berths' }, { icon: '🚨', label: 'Report Incident', to: '/emergency' },
     { icon: '💬', label: 'Message Guest', to: '/messages' }, { icon: '📊', label: 'View Reports', to: '/reports' },
-  ]
+  ].filter((a) => marinaRouteAllowed(a.to, access))
   return (
     <AnimatePresence>
       {open && (<>
@@ -306,6 +412,10 @@ function GlobalSearch() {
   const [open, setOpen] = useState(false)
   const [active, setActive] = useState(0)
   const [hits, setHits] = useState<SearchHit[]>([])
+  // "No matches" is only true once the server has answered; until then, or
+  // when it failed, the dropdown says so instead.
+  const [searching, setSearching] = useState(false)
+  const [searchError, setSearchError] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
 
@@ -322,10 +432,13 @@ function GlobalSearch() {
   // Debounced query against the marina-wide search endpoint.
   useEffect(() => {
     const term = q.trim()
-    if (term.length < 2) { setHits([]); return }
+    if (term.length < 2) { setHits([]); setSearching(false); setSearchError(false); return }
+    let stale = false
+    setSearching(true)
     const t = setTimeout(() => {
       portalApi.search(term)
         .then(r => {
+          if (stale) return
           setHits(r.data.results.map(h => ({
             kind: HIT_META[h.kind]?.kind ?? h.kind,
             icon: HIT_META[h.kind]?.icon ?? '🔎',
@@ -334,18 +447,32 @@ function GlobalSearch() {
             to: h.href,
             avatar: h.avatar,
           })))
+          setSearchError(false)
           setActive(0)
         })
-        .catch(() => setHits([]))
+        .catch(() => { if (!stale) { setHits([]); setSearchError(true) } })
+        .finally(() => { if (!stale) setSearching(false) })
     }, 220)
-    return () => clearTimeout(t)
+    // A late answer for an older term must not overwrite the current one.
+    return () => { stale = true; clearTimeout(t) }
   }, [q])
 
-  const go = (h: SearchHit) => { setOpen(false); setQ(''); toast(translatePortalText(`Opening ${h.kind.toLowerCase()} “${h.title}”`), 'info'); nav(h.to) }
+  const go = (h: SearchHit) => {
+    // The server links staff hits to `/people`, which this console has no
+    // route for — the catch-all quietly dropped the operator on the dashboard.
+    if (!isMarinaRoute(h.to)) {
+      toast(translatePortalText('This result has no page in the marina console yet'), 'warn')
+      return
+    }
+    setOpen(false); setQ(''); toast(translatePortalText(`Opening ${h.kind.toLowerCase()} “${h.title}”`), 'info'); nav(h.to)
+  }
 
   return (
     <div ref={wrapRef} className="relative hidden flex-1 max-w-md sm:block">
       <Search size={16} className="pointer-events-none absolute start-3.5 top-1/2 -translate-y-1/2 text-slate-400" />
+      {/* The placeholder names what the search endpoint actually matches: berth
+          codes, bookings (boat name, plate, number), staff names and work
+          orders — it does not search customers. */}
       <input ref={inputRef} value={q}
         onChange={e => { setQ(e.target.value); setOpen(true); setActive(0) }}
         onFocus={() => setOpen(true)}
@@ -354,14 +481,20 @@ function GlobalSearch() {
           else if (e.key === 'ArrowUp') { e.preventDefault(); setActive(a => Math.max(a - 1, 0)) }
           else if (e.key === 'Enter' && hits[active]) { e.preventDefault(); go(hits[active]) }
         }}
-        placeholder={translatePortalText("Search berths, boats, customers, bookings…")} className="input !rounded-full ps-10 pe-14" />
+        placeholder={translatePortalText("Search berths, bookings, boats, staff, work orders…")} className="input !rounded-full ps-10 pe-14" />
       <kbd className="absolute end-3.5 top-1/2 -translate-y-1/2 rounded-md border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] font-bold text-slate-400">⌘K</kbd>
       <AnimatePresence>
-        {open && q.trim() && (
+        {open && q.trim().length >= 2 && (
           <motion.div initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 6 }}
             className="absolute start-0 end-0 top-full z-50 mt-2 max-h-80 overflow-y-auto rounded-2xl border border-slate-100 bg-white p-2 shadow-lift">
             {hits.length === 0 ? (
-              <p className="px-3 py-6 text-center text-sm text-slate-400">{translatePortalText(`No matches for “${q}”.`)}</p>
+              <p className={`px-3 py-6 text-center text-sm ${searchError ? 'text-rose-500' : 'text-slate-400'}`}>
+                {searchError
+                  ? translatePortalText('Search is unavailable right now')
+                  : searching
+                    ? translatePortalText('Searching…')
+                    : translatePortalText(`No matches for “${q}”.`)}
+              </p>
             ) : hits.map((h, i) => (
               <button key={h.kind + h.title + i} onMouseEnter={() => setActive(i)} onClick={() => go(h)}
                 className={`flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left transition ${i === active ? 'bg-ocean-50' : 'hover:bg-sand'}`}>
@@ -434,9 +567,12 @@ function useTicker(): string[] {
         ? `🛥️ القارب التالي: ${boatName} — وقت الوصول المتوقع ${eta}${next.pontoon ? ` ← ${next.pontoon}-${String(next.slot ?? 0).padStart(2, '0')}` : ''}`
         : `🛥️ Next arrival: ${boatName} — ETA ${eta}${next.pontoon ? ` → ${next.pontoon}-${String(next.slot ?? 0).padStart(2, '0')}` : ''}`)
     }
-    if (overview.revenue.month.gross) lines.push(isPortalArabic()
-      ? `💰 إيرادات هذا الشهر: ${formatMoney(overview.revenue.month.gross, currency)}`
-      : `💰 ${formatMoney(overview.revenue.month.gross, currency)} earned this month`)
+    // Through the same guard as the dashboard tile: the overview's lifetime
+    // berth-total fallback is not money earned this month.
+    const monthGross = monthRevenueGross(overview)
+    if (monthGross) lines.push(isPortalArabic()
+      ? `💰 إيرادات هذا الشهر: ${formatMoney(monthGross, currency)}`
+      : `💰 ${formatMoney(monthGross, currency)} earned this month`)
     const urgentWork = overview.workOrders.filter(w => w.priority === 'critical' || w.priority === 'high')
     if (urgentWork.length) {
       const title = localizedField(urgentWork[0], 'title') ?? urgentWork[0].title
@@ -452,9 +588,10 @@ function useTicker(): string[] {
       : `⭐ ${overview.rating.average} average guest rating from ${overview.rating.count} review${overview.rating.count === 1 ? '' : 's'}`)
   }
   if (weather) {
-    if (weather.tides.length) lines.push(isPortalArabic()
-      ? `🌊 مستوى المد ${formatPortalNumber(weather.tides[weather.tides.length - 1].height)} م`
-      : `🌊 Tide ${weather.tides[weather.tides.length - 1].height} m`)
+    const tide = tideNow(weather.tides)
+    if (tide != null) lines.push(isPortalArabic()
+      ? `🌊 مستوى المد ${formatPortalNumber(tide)} م`
+      : `🌊 Tide ${tide} m`)
     if (weather.windSpeed != null) lines.push(isPortalArabic()
       ? `💨 الرياح ${windDir(weather.windDirection)} ${formatPortalNumber(Math.round(weather.windSpeed))} عقد${weather.windGust != null ? `، هبّات ${formatPortalNumber(Math.round(weather.windGust))} عقد` : ''}`
       : `💨 Wind ${windDir(weather.windDirection)} ${Math.round(weather.windSpeed)} kn${weather.windGust != null ? `, gusts ${Math.round(weather.windGust)} kn` : ''}`)
@@ -469,29 +606,44 @@ function Clock() {
   useEffect(() => { const t = setInterval(() => setNow(new Date()), 1000); return () => clearInterval(t) }, [])
   return (
     <div className="hidden xl:flex flex-col items-end pe-1 leading-tight">
-      <span className="font-display text-sm font-extrabold tabular-nums text-deep-900">{now.toLocaleTimeString(isPortalArabic() ? 'ar-SA-u-ca-gregory' : 'en-US', { hour12: false })}</span>
+      {/* Harbour time, not the browser's: it sits beside the marina's city, and
+          an operator checking in from abroad was shown their own clock. */}
+      <span className="font-display text-sm font-extrabold tabular-nums text-deep-900">{now.toLocaleTimeString(isPortalArabic() ? 'ar-SA-u-ca-gregory' : 'en-US', { hour12: false, timeZone: HARBOUR_TZ })}</span>
       <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
-        {formatPortalDate(now, { weekday: 'short', month: 'short', day: 'numeric' })}{marina?.city ? ` · ${localizedField(marina, 'city')}` : ''}
+        {formatPortalDate(now, { weekday: 'short', month: 'short', day: 'numeric', timeZone: HARBOUR_TZ })}{marina?.city ? ` · ${localizedField(marina, 'city')}` : ''}
       </span>
     </div>
   )
 }
 
 function WeatherModal({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const { weather } = useOps()
+  const { weather, weatherError, reloadWeather } = useOps()
   const { marina } = useMarina()
 
   if (!open) return null
 
-  const temp = weather?.temperature != null ? Math.round(weather.temperature) : 28
-  const code = weather?.weatherCode ?? 0
+  // Every figure is the feed's own or a dash. This used to fall back to a
+  // made-up 28°C / 12 kn NW / 65% / 10 km whenever the feed was missing, which
+  // painted a confident, invented forecast — "Favorable Conditions" included —
+  // exactly when the operator had no real one.
+  const temp = weather?.temperature != null ? Math.round(weather.temperature) : null
+  const code = weather?.weatherCode ?? null
   const isDay = weather?.isDay ?? true
-  const windSpeed = weather?.windSpeed != null ? Math.round(weather.windSpeed) : 12
-  const windGust = weather?.windGust != null ? Math.round(weather.windGust) : 16
-  const direction = weather?.windDirection ?? 310
-  const humidity = weather?.humidity ?? 65
-  const visibility = weather?.visibilityKm ?? 10
+  const windSpeed = weather?.windSpeed != null ? Math.round(weather.windSpeed) : null
+  const windGust = weather?.windGust != null ? Math.round(weather.windGust) : null
+  const direction = weather?.windDirection ?? null
+  const humidity = weather?.humidity ?? null
+  const visibility = weather?.visibilityKm ?? null
+  const wave = weather?.waveHeight ?? null
   const tides = weather?.tides ?? []
+  const currentTide = tideNow(tides)
+  // Sea state from the measured wave height (Douglas scale bands), not guessed
+  // from the wind as before.
+  const seaState = wave == null ? null
+    : wave < 0.1 ? 'Calm Glass' : wave < 0.5 ? 'Smooth Chop' : wave < 1.25 ? 'Slight Sea' : wave < 2.5 ? 'Moderate Swell' : 'Rough Sea'
+  const visibilityNote = visibility == null ? 'Not reported'
+    : visibility >= 5 ? 'Good visibility for navigation' : visibility >= 1 ? 'Reduced visibility' : 'Poor visibility — navigate with caution'
+  const percent = isPortalArabic() ? '٪' : '%'
 
   return (
     <AnimatePresence>
@@ -525,15 +677,27 @@ function WeatherModal({ open, onClose }: { open: boolean; onClose: () => void })
             <div className="mt-4 flex items-end gap-4">
               <span className="text-5xl animate-float">{isDay ? '☀️' : '🌙'}</span>
               <div>
-                <h2 className="font-display text-4xl font-extrabold tracking-tight">{formatPortalNumber(temp)}°C</h2>
+                <h2 className="font-display text-4xl font-extrabold tracking-tight">{temp != null ? `${formatPortalNumber(temp)}°C` : '—'}</h2>
                 <p className="text-xs font-semibold text-ocean-100">{translatePortalText(weatherText(code))}</p>
               </div>
             </div>
 
-            {/* Maritime Safety Badge */}
+            {/* Maritime Safety Badge — the server's small-craft advisory (gusts
+                ≥ 22 kn or seas ≥ 1.5 m), not a local wind-speed guess. */}
             <div className="mt-5 flex items-center gap-2.5 rounded-2xl bg-black/25 px-4 py-2.5 text-xs font-bold backdrop-blur">
-              <span className={`h-2.5 w-2.5 rounded-full ${windSpeed < 18 ? 'bg-emerald-400' : 'bg-amber-400'} animate-pulse`} />
-              <span>{translatePortalText(windSpeed < 18 ? '🟢 Favorable Conditions for Berthing & Departures' : '🟡 Wind Warning: High Gusts in Channel')}</span>
+              <span className={`h-2.5 w-2.5 rounded-full ${!weather ? 'bg-slate-400' : weather.warning ? 'bg-amber-400 animate-pulse' : 'bg-emerald-400 animate-pulse'}`} />
+              <span>
+                {!weather
+                  ? translatePortalText(weatherError ? 'Marine conditions unavailable' : 'Fetching marine conditions…')
+                  : weather.warning
+                    ? `🟡 ${translatePortalText(weather.warning)}`
+                    : translatePortalText('🟢 Favorable Conditions for Berthing & Departures')}
+              </span>
+              {!weather && weatherError && (
+                <button onClick={() => void reloadWeather()} className="ms-auto rounded-lg bg-white/15 px-2.5 py-1 text-[11px] hover:bg-white/25">
+                  {translatePortalText('Try again')}
+                </button>
+              )}
             </div>
           </div>
 
@@ -545,8 +709,8 @@ function WeatherModal({ open, onClose }: { open: boolean; onClose: () => void })
                   <Wind size={16} className="text-ocean-400" />
                   <span>{translatePortalText("Wind & Gusts")}</span>
                 </div>
-                <p className="font-display text-lg font-bold text-white">{formatPortalNumber(windSpeed)} {translatePortalText("kn ")}{windDir(direction)}</p>
-                <p className="text-[11px] text-slate-400 mt-0.5">{translatePortalText("Gusts up to ")}{formatPortalNumber(windGust)} {translatePortalText("kn")}</p>
+                <p className="font-display text-lg font-bold text-white">{windSpeed != null ? <>{formatPortalNumber(windSpeed)} {translatePortalText("kn ")}{windDir(direction)}</> : '—'}</p>
+                <p className="text-[11px] text-slate-400 mt-0.5">{windGust != null ? <>{translatePortalText("Gusts up to ")}{formatPortalNumber(windGust)} {translatePortalText("kn")}</> : translatePortalText('Not reported')}</p>
               </div>
 
               <div className="rounded-2xl bg-white/5 p-4 border border-white/5">
@@ -554,8 +718,8 @@ function WeatherModal({ open, onClose }: { open: boolean; onClose: () => void })
                   <Waves size={16} className="text-emerald-400" />
                   <span>{translatePortalText("Sea State")}</span>
                 </div>
-                <p className="font-display text-lg font-bold text-white">{translatePortalText(windSpeed < 10 ? 'Calm Glass' : windSpeed < 18 ? 'Smooth Chop' : 'Moderate Swell')}</p>
-                <p className="text-[11px] text-slate-400 mt-0.5">{translatePortalText("Waves ")}{windSpeed < 10 ? `${formatPortalNumber(0.1)}–${formatPortalNumber(0.3)}` : `${formatPortalNumber(0.4)}–${formatPortalNumber(1)}`} {meterUnit()}</p>
+                <p className="font-display text-lg font-bold text-white">{seaState ? translatePortalText(seaState) : '—'}</p>
+                <p className="text-[11px] text-slate-400 mt-0.5">{wave != null ? <>{translatePortalText("Waves ")}{formatPortalNumber(wave, { maximumFractionDigits: 2 })} {meterUnit()}</> : translatePortalText('Wave height not reported')}</p>
               </div>
 
               <div className="rounded-2xl bg-white/5 p-4 border border-white/5">
@@ -563,8 +727,8 @@ function WeatherModal({ open, onClose }: { open: boolean; onClose: () => void })
                   <Eye size={16} className="text-amber-400" />
                   <span>{translatePortalText("Visibility")}</span>
                 </div>
-                <p className="font-display text-lg font-bold text-white">{formatPortalNumber(visibility)} {translatePortalText("km")}</p>
-                <p className="text-[11px] text-slate-400 mt-0.5">{translatePortalText("Clear navigation view")}</p>
+                <p className="font-display text-lg font-bold text-white">{visibility != null ? <>{formatPortalNumber(visibility)} {translatePortalText("km")}</> : '—'}</p>
+                <p className="text-[11px] text-slate-400 mt-0.5">{translatePortalText(visibilityNote)}</p>
               </div>
 
               <div className="rounded-2xl bg-white/5 p-4 border border-white/5">
@@ -572,7 +736,7 @@ function WeatherModal({ open, onClose }: { open: boolean; onClose: () => void })
                   <Droplets size={16} className="text-cyan-400" />
                   <span>{translatePortalText("Humidity")}</span>
                 </div>
-                <p className="font-display text-lg font-bold text-white">{formatPortalNumber(humidity)}٪</p>
+                <p className="font-display text-lg font-bold text-white">{humidity != null ? `${formatPortalNumber(humidity)}${percent}` : '—'}</p>
                 <p className="text-[11px] text-slate-400 mt-0.5">{translatePortalText("Coastal moisture")}</p>
               </div>
             </div>
@@ -581,10 +745,15 @@ function WeatherModal({ open, onClose }: { open: boolean; onClose: () => void })
               <div className="rounded-2xl bg-white/5 p-3.5 border border-white/5">
                 <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400 mb-1">{translatePortalText("Tide Level Today (m)")}</p>
                 <div className="flex items-center justify-between text-xs font-semibold text-ocean-200">
-                  <span>{translatePortalText("Current Tide: ")}{formatPortalNumber(tides[tides.length - 1]?.height)} {meterUnit()}</span>
+                  <span>{translatePortalText("Current Tide: ")}{currentTide != null ? formatPortalNumber(currentTide) : '—'} {meterUnit()}</span>
                   <span>{translatePortalText("Range: ")}{formatPortalNumber(Math.min(...tides.map(t => t.height)))}–{formatPortalNumber(Math.max(...tides.map(t => t.height)))} {meterUnit()}</span>
                 </div>
               </div>
+            )}
+            {weather?.updatedAt && (
+              <p className="text-end text-[10px] font-semibold text-slate-500">
+                {translatePortalText('Updated')} {fmtRelative(weather.updatedAt)}
+              </p>
             )}
           </div>
         </motion.div>
@@ -602,9 +771,11 @@ export default function Layout() {
   const nav = useNavigate()
   const { logout, user } = useAuth()
   const { marina } = useMarina()
-  const { unread, weather } = useOps()
+  const { unread, weather, error: opsError } = useOps()
   const loc = useLocation()
   const ticker = useTicker()
+  // Listing status and plan renewal are the owner's business, not the desk's.
+  const isOwner = useMarinaPermissions().isOwner
 
   return (
     <div className="min-h-screen overflow-x-hidden">
@@ -661,7 +832,15 @@ export default function Layout() {
             </div>
           )}
         </header>
-        <MarinaStatusBanner />
+        {isOwner && <MarinaStatusBanner />}
+        {/* A lapsed subscription keeps the console (existing bookings still
+            run) but new bookings stop until it is renewed — say so, with the way out. */}
+        {isLapsedSubscription(user) && (
+          <div role="alert" className="mx-4 mt-4 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900 md:mx-7">
+            <span className="font-semibold">{translatePortalText('Your subscription has expired — new bookings are paused until you renew. Existing bookings keep running.')}</span>
+            <NavLink to="/onboarding" className="btn-primary !py-1.5 text-xs">{translatePortalText('Renew subscription')}</NavLink>
+          </div>
+        )}
         <main className="px-4 py-6 md:px-7 md:py-7 max-w-[1600px]">
           {/* Enter-only CSS fade keyed by route. The old framer-motion
               AnimatePresence mode="wait" could finish the outgoing page's exit
@@ -670,8 +849,14 @@ export default function Layout() {
             {useOutlet()}
           </div>
           <footer className="mt-10 flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 pt-5 pb-2 text-xs text-slate-400">
-            <p>© {formatPortalNumber(new Date().getFullYear(), { useGrouping: false })} HarborLink · <bdi dir="auto">{localizedField(marina, 'name') || translatePortalText('Your Marina')}</bdi> · {translatePortalText('Powered by BoatPro')}</p>
-            <p className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse-soft" /> {translatePortalText("All systems operational")}</p>
+            <p>© {formatPortalNumber(new Date().getFullYear(), { useGrouping: false })} <bdi dir="auto">{localizedField(marina, 'name') || translatePortalText('Your Marina')}</bdi> · {translatePortalText('Powered by BoatPro')}</p>
+            {/* Was a hard-coded green "All systems operational". It now reports
+                what this console can actually observe: whether the live
+                overview feed is answering. */}
+            <p className="flex items-center gap-1.5">
+              <span className={`h-2 w-2 rounded-full ${opsError ? 'bg-rose-400' : 'bg-emerald-400 animate-pulse-soft'}`} />
+              {translatePortalText(opsError ? 'Live data unavailable — retrying every minute' : 'Live data connected')}
+            </p>
           </footer>
         </main>
       </div>

@@ -9,6 +9,7 @@ import {
 import { PageWrap } from './_shared'
 import { AdminHeader, ABadge, ViewToggle } from '../adminUi'
 import { Modal, toast, Counter, CardGridSkeleton, TableSkeleton } from '../../ui'
+import { confirm } from '../../async'
 import { translatePortalText  , formatPortalDate, formatPortalNumber, formatPortalPercent} from '../../i18n/runtime'
 import { adminApi, aiDocumentApi, fileUrl, type AdminBoatApproval, type AIDocument } from '../../api'
 import { AiDocumentVerificationModal } from '../../components/AiDocumentVerificationModal'
@@ -70,9 +71,19 @@ export default function AdminBoatApprovals() {
   const load = useCallback(async () => {
     setLoading(true); setError(null)
     try {
-      const res = await adminApi.listBoatApprovals(tab ? { approvalStatus: tab } : undefined)
-      setBoats(res.data.boats)
-      setCounts(res.data.statusCounts || {})
+      // Every page, 100 at a time (the API's cap). Without `limit` the API
+      // served its default of 20, so the 21st pending boat was counted in the
+      // tab and never on screen — the table pages client-side over what came back.
+      const all: AdminBoatApproval[] = []
+      let statusCounts: Record<string, number> = {}
+      for (let page = 1; page <= 50; page++) {
+        const res = await adminApi.listBoatApprovals({ limit: 100, page, ...(tab ? { approvalStatus: tab } : {}) })
+        all.push(...(res.data.boats || []))
+        statusCounts = res.data.statusCounts || {}
+        if (!res.data.boats?.length || all.length >= (res.data.total ?? 0)) break
+      }
+      setBoats(all)
+      setCounts(statusCounts)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load boats')
     } finally {
@@ -97,17 +108,50 @@ export default function AdminBoatApprovals() {
   }
 
   const doReject = () => {
-    if (!rejecting) return
+    if (!rejecting || busyId) return
     const id = boatId(rejecting)
     if (!id) { toast(translatePortalText('Invalid boat ID'), 'warn'); return }
     if (reason.trim().length < 3) { toast(translatePortalText('Please give a rejection reason (min 3 chars)'), 'warn'); return }
-    act(rejecting, () => adminApi.rejectBoat(id, reason.trim()), `"${rejecting.name}" rejected`, 'warn')
+    const revoking = rejecting.approvalStatus === 'approved'
+    act(rejecting, () => adminApi.rejectBoat(id, reason.trim()), `"${rejecting.name}" ${revoking ? 'approval revoked' : 'rejected'}`, 'warn')
+  }
+
+  /**
+   * Approve, after naming what the admin is approving past.
+   *
+   * The server approves a boat with no checks of its own — no documents, AI
+   * readings that failed or were rejected, no photos — and every Approve button
+   * here fired in one click, so a vessel with nothing on file went live
+   * unremarked. A diver's vessel owes no paperwork and is not warned about it.
+   */
+  const approveWithChecks = async (b: AdminBoatApproval) => {
+    const id = boatId(b)
+    if (!id || busyId) return
+    const docs = b.documents ?? []
+    const warnings: string[] = []
+    if (!isDiverBoat(b)) {
+      if (docs.length === 0) warnings.push(translatePortalText('No documents are on file for this boat.'))
+      const bad = docs.filter((d) => d.reviewStatus === 'rejected' || d.reviewStatus === 'failed')
+      if (bad.length) warnings.push(translatePortalText(`AI rejected or could not read: ${bad.map((d) => d.label).join(', ')}.`))
+      const unread = docs.filter((d) => !d.aiDocumentId)
+      if (unread.length) warnings.push(translatePortalText(`${unread.length} document${unread.length === 1 ? ' has' : 's have'} no AI reading.`))
+    }
+    if (!b.images?.length) warnings.push(translatePortalText('The listing has no photos.'))
+    const ok = await confirm({
+      title: `Approve "${b.name}"?`,
+      body: [...warnings, translatePortalText('Approved boats appear publicly and can be used in trips.')].join(' '),
+      confirmLabel: warnings.length ? 'Approve anyway' : 'Approve',
+      danger: warnings.length > 0,
+    })
+    if (ok) act(b, () => adminApi.approveBoat(id), `"${b.name}" approved — now live`)
   }
 
   const openDetail = (b: AdminBoatApproval) => { setDetail(b); setImgIdx(0) }
 
   const filterCfg: TableFiltersConfig<any> = useMemo(() => ({
-    searchFields: (b) => [b.name, b.code, b.city, b.category, b.providerId?.name, b.providerId?.business?.businessName],
+    // `provider`, not `providerId`: the API renames the populated owner before
+    // responding, so searching by owner never matched anything.
+    searchFields: (b) => [b.name, b.nameAr, b.code, b.city, b.marina, b.category, b.provider?.name, b.provider?.email, b.provider?.business?.businessName],
     filters: [
       { key: 'category', label: translatePortalText('Category'), get: (b) => b.category },
       { key: 'city', label: translatePortalText('City'), get: (b) => b.city },
@@ -195,7 +239,7 @@ export default function AdminBoatApprovals() {
         <ViewToggle view={view} onChange={setView} />
       </TableToolbar>
 
-      {!loading && boats.length === 0 && (
+      {!loading && !error && boats.length === 0 && (
         <div className="rounded-2xl border border-dashed border-slate-200 py-16 text-center text-sm text-slate-400">
           {translatePortalText("\r\n          No boats in \"")}{tab || 'all'}".
         </div>
@@ -372,7 +416,7 @@ export default function AdminBoatApprovals() {
                               <>
                                 <button
                                   disabled={busyId === id}
-                                  onClick={() => act(b, () => adminApi.approveBoat(id), `"${b.name}" approved — now live`)}
+                                  onClick={() => void approveWithChecks(b)}
                                   className="btn-admin !py-1 !px-2.5 text-[11px] font-bold disabled:opacity-60"
                                 >
                                   <Check size={12} className="me-1 inline" /> {translatePortalText("Approve")}
@@ -391,7 +435,7 @@ export default function AdminBoatApprovals() {
                             {isRejected && (
                               <button
                                 disabled={busyId === id}
-                                onClick={() => act(b, () => adminApi.approveBoat(id), `"${b.name}" approved — now live`)}
+                                onClick={() => void approveWithChecks(b)}
                                 className="btn-admin !py-1 !px-2.5 text-[11px] font-bold disabled:opacity-60"
                               >
                                 <Check size={12} className="me-1 inline" /> {translatePortalText(" Approve\r\n                              ")}</button>
@@ -430,7 +474,7 @@ export default function AdminBoatApprovals() {
                       ? <img src={fileUrl(b.images[0])} alt={b.name} className="h-full w-full object-cover" />
                       : <div className="flex h-full items-center justify-center text-4xl">{CATEGORY_ICON[b.category] || '🛥️'}</div>}
                     <span className={`absolute end-2 top-2 rounded-full px-2.5 py-0.5 text-[11px] font-bold ${approvalBadgeClass(b.approvalStatus)}`}>
-                      {b.approvalStatus}
+                      {translatePortalText(b.approvalStatus)}
                     </span>
                   </div>
 
@@ -451,7 +495,7 @@ export default function AdminBoatApprovals() {
                           {(b.provider as any).business?.businessName || (b.provider as any).name}
                         </p>
                       )}
-                      <p className="flex items-center gap-1.5"><MapPin size={11} className="text-slate-400" />{b.city} · {b.marina}</p>
+                      <p className="flex items-center gap-1.5"><MapPin size={11} className="text-slate-400" />{[b.city, b.marina].filter(Boolean).join(' · ') || translatePortalText('Location unassigned')}</p>
                       <p className="flex items-center gap-1.5"><Users size={11} className="text-slate-400" />{formatPortalNumber(b.capacity)} {translatePortalText('pax')} · {formatPortalNumber(b.lengthFt)} {translatePortalText('ft')}</p>
                       <p className="flex items-center gap-1.5"><Calendar size={11} className="text-slate-400" />
                         {formatPortalDate(new Date(b.createdAt))}
@@ -478,7 +522,7 @@ export default function AdminBoatApprovals() {
                         {translatePortalText("\r\n                        View Details\r\n                      ")}</button>
                       {b.approvalStatus === 'pending' && (<>
                         <button disabled={busyId === id}
-                          onClick={() => act(b, () => adminApi.approveBoat(id), `"${b.name}" approved — now live`)}
+                          onClick={() => void approveWithChecks(b)}
                           className="btn-admin flex-1 !justify-center !py-1.5 !text-[11px] disabled:opacity-60">
                           <Check size={12} /> {translatePortalText(" Approve\r\n                        ")}</button>
                         <button disabled={busyId === id}
@@ -489,7 +533,7 @@ export default function AdminBoatApprovals() {
                       </>)}
                       {b.approvalStatus === 'rejected' && (
                         <button disabled={busyId === id}
-                          onClick={() => act(b, () => adminApi.approveBoat(id), `"${b.name}" approved — now live`)}
+                          onClick={() => void approveWithChecks(b)}
                           className="btn-admin flex-1 !justify-center !py-1.5 !text-[11px] disabled:opacity-60">
                           <Check size={12} /> {translatePortalText(" Approve\r\n                        ")}</button>
                       )}
@@ -537,11 +581,18 @@ export default function AdminBoatApprovals() {
           ))}
         </div>
 
-        <textarea className="input min-h-[90px]" value={reason} onChange={e => setReason(e.target.value)}
+        <textarea className="input min-h-[90px]" dir="auto" value={reason} onChange={e => setReason(e.target.value)}
           placeholder={translatePortalText("e.g. Boat licence document is missing — please upload a valid copy.")} />
+        {/* Revoking only flips the boat's approval (rejectBoat on the API) —
+            trips already published on it are not paused, and their bookings stand. */}
+        {rejecting?.approvalStatus === 'approved' && (
+          <p className="mt-2 rounded-lg bg-amber-50 px-2.5 py-1.5 text-[11px] font-semibold text-amber-800">
+            {translatePortalText("Trips already published with this boat stay live — revoking does not pause them or cancel their bookings. Pause them from the trip listings if needed.")}
+          </p>
+        )}
         <div className="mt-4 flex justify-end gap-2">
           <button className="btn-ghost" onClick={() => setRejecting(null)}>{translatePortalText("Cancel")}</button>
-          <button className="btn-admin !bg-gradient-to-r !from-rose-500 !to-rose-600" onClick={doReject}>
+          <button className="btn-admin !bg-gradient-to-r !from-rose-500 !to-rose-600 disabled:opacity-60" disabled={!!busyId || reason.trim().length < 3} onClick={doReject}>
             {rejecting?.approvalStatus === 'approved' ? translatePortalText('Revoke approval') : translatePortalText('Reject boat')}
           </button>
         </div>
@@ -869,14 +920,14 @@ export default function AdminBoatApprovals() {
                 <button className="btn-ghost !text-rose-500"
                   onClick={() => { setDetail(null); setRejecting(detail); setReason('') }}>
                   {translatePortalText("\r\n                  Reject\r\n                ")}</button>
-                <button className="btn-admin"
-                  onClick={() => act(detail, () => adminApi.approveBoat(boatId(detail)), `"${detail.name}" approved — now live`)}>
+                <button className="btn-admin disabled:opacity-60" disabled={!!busyId}
+                  onClick={() => void approveWithChecks(detail)}>
                   <ShieldCheck size={14} /> {translatePortalText("Approve Boat")}
                 </button>
               </>)}
               {detail.approvalStatus === 'rejected' && (
-                <button className="btn-admin"
-                  onClick={() => act(detail, () => adminApi.approveBoat(boatId(detail)), `"${detail.name}" approved — now live`)}>
+                <button className="btn-admin disabled:opacity-60" disabled={!!busyId}
+                  onClick={() => void approveWithChecks(detail)}>
                   <Check size={14} /> {translatePortalText("Approve Boat")}
                 </button>
               )}

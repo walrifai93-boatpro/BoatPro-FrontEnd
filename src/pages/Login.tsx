@@ -7,7 +7,8 @@ import {
   Waves, Sparkles, Check, Building2, User, Compass, Zap, ChevronDown, Ship, Phone } from 'lucide-react'
 import { toast, ToastStack, Modal, FieldWarning } from '../ui'
 import { ThemeToggle } from '../theme'
-import { useAuth, type PortalRole } from '../auth'
+import { useAuth, isMfaChallenge, type PortalRole } from '../auth'
+import type { ApiUser } from '../api'
 import { authApi, planInviteApi, setSessionPersistence } from '../api'
 import { getPendingInvite } from '../shared/pendingInvite'
 import { FakeFillButton, useFakeFillEnabled } from '../shared/FakeFillButton'
@@ -109,7 +110,7 @@ const PORTAL_FOR_PROVIDER_TYPE: Record<string, Role | undefined> = {
 
 export default function Login() {
   const nav = useNavigate()
-  const { status, user, login, register } = useAuth()
+  const { status, user, login, completeMfaLogin, register } = useAuth()
 
   React.useEffect(() => {
     if (status === 'authed' && user) {
@@ -231,6 +232,80 @@ export default function Login() {
     finally { setForgotBusy(false) }
   }
 
+  /**
+   * Two-factor sign-in (admins and support agents, while the security policy
+   * requires it). The password was right; the server emailed a 6-digit code
+   * and handed back a short-lived `mfaToken` that is not a session. This step
+   * trades the two for one.
+   */
+  const [mfa, setMfa] = useState<{ token: string; emailHint: string } | null>(null)
+  const [mfaCode, setMfaCode] = useState('')
+  const [mfaBusy, setMfaBusy] = useState(false)
+  const [mfaResending, setMfaResending] = useState(false)
+  const [resendIn, setResendIn] = useState(0)
+  React.useEffect(() => {
+    if (!mfa || resendIn <= 0) return
+    const t = window.setTimeout(() => setResendIn(s => Math.max(0, s - 1)), 1000)
+    return () => window.clearTimeout(t)
+  }, [mfa, resendIn])
+
+  const errorCode = (err: unknown) => (err as { details?: { code?: string; retryAfter?: number } } | null)?.details
+  const leaveMfa = () => { setMfa(null); setMfaCode(''); setResendIn(0) }
+
+  /** Where a finished sign-in lands, and what it says on the way in. */
+  const welcome = (loggedUser: ApiUser | undefined) => {
+    const targetRole: Role = loggedUser?.role === 'admin' ? 'admin' : loggedUser?.role === 'support_agent' ? 'agent' : role
+    const msg: Record<Role, string> = {
+      marina: 'Welcome back to the Marina Portal ⚓', fuel: 'Welcome back to the Fuel Portal ⛽',
+      maint: 'Welcome back to the Maintenance Portal 🔧', boat: 'Welcome back to the Boat Provider Portal 🚤',
+      admin: 'Welcome to the Super Admin Control Center 👑',
+      agent: 'Welcome to BoatPro Support',
+    }
+    toast(translatePortalText(msg[targetRole] || msg.admin))
+    nav(DEST[targetRole], { replace: true })
+  }
+
+  const submitMfa = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!mfa) return
+    const code = mfaCode.trim()
+    if (!/^\d{6}$/.test(code)) {
+      fe.fail({ mfaCode: 'Enter the 6-digit code from the email' })
+      return
+    }
+    setMfaBusy(true)
+    try {
+      welcome(await completeMfaLogin(mfa.token, code, role))
+    } catch (err) {
+      const details = errorCode(err)
+      // The pending sign-in is gone (expired, used up, or the account locked):
+      // the only way forward is the password again.
+      if (details?.code === 'MFA_EXPIRED' || details?.code === 'ACCOUNT_LOCKED') leaveMfa()
+      if (details?.code === 'MFA_CODE_INVALID') setMfaCode('')
+      toast(translatePortalText(err instanceof Error ? err.message : 'Could not verify the code'), 'warn')
+    } finally {
+      setMfaBusy(false)
+    }
+  }
+
+  const resendMfa = async () => {
+    if (!mfa || resendIn > 0 || mfaResending) return
+    setMfaResending(true)
+    try {
+      const res = await authApi.resendLoginMfa(mfa.token)
+      setResendIn(res.data.resendAvailableIn || 60)
+      setMfaCode(res.devCode ?? '') // dev-only convenience, never present in production
+      toast(translatePortalText('A new code is on its way'))
+    } catch (err) {
+      const details = errorCode(err)
+      if (details?.code === 'MFA_RESEND_COOLDOWN') setResendIn(details.retryAfter || 60)
+      else if (details?.code === 'MFA_EXPIRED' || details?.code === 'MFA_RESEND_LIMIT') leaveMfa()
+      toast(translatePortalText(err instanceof Error ? err.message : 'Could not send a new code'), 'warn')
+    } finally {
+      setMfaResending(false)
+    }
+  }
+
   const sendSignupCode = async () => {
     const addr = email.trim().toLowerCase()
     setOtpSending(true)
@@ -300,18 +375,23 @@ export default function Login() {
         toast(translatePortalText(`Welcome to BoatPro, ${org || 'new provider'} — account created 🎉`))
         nav(DEST[role], { replace: true })
       } else {
-        const loggedUser = await login(email.trim(), pw, role)
-        const targetRole: Role = loggedUser?.role === 'admin' ? 'admin' : loggedUser?.role === 'support_agent' ? 'agent' : role
-        const msg: Record<Role, string> = {
-          marina: 'Welcome back to the Marina Portal ⚓', fuel: 'Welcome back to the Fuel Portal ⛽',
-          maint: 'Welcome back to the Maintenance Portal 🔧', boat: 'Welcome back to the Boat Provider Portal 🚤',
-          admin: 'Welcome to the Super Admin Control Center 👑',
-          agent: 'Welcome to BoatPro Support',
+        const outcome = await login(email.trim(), pw, role)
+        if (isMfaChallenge(outcome)) {
+          setMfa({ token: outcome.mfaToken, emailHint: outcome.emailHint })
+          setMfaCode(outcome.devCode ?? '') // dev-only convenience, never present in production
+          setResendIn(60)
+          fe.clear()
+          return
         }
-        toast(translatePortalText(msg[targetRole] || msg.admin))
-        nav(DEST[targetRole], { replace: true })
+        welcome(outcome)
       }
     } catch (err) {
+      /* 403s are rewritten to a generic "no permission" by the API layer, which
+         for this one would hide the actual reason: the network, not the account. */
+      if (errorCode(err)?.code === 'IP_NOT_ALLOWED') {
+        toast(translatePortalText('Admin sign-in is not allowed from this network'), 'warn')
+        return
+      }
       /**
        * This used to pin every failure to the email field, so a wrong password —
        * or a server being down — put a red ring around a perfectly good address
@@ -519,6 +599,55 @@ export default function Login() {
                 )}
               </div>
 
+              {mfa ? (
+                <form onSubmit={submitMfa} className="mt-5 space-y-4">
+                  <div className="rounded-xl bg-emerald-50 px-3.5 py-3 ring-1 ring-emerald-100 dark:bg-emerald-500/10 dark:ring-emerald-500/20">
+                    <p className="flex items-center gap-2 text-[13px] font-extrabold text-emerald-800 dark:text-emerald-300">
+                      <ShieldCheck size={15} /> {translatePortalText('Check your email')}
+                    </p>
+                    <p className="mt-1 text-[12px] leading-relaxed text-emerald-700 dark:text-emerald-200/80">
+                      {translatePortalText('We sent a 6-digit sign-in code to')}{' '}
+                      <span dir="ltr" className="font-bold">{mfa.emailHint}</span>.{' '}
+                      {translatePortalText('It expires in 10 minutes.')}
+                    </p>
+                  </div>
+
+                  <div>
+                    <label className="label" htmlFor="mfa-code">{translatePortalText('Sign-in code')}</label>
+                    <div className="relative">
+                      <Lock size={15} className="pointer-events-none absolute start-3.5 top-1/2 -translate-y-1/2 text-slate-400" />
+                      <input {...fe.field('mfaCode')} id="mfa-code" autoFocus required inputMode="numeric" autoComplete="one-time-code" maxLength={6} dir="ltr"
+                        value={mfaCode} onChange={e => { setMfaCode(e.target.value.replace(/\D/g, '').slice(0, 6)); clearErr('mfaCode') }} placeholder="123456"
+                        className={`input ps-10 text-lg font-bold tracking-[0.4em] ${fieldErrors.mfaCode ? '!border-rose-400 !ring-2 !ring-rose-100' : ''}`} />
+                    </div>
+                    <AnimatePresence>{fieldErrors.mfaCode && <FieldWarning>{fieldErrors.mfaCode}</FieldWarning>}</AnimatePresence>
+                    <div className="mt-1.5 flex items-center justify-between gap-2 text-[11px] text-slate-500">
+                      <span>{translatePortalText("Didn't get it? Check spam, or")}</span>
+                      <button type="button" onClick={() => void resendMfa()} disabled={resendIn > 0 || mfaResending}
+                        className="font-bold text-ocean-600 hover:underline disabled:cursor-not-allowed disabled:text-slate-400 disabled:no-underline">
+                        {mfaResending
+                          ? translatePortalText('Sending…')
+                          : resendIn > 0
+                            ? `${translatePortalText('Resend code in')} ${Math.floor(resendIn / 60)}:${String(resendIn % 60).padStart(2, '0')}`
+                            : translatePortalText('Resend code')}
+                      </button>
+                    </div>
+                  </div>
+
+                  <motion.button whileTap={{ scale: 0.97 }} type="submit" disabled={mfaBusy || mfaCode.length !== 6}
+                    className={`${active.btn} w-full !justify-center !py-3 !text-sm disabled:opacity-70`}>
+                    {mfaBusy ? (
+                      <span className="flex items-center gap-2"><span className="h-4 w-4 animate-spin rounded-full border-2 border-white/40 border-t-white" /> {translatePortalText('Verifying…')}</span>
+                    ) : (
+                      <>{translatePortalText('Verify and sign in')} <ArrowRight size={16} /></>
+                    )}
+                  </motion.button>
+
+                  <button type="button" onClick={leaveMfa} className="w-full text-center text-xs font-bold text-slate-500 hover:text-deep-900 hover:underline">
+                    {translatePortalText('← Back to sign in')}
+                  </button>
+                </form>
+              ) : (
               <form onSubmit={submit} className="mt-5 space-y-4">
                 <AnimatePresence initial={false}>
                   {mode === 'signup' && (
@@ -665,6 +794,7 @@ export default function Login() {
                   )}
                 </motion.button>
               </form>
+              )}
 
               {/*
                 An "or continue with" divider sat here over two buttons —
@@ -695,7 +825,7 @@ export default function Login() {
               three characters it saves. "Privacy" is an anchor for the same
               reason as the one on the consent line above. */}
           <p className="mt-5 flex items-center justify-center gap-2 text-center text-[11px] text-white/65">
-            <User size={12} /> © {new Date().getFullYear()} HarborLink · BoatPro · {translatePortalText("Provider Console")} ·{' '}
+            <User size={12} /> © {new Date().getFullYear()} <a href="https://boatpro.club" target="_blank" rel="noopener noreferrer" className="hover:text-white">BoatPro</a> · {translatePortalText("Provider Console")} ·{' '}
             <a href="privacy.html" target="_blank" rel="noopener noreferrer" className="underline hover:text-white/70">{translatePortalText("Privacy")}</a>
           </p>
         </motion.div>

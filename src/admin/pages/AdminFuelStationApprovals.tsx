@@ -4,11 +4,12 @@ import { motion } from 'framer-motion'
 import {
   Fuel, Check, X, RefreshCw, MapPin, Phone, Mail, Radio,
   Clock, ShieldCheck, ExternalLink, AlertTriangle, ChevronRight,
-  Droplets, Building2, Globe
+  Building2, Globe
 } from 'lucide-react'
 import { PageWrap } from './_shared'
 import { AdminHeader } from '../adminUi'
 import { Modal, toast, Counter, CardGridSkeleton } from '../../ui'
+import { confirm } from '../../async'
 import { translatePortalText  , formatPortalDate, formatPortalNumber} from '../../i18n/runtime'
 import { adminPortalApi, fileUrl } from '../../api'
 
@@ -60,9 +61,18 @@ export default function AdminFuelStationApprovals() {
     setLoading(true)
     setError(null)
     try {
-      const res = await adminPortalApi.fuelStationApprovals(tab || undefined)
-      setStations(res.data?.stations || [])
-      setCounts(res.data?.statusCounts || {})
+      // Every page: one page of 100 hid the 101st station from the queue.
+      const all: any[] = []
+      let counts: Record<string, number> = {}
+      for (let page = 1; page <= 50; page++) {
+        const res = await adminPortalApi.fuelStationApprovals(tab || undefined, page)
+        const batch = res.data?.stations || []
+        counts = res.data?.statusCounts || counts
+        all.push(...batch)
+        if (batch.length < 100 || all.length >= (res.data?.total ?? 0)) break
+      }
+      setStations(all)
+      setCounts(counts)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load fuel stations')
     } finally {
@@ -89,8 +99,36 @@ export default function AdminFuelStationApprovals() {
     }
   }
 
+  /**
+   * Approve, after naming what the admin is approving past.
+   *
+   * The server approves and activates a station with no checks at all — no
+   * licences, expired ones, nothing for sale, or a draft its provider never
+   * submitted — and the buttons did that in one click.
+   */
+  const doApprove = async (s: any) => {
+    const id = s._id || s.id
+    if (!id || busyId) return
+    const licenses: any[] = s.licenses ?? []
+    const expired = licenses.filter((l) => l.expiresAt && new Date(l.expiresAt).getTime() < Date.now())
+    const sells = s.fuels?.length || s.fuelTypes?.length
+    const warnings: string[] = []
+    if ((s.approvalStatus || 'draft') === 'draft') warnings.push(translatePortalText('This station is still a draft — the provider has not submitted it for review.'))
+    if (!s.provider) warnings.push(translatePortalText('The provider account that owns it no longer exists.'))
+    if (!licenses.length) warnings.push(translatePortalText('No licences are on file.'))
+    if (expired.length) warnings.push(translatePortalText(`Expired: ${expired.map((l) => l.name).join(', ')}.`))
+    if (!sells) warnings.push(translatePortalText('No fuel grades are set up, so it has nothing to sell.'))
+    const ok = await confirm({
+      title: `Approve "${s.name}"?`,
+      body: [...warnings, translatePortalText('It is activated and appears on customer maps straight away.')].join(' '),
+      confirmLabel: warnings.length ? 'Approve anyway' : 'Approve',
+      danger: warnings.length > 0,
+    })
+    if (ok) act(s, () => adminPortalApi.approveFuelStation(id), `"${s.name}" approved & activated`)
+  }
+
   const doReject = () => {
-    if (!rejecting) return
+    if (!rejecting || busyId) return
     const id = rejecting._id || rejecting.id
     if (!id) { toast(translatePortalText('Invalid station ID'), 'warn'); return }
     if (reason.trim().length < 3) { toast(translatePortalText('Please provide a rejection reason (min 3 chars)'), 'warn'); return }
@@ -225,7 +263,7 @@ export default function AdminFuelStationApprovals() {
       {error && <div className="card mb-4 !border-rose-200 !bg-rose-50 text-sm text-rose-600">{translatePortalText("Couldn't load: ")}{error}</div>}
       {loading && <CardGridSkeleton count={6} />}
 
-      {!loading && filtered.length === 0 && (
+      {!loading && !error && filtered.length === 0 && (
         <div className="rounded-2xl border border-dashed border-slate-200 py-16 text-center text-sm text-slate-400 bg-white">
           {translatePortalText("No fuel stations found in this filter.")}
         </div>
@@ -283,7 +321,13 @@ export default function AdminFuelStationApprovals() {
                   <div className="space-y-1 text-[11.5px] text-slate-600">
                     <p className="flex items-center gap-2">
                       <MapPin size={13} className="text-amber-500 shrink-0" />
-                      <span className="truncate">{formatPortalNumber(s.latitude, { minimumFractionDigits: 4, maximumFractionDigits: 4 })}, {formatPortalNumber(s.longitude, { minimumFractionDigits: 4, maximumFractionDigits: 4 })}</span>
+                      {/* The marina it sits in, when the API populated one — the
+                          bare coordinates told a reviewer nothing about where it is. */}
+                      <span className="truncate">
+                        {s.marina?.name
+                          ? `${s.marina.name}${s.marina.city ? ` · ${s.marina.city}` : ''}`
+                          : `${formatPortalNumber(s.latitude, { minimumFractionDigits: 4, maximumFractionDigits: 4 })}, ${formatPortalNumber(s.longitude, { minimumFractionDigits: 4, maximumFractionDigits: 4 })}`}
+                      </span>
                       <a
                         href={`https://www.google.com/maps?q=${s.latitude},${s.longitude}`}
                         target="_blank"
@@ -303,12 +347,9 @@ export default function AdminFuelStationApprovals() {
                       <Clock size={13} className="text-slate-400 shrink-0" />
                       <span>{s.open24h ? translatePortalText('Open 24 Hours') : (s.operatingHours || translatePortalText('Standard Hours'))}</span>
                     </p>
-                    {s.delivery && (
-                      <p className="flex items-center gap-2 text-emerald-600 font-semibold">
-                        <Droplets size={13} className="shrink-0" />
-                        <span>{translatePortalText("Offers Boat Fuel Delivery")} ({formatPortalNumber(s.deliveryFeeSar || 0)} {translatePortalText(s.currency || "SAR")})</span>
-                      </p>
-                    )}
+                    {/* No "Offers Boat Fuel Delivery" line: fuel is station-only since
+                        2026-10-12 (the boat comes to the pump). Old rows still carry
+                        the legacy `delivery` flag, which no longer means anything. */}
                   </div>
 
                   {/* Rejection notice if rejected */}
@@ -332,7 +373,7 @@ export default function AdminFuelStationApprovals() {
                       <>
                         <button
                           disabled={busyId === id}
-                          onClick={() => act(s, () => adminPortalApi.approveFuelStation(id), `"${s.name}" approved & activated`)}
+                          onClick={() => void doApprove(s)}
                           className="btn-admin flex-1 !justify-center !py-1.5 !text-xs font-bold !bg-emerald-600 hover:!bg-emerald-700 text-white disabled:opacity-60"
                         >
                           <Check size={13} /> {translatePortalText("Approve")}
@@ -351,7 +392,7 @@ export default function AdminFuelStationApprovals() {
                     {s.approvalStatus === 'rejected' && (
                       <button
                         disabled={busyId === id}
-                        onClick={() => act(s, () => adminPortalApi.approveFuelStation(id), `"${s.name}" approved & activated`)}
+                        onClick={() => void doApprove(s)}
                         className="btn-admin flex-1 !justify-center !py-1.5 !text-xs font-bold !bg-emerald-600 text-white disabled:opacity-60"
                       >
                         <Check size={13} /> {translatePortalText(" Approve\n                      ")}</button>
@@ -442,7 +483,8 @@ export default function AdminFuelStationApprovals() {
             <div className="space-y-2">
               <p className="text-[11px] font-extrabold uppercase tracking-wider text-slate-400">{translatePortalText("Location & Coordinates")}</p>
               <div className="rounded-xl border border-slate-100 p-3 space-y-1.5 text-xs text-slate-700 bg-white">
-                <p><span className="font-semibold text-slate-500">{translatePortalText("Address:")}</span> {detail.address}</p>
+                {detail.marina?.name && <p><span className="font-semibold text-slate-500">{translatePortalText("Marina:")}</span> {detail.marina.name}</p>}
+                <p><span className="font-semibold text-slate-500">{translatePortalText("Address:")}</span> {detail.address || '—'}</p>
                 <p><span className="font-semibold text-slate-500">{translatePortalText("City / Region:")}</span> {detail.city || '—'} {detail.region ? `(${detail.region})` : ''}</p>
                 <p><span className="font-semibold text-slate-500">{translatePortalText("GPS Coordinates:")}</span> {formatPortalNumber(detail.latitude, { minimumFractionDigits: 4, maximumFractionDigits: 4 })}, {formatPortalNumber(detail.longitude, { minimumFractionDigits: 4, maximumFractionDigits: 4 })}</p>
                 <a
@@ -500,7 +542,10 @@ export default function AdminFuelStationApprovals() {
                     <div key={idx} className="rounded-xl border border-slate-100 p-3 text-xs bg-white flex items-center justify-between">
                       <div>
                         <p className="font-bold text-deep-900">{lic.name}</p>
-                        <p className="text-[11px] text-slate-500">{translatePortalText("Ref: ")}{lic.reference || '—'} {translatePortalText(" · Expires: ")}{lic.expiresAt ? formatPortalDate(new Date(lic.expiresAt)) : 'N/A'}</p>
+                        <p className="text-[11px] text-slate-500">{translatePortalText("Ref: ")}{lic.reference || '—'} {translatePortalText(" · Expires: ")}{lic.expiresAt ? formatPortalDate(new Date(lic.expiresAt)) : translatePortalText('N/A')}</p>
+                        {lic.expiresAt && new Date(lic.expiresAt).getTime() < Date.now() && (
+                          <p className="text-[10.5px] font-bold text-rose-600">{translatePortalText("Expired")}</p>
+                        )}
                       </div>
                       {lic.fileUrl && (
                         <a href={fileUrl(lic.fileUrl)} target="_blank" rel="noreferrer" className="btn-ghost !p-1.5 text-sky-600">
@@ -521,7 +566,7 @@ export default function AdminFuelStationApprovals() {
               {detail.approvalStatus !== 'approved' && (
                 <button
                   disabled={busyId === (detail._id || detail.id)}
-                  onClick={() => act(detail, () => adminPortalApi.approveFuelStation(detail._id || detail.id), `"${detail.name}" approved`)}
+                  onClick={() => void doApprove(detail)}
                   className="btn-admin !bg-emerald-600 hover:!bg-emerald-700 text-white text-xs font-bold"
                 >
                   <Check size={13} /> {translatePortalText("Approve Station")}

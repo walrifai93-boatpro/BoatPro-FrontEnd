@@ -32,7 +32,9 @@ import {
   type ApiChat,
   type ApiMessage,
 } from '../api'
-import { useAuth } from '../auth'
+import { useNavigate } from 'react-router-dom'
+import { useAuth, useMarinaPermissions } from '../auth'
+import { StaffAccessNote } from '../components/StaffAccessNote'
 import { formatPortalNumber, translatePortalText } from '../i18n/runtime'
 
 const DEFAULT_AI_PROMPTS = [
@@ -496,17 +498,40 @@ export function Messaging({ directOnly = false }: { directOnly?: boolean } = {})
 // ===========================================================================
 // Reviews of the marina, with replies
 // ===========================================================================
+/** `Review.reply.text` is capped at this on the server; a longer reply failed the save. */
+const REPLY_MAX = 2000
+
+/** Prev / next over a server-paginated list — 100 rows a page is the API's cap. */
+function Pager({ page, totalPages, total, onPage }: { page: number; totalPages: number; total: number; onPage: (p: number) => void }) {
+  if (totalPages <= 1) return null
+  return (
+    <div className="mt-4 flex items-center justify-end gap-2 text-xs text-slate-500">
+      <span className="me-auto">{translatePortalText(`Page ${page} of ${totalPages}`)} · {formatPortalNumber(total)} {translatePortalText('in total')}</span>
+      <button className="btn-ghost !py-1.5 !px-3 text-xs" disabled={page <= 1} onClick={() => onPage(page - 1)}>{translatePortalText('Previous')}</button>
+      <button className="btn-ghost !py-1.5 !px-3 text-xs" disabled={page >= totalPages} onClick={() => onPage(page + 1)}>{translatePortalText('Next')}</button>
+    </div>
+  )
+}
+
 export function Reviews() {
+  // Replying speaks for the marina: the owner, or staff on the bookings desk (the API checks the same).
+  const canReply = useMarinaPermissions().can('manage_bookings')
   const [unanswered, setUnanswered] = useState(false)
+  const [page, setPage] = useState(1)
   const [replyTo, setReplyTo] = useState<string | null>(null)
   const [text, setText] = useState('')
   const [busy, setBusy] = useState(false)
 
-  const state = useAsync(() => portalApi.reviews({ unanswered: unanswered || undefined, limit: 100 }).then(r => r.data), [unanswered])
+  const state = useAsync(() => portalApi.reviews({ unanswered: unanswered || undefined, page, limit: 100 }).then(r => r.data), [unanswered, page])
   const rows = state.data?.items ?? []
+  const pagination = state.data?.pagination
 
   const submit = async (id: string) => {
-    if (!text.trim()) return
+    // An empty or over-long reply used to do nothing at all (or fail the save
+    // server-side); say why instead.
+    if (!text.trim()) { toast(translatePortalText('Write a reply before publishing'), 'warn'); return }
+    if (text.trim().length > REPLY_MAX) { toast(translatePortalText(`Keep the reply under ${REPLY_MAX} characters`), 'warn'); return }
+    if (busy) return
     setBusy(true)
     try {
       await reviewsApi.reply(id, text.trim())
@@ -526,6 +551,7 @@ export function Reviews() {
       <PageHeader title={translatePortalText("Reviews & Ratings")} icon={<Star className="text-ocean-500" />}
         sub="What boaters say about your marina. Replies appear publicly on your listing."
         actions={<button className="btn-ghost" onClick={() => state.reload()}><RefreshCw size={14} /> {translatePortalText("Refresh")}</button>} />
+      <StaffAccessNote need={['manage_bookings']} action="Replying to reviews" />
 
       <div className="mb-5 grid gap-5 lg:grid-cols-3">
         <Section title={translatePortalText("Overall rating")} sub={`${formatPortalNumber(total)} ${translatePortalText(total === 1 ? 'review' : 'reviews')}`}>
@@ -559,12 +585,12 @@ export function Reviews() {
 
       <div className="mb-4 flex flex-wrap items-center gap-2">
         {([[false, 'All reviews'], [true, 'Awaiting a reply']] as const).map(([k, label]) => (
-          <button key={String(k)} onClick={() => setUnanswered(k)}
+          <button key={String(k)} onClick={() => { setUnanswered(k); setPage(1) }}
             className={`chip transition ${unanswered === k ? 'bg-deep-900 text-white' : 'bg-white ring-1 ring-slate-200 text-slate-500 hover:ring-ocean-300'}`}>
             {translatePortalText(label)}
           </button>
         ))}
-        <span className="ms-auto text-xs font-semibold text-slate-400">{formatPortalNumber(rows.length)} {translatePortalText("shown")}</span>
+        <span className="ms-auto text-xs font-semibold text-slate-400">{formatPortalNumber(rows.length)} {translatePortalText("shown")}{pagination && pagination.total > rows.length ? ` · ${formatPortalNumber(pagination.total)} ${translatePortalText('in total')}` : ''}</span>
       </div>
 
       <AsyncBlock state={state} loadingLabel="Loading reviews…"
@@ -585,6 +611,10 @@ export function Reviews() {
                         <p className="font-bold text-deep-900">{who?.name ?? translatePortalText('Boater')}</p>
                         <Stars n={r.rating} />
                         <span className="text-[11px] text-slate-400">{fmtRelative(r.createdAt)}</span>
+                        {/* Reported and waiting on a moderator — still public until someone takes it down. */}
+                        {r.moderation?.status === 'under_review' && (
+                          <span className="chip bg-amber-50 text-amber-700 ring-1 ring-amber-200">{translatePortalText('Under moderator review')}</span>
+                        )}
                       </div>
                       {r.comment && <p className="mt-1.5 text-sm text-slate-600">{r.comment}</p>}
 
@@ -595,14 +625,18 @@ export function Reviews() {
                         </div>
                       ) : replyTo === r.id ? (
                         <div className="mt-3">
-                          <textarea className="input min-h-[80px]" value={text} onChange={e => setText(e.target.value)} placeholder={translatePortalText("Thank them, or put the record straight…")} />
-                          <div className="mt-2 flex justify-end gap-2">
-                            <button className="btn-ghost !py-1.5 !px-3 text-xs" onClick={() => { setReplyTo(null); setText('') }}>{translatePortalText("Cancel")}</button>
-                            <button className="btn-primary !py-1.5 !px-3 text-xs" disabled={busy} onClick={() => submit(r.id)}>{translatePortalText("Publish reply")}</button>
+                          <textarea className="input min-h-[80px]" value={text} maxLength={REPLY_MAX} onChange={e => setText(e.target.value)} placeholder={translatePortalText("Thank them, or put the record straight…")} />
+                          <div className="mt-2 flex items-center justify-end gap-2">
+                            {/* The portal offers one reply per review — there is no edit once it is public. */}
+                            <span className="me-auto text-[11px] text-slate-400">
+                              {translatePortalText('Replies are public and cannot be edited once published.')} {formatPortalNumber(text.length)}/{formatPortalNumber(REPLY_MAX)}
+                            </span>
+                            <button className="btn-ghost !py-1.5 !px-3 text-xs" disabled={busy} onClick={() => { setReplyTo(null); setText('') }}>{translatePortalText("Cancel")}</button>
+                            <button className="btn-primary !py-1.5 !px-3 text-xs" disabled={busy || !text.trim()} onClick={() => submit(r.id)}>{translatePortalText(busy ? 'Publishing…' : 'Publish reply')}</button>
                           </div>
                         </div>
-                      ) : (
-                        <button className="btn-ghost mt-3 !py-1.5 !px-3 text-xs" onClick={() => { setReplyTo(r.id); setText('') }}>
+                      ) : !canReply ? null : (
+                        <button className="btn-ghost mt-3 !py-1.5 !px-3 text-xs" disabled={busy} onClick={() => { setReplyTo(r.id); setText('') }}>
                           <Reply size={13} /> {translatePortalText("Reply\n                        ")}</button>
                       )}
                     </div>
@@ -610,6 +644,7 @@ export function Reviews() {
                 </motion.div>
               )
             })}
+            {pagination && <Pager page={pagination.page} totalPages={pagination.totalPages} total={pagination.total} onPage={setPage} />}
           </div>
         )}
       </AsyncBlock>
@@ -627,14 +662,34 @@ const NOTIF_ICONS: Record<string, string> = {
   review_received: '⭐', documents_expiring: '📄', staff_assigned: '👷', general: '🔔',
 }
 
+/**
+ * Where a notification's subject lives in this console, by type. Only routes
+ * the marina console actually mounts (App.tsx); anything else has no link.
+ */
+const NOTIF_ROUTES: Record<string, string> = {
+  booking_request: '/reservations', booking_approved: '/reservations', booking_rejected: '/reservations',
+  booking_confirmed: '/reservations', booking_cancelled: '/reservations', booking_completed: '/reservations',
+  booking_modified: '/reservations', booking_arrived: '/movements', booking_no_show: '/movements',
+  booking_reminder: '/reservations', berth_arrival: '/movements', berth_departure: '/movements',
+  payment_success: '/billing', payment_refund: '/billing', work_order_assigned: '/maintenance',
+  utility_billed: '/utilities', incident_reported: '/emergency', emergency_sos: '/emergency',
+  review_received: '/reviews', documents_expiring: '/documents', document_approved: '/documents',
+  document_rejected: '/documents', document_action_required: '/documents', document_submitted: '/documents',
+  message: '/inbox', support_ticket: '/inbox',
+}
+
 export function NotificationsPage() {
   const { reloadAlerts } = useOps()
+  const nav = useNavigate()
   const [unreadOnly, setUnreadOnly] = useState(false)
+  const [page, setPage] = useState(1)
   const [busy, setBusy] = useState(false)
+  const [markingId, setMarkingId] = useState<string | null>(null)
 
-  const state = useAsync(() => notificationsApi.list({ unread: unreadOnly || undefined, limit: 100 }).then(r => r.data), [unreadOnly])
+  const state = useAsync(() => notificationsApi.list({ unread: unreadOnly || undefined, page, limit: 100 }).then(r => r.data), [unreadOnly, page])
   const rows = state.data?.items ?? []
   const unread = state.data?.unreadCount ?? 0
+  const pagination = state.data?.pagination
 
   const markAll = async () => {
     setBusy(true)
@@ -648,12 +703,24 @@ export function NotificationsPage() {
     } finally { setBusy(false) }
   }
 
+  // Notifications come back as plain objects with `_id` only (no `id` virtual),
+  // so `n.id` was undefined and every click PATCHed `/notifications/undefined/read`.
   const markOne = async (id: string) => {
+    if (!id || markingId) return
+    setMarkingId(id)
     try {
       await notificationsApi.markRead(id)
       await state.reload()
       await reloadAlerts()
-    } catch { /* non-critical */ }
+    } catch (e) {
+      toast(translatePortalText(e instanceof Error ? e.message : 'Could not mark that notification read'), 'warn')
+    } finally { setMarkingId(null) }
+  }
+
+  const openOne = async (n: { isRead: boolean; type: string }, id: string) => {
+    const to = NOTIF_ROUTES[n.type]
+    if (!n.isRead) await markOne(id)
+    if (to) nav(to)
   }
 
   const byType = useMemo(() => {
@@ -671,16 +738,19 @@ export function NotificationsPage() {
           <button className="btn-primary" disabled={unread === 0 || busy} onClick={markAll}><CheckCheck size={15} /> {translatePortalText("Mark all read")}</button>
         </>} />
 
-      <div className="mb-5 grid gap-3.5 sm:grid-cols-2 xl:grid-cols-4">
-        <StatCard i={0} label="Unread" value={unread} icon={<Bell size={17} />} tone="rose" />
-        <StatCard i={1} label="Berth requests" value={byType.booking_request ?? 0} icon={<Bell size={17} />} tone="amber" />
-        <StatCard i={2} label="Payments" value={byType.payment_success ?? 0} icon={<Bell size={17} />} tone="green" />
-        <StatCard i={3} label="Total shown" value={rows.length} icon={<Bell size={17} />} tone="navy" />
-      </div>
+      {/* Tiles wait for the first response, so a failed load does not read as "0 unread". */}
+      {state.data && (
+        <div className="mb-5 grid gap-3.5 sm:grid-cols-2 xl:grid-cols-4">
+          <StatCard i={0} label="Unread" value={unread} icon={<Bell size={17} />} tone="rose" />
+          <StatCard i={1} label="Berth requests" value={byType.booking_request ?? 0} icon={<Bell size={17} />} tone="amber" />
+          <StatCard i={2} label="Payments" value={byType.payment_success ?? 0} icon={<Bell size={17} />} tone="green" />
+          <StatCard i={3} label="Total shown" value={rows.length} icon={<Bell size={17} />} tone="navy" />
+        </div>
+      )}
 
       <div className="mb-4 flex flex-wrap items-center gap-2">
         {([[false, 'Everything'], [true, `Unread only${unread ? ` · ${formatPortalNumber(unread)}` : ''}`]] as const).map(([k, label]) => (
-          <button key={String(k)} onClick={() => setUnreadOnly(k)}
+          <button key={String(k)} onClick={() => { setUnreadOnly(k); setPage(1) }}
             className={`chip transition ${unreadOnly === k ? 'bg-deep-900 text-white' : 'bg-white ring-1 ring-slate-200 text-slate-500 hover:ring-ocean-300'}`}>
             {translatePortalText(label)}
           </button>
@@ -691,22 +761,33 @@ export function NotificationsPage() {
         empty={d => d.items.length === 0 ? { icon: '🔔', text: unreadOnly ? "You're all caught up" : 'No notifications yet' } : null}>
         {() => (
           <div className="space-y-2">
-            {rows.map((n, i) => (
-              <motion.button key={n.id} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: Math.min(i * 0.02, 0.35) }}
-                onClick={() => !n.isRead && markOne(n.id)}
-                className={`flex w-full items-start gap-3 rounded-2xl border p-4 text-left transition hover:shadow-soft ${!n.isRead ? 'border-ocean-100 bg-ocean-50/40' : 'border-slate-100 bg-white'}`}>
-                <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-sand text-lg">{NOTIF_ICONS[n.type] ?? '🔔'}</span>
-                <div className="min-w-0 flex-1">
-                  <p className="flex flex-wrap items-center gap-2">
-                    <b className="text-sm text-deep-900">{translatePortalText(n.title)}</b>
-                    <Badge>{translatePortalText(humanize(n.type))}</Badge>
-                    <span className="text-[11px] text-slate-400">{fmtRelative(n.createdAt)}</span>
-                  </p>
-                  <p className="mt-0.5 text-sm text-slate-600">{translatePortalText(n.body)}</p>
-                </div>
-                {!n.isRead && <span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-ocean-500" />}
-              </motion.button>
-            ))}
+            {rows.map((n, i) => {
+              const nid = idOf(n)
+              const to = NOTIF_ROUTES[n.type]
+              return (
+                <motion.div key={nid || i} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: Math.min(i * 0.02, 0.35) }}
+                  role="button" tabIndex={0}
+                  onClick={() => !n.isRead && markOne(nid)}
+                  onKeyDown={e => { if ((e.key === 'Enter' || e.key === ' ') && !n.isRead) { e.preventDefault(); void markOne(nid) } }}
+                  className={`flex w-full cursor-pointer items-start gap-3 rounded-2xl border p-4 text-left transition hover:shadow-soft ${!n.isRead ? 'border-ocean-100 bg-ocean-50/40' : 'border-slate-100 bg-white'} ${markingId === nid ? 'opacity-60' : ''}`}>
+                  <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-sand text-lg">{NOTIF_ICONS[n.type] ?? '🔔'}</span>
+                  <div className="min-w-0 flex-1">
+                    <p className="flex flex-wrap items-center gap-2">
+                      <b className="break-words text-sm text-deep-900">{translatePortalText(n.title)}</b>
+                      <Badge>{humanize(n.type)}</Badge>
+                      <span className="text-[11px] text-slate-400">{fmtRelative(n.createdAt)}</span>
+                    </p>
+                    <p className="mt-0.5 break-words text-sm text-slate-600">{translatePortalText(n.body)}</p>
+                  </div>
+                  {to && (
+                    <button className="btn-ghost shrink-0 !py-1 !px-2.5 text-[11px]" disabled={markingId === nid}
+                      onClick={e => { e.stopPropagation(); void openOne(n, nid) }}>{translatePortalText('Open')} →</button>
+                  )}
+                  {!n.isRead && <span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-ocean-500" />}
+                </motion.div>
+              )
+            })}
+            {pagination && <Pager page={pagination.page} totalPages={pagination.totalPages} total={pagination.total} onPage={setPage} />}
           </div>
         )}
       </AsyncBlock>

@@ -58,7 +58,6 @@ export const MAINTENANCE_ARABIC_MESSAGES: Record<string, string> = {
   "What a boat owner might type looking for this job. Leave blank and we'll build them from the name and category.": "الكلمات التي قد يستخدمها مالك القارب للعثور على هذه الخدمة. اترك الحقل فارغًا لإنشائها تلقائيًا من الاسم والفئة.",
 
   "🔧 Service Notifications": "🔧 إشعارات الخدمات",
-  "HarborLink ·": "HarborLink ·",
   "· Powered by BoatPro": "· مدعوم من BoatPro",
   "📞 Call": "📞 اتصال",
   "Call now": "اتصل الآن",

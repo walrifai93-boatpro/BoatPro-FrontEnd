@@ -15,7 +15,9 @@ export default function ImageGalleryUpload({
   onUpload: (files: File[], category?: string) => Promise<void>
   onDelete: (index: number) => Promise<void>
 }) {
-  const [category, setCategory] = useState(categories[0] || '')
+  // No category until one is chosen: defaulting to the first ("logo") tagged a
+  // whole batch of berth photos as logos (QA W-07).
+  const [category, setCategory] = useState('')
   const [busy, setBusy] = useState(false)
   const [deletingAt, setDeletingAt] = useState<number | null>(null)
 
@@ -56,6 +58,7 @@ export default function ImageGalleryUpload({
         <div className="flex items-center gap-2">
           {categories.length > 0 && (
             <select className="input !py-1.5 !text-xs" value={category} onChange={(e) => setCategory(e.target.value)}>
+              <option value="">{translatePortalText('No category')}</option>
               {categories.map((c) => <option key={c} value={c}>{translatePortalText(c.replace(/_/g, ' '))}</option>)}
             </select>
           )}

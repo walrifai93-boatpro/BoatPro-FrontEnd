@@ -8,11 +8,16 @@ import { listingPhoto } from '../../images'
 import { PageWrap, toKycItem } from './_shared'
 import { Section, Modal, toast, Stars, Counter, Img, downloadCsv } from '../../ui'
 import { AdminHeader, ABadge, AProgress } from '../adminUi'
-import { adminPortalApi, authApi, documentsApi, type AdminPortalUser, type AdminUserStats, type AdminWorkerApproval, type ApiVendor, type ApiKycDocument } from '../../api'
-import { confirmAndRun } from '../../async'
+import { adminPortalApi, authApi, documentsApi, fileUrl, type AdminPortalUser, type AdminUserStats, type AdminWorkerApproval, type ApiVendor, type ApiKycDocument } from '../../api'
+import { confirmAndRun, errorMessage } from '../../async'
+import { useAuth } from '../../auth'
 import { formatPortalDate, formatPortalNumber, formatPortalPercent, translatePortalText } from '../../i18n/runtime'
 
-const roleLabels: Record<string, string> = { customer: 'Customer', boat_owner: 'Boat Owner', boat_provider: 'Boat Provider', marina_provider: 'Marina Provider', fuel_provider: 'Fuel Provider', maintenance_provider: 'Maintenance Provider', admin: 'Admin' }
+// Every role in the backend's `USER_ROLES`. Workers, crew and support agents
+// were missing, so their rows and role tiles showed the raw key ("boat_crew").
+const roleLabels: Record<string, string> = { customer: 'Customer', boat_owner: 'Boat Owner', boat_provider: 'Boat Provider', marina_provider: 'Marina Provider', fuel_provider: 'Fuel Provider', maintenance_provider: 'Maintenance Provider', fuel_worker: 'Fuel Worker', maintenance_worker: 'Maintenance Worker', marina_worker: 'Marina Staff', boat_crew: 'Boat Crew', support_agent: 'Support Agent', admin: 'Admin' }
+/** Roles whose `onboarding.status` is enforced — the only ones "Suspend" means anything for. */
+const PROVIDER_ROLE_KEYS = ['boat_provider', 'marina_provider', 'fuel_provider', 'maintenance_provider']
 
 const vendorCategoryLabels: Record<string, string> = { spare_parts: 'Spare Parts', cleaning: 'Cleaning', rescue: 'Rescue', provisioning: 'Provisioning', media: 'Media', other: 'Other' }
 const vendorStatusLabels: Record<string, 'Approved' | 'Pending' | 'Suspended'> = { approved: 'Approved', pending: 'Pending', suspended: 'Suspended' }
@@ -39,7 +44,7 @@ const mapUser = (u: AdminPortalUser, stats?: AdminUserStats): any => ({
   id: u.id || u._id,
   name: u.name,
   email: u.email,
-  avatar: u.avatar || avatar(1),
+  avatar: fileUrl(u.avatar) || avatar(1),
   role: translatePortalText(roleLabels[u.role] || u.role),
   roleKey: u.role,
   status: !u.isActive ? 'Blocked' : u.onboarding?.status === 'suspended' ? 'Suspended' : u.onboarding?.status === 'pending' ? 'Pending' : 'Active',
@@ -139,12 +144,27 @@ function UsersPage() {
   const [sel, setSel] = useState<any | null>(null)
   const [users, setUsers] = useState<any[]>([])
   const [roleCounts, setRoleCounts] = useState<any[]>([])
+  // There was no loading or error state: while loading, and after a failed
+  // load, the table rendered its header over nothing — no rows, no message.
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+  /** Accounts on the platform matching the query — the list holds at most 500. */
+  const [total, setTotal] = useState(0)
+  const { user: me } = useAuth()
+  const myId = me ? String(me.id || me._id) : ''
 
-  useEffect(() => {
+  /*
+    One loader for the first read and every refresh after an action. The
+    refresh used to skip the role tiles, so after blocking or unblocking they
+    still described the page as first loaded.
+  */
+  const load = () =>
     adminPortalApi.users({ limit: 500, withStats: true })
       .then(res => {
         const stats = res.data.stats || {}
         setUsers(res.data.items.map(u => mapUser(u, stats[u.id || u._id])))
+        setTotal(res.data.pagination?.total ?? res.data.items.length)
+        setError(null)
         if (res.data.roleCounts) {
           const mappedCounts = Object.entries(res.data.roleCounts).map(([k, v]) => ({
             role: roleLabels[k] || k,
@@ -154,16 +174,12 @@ function UsersPage() {
           setRoleCounts(mappedCounts)
         }
       })
-      .catch(err => toast(translatePortalText('Failed to load users'), 'warn'))
-  }, [])
+      .catch(err => setError(errorMessage(err)))
+      .finally(() => setLoading(false))
 
-  const reload = () =>
-    adminPortalApi.users({ limit: 500, withStats: true })
-      .then(res => {
-        const stats = res.data.stats || {}
-        setUsers(res.data.items.map(u => mapUser(u, stats[u.id || u._id])))
-      })
-      .catch(() => toast(translatePortalText('Failed to reload users'), 'warn'))
+  useEffect(() => { void load() }, [])
+
+  const reload = () => load()
 
   /**
    * Sends the account holder a real password-reset code.
@@ -174,23 +190,34 @@ function UsersPage() {
    * uses, and it emails the code to the address on the account — the admin never
    * sees it, which is the property that makes this safe to expose here.
    */
+  /*
+    The success toast said "Reset code emailed to X" — but the endpoint answers
+    the same way whether or not the email could be delivered (it is the public
+    login-screen endpoint, built not to reveal anything), so the console cannot
+    know it arrived. The copy now claims only what the server confirmed.
+  */
   const resetPassword = async (u: any) =>
     confirmAndRun({
       title: `Send a password reset to ${u.name}?`,
       body: `A reset code goes to ${u.email}. You will not see the code — only they can use it.`,
       confirmLabel: 'Send reset',
       busyLabel: 'Sending…',
-      success: `Reset code emailed to ${u.email}`,
+      success: `Reset requested — a code is emailed to ${u.email} if delivery succeeds`,
       run: async () => { await authApi.forgotPassword(u.email) },
     })
 
   /** Block or unblock for real, via the `isActive` flag. */
   const toggleBlocked = async (u: any) => {
     const blocking = u.status !== 'Blocked'
+    // The server refuses it ("You cannot change your own account status");
+    // the button is disabled for your own row, and this is the backstop.
+    if (u.id === myId) { toast(translatePortalText('You cannot block your own account'), 'warn'); return }
     return confirmAndRun({
       title: blocking ? `Block ${u.name}?` : `Unblock ${u.name}?`,
       body: blocking
-        ? 'They will not be able to sign in until you unblock them.'
+        ? u.roleKey === 'admin'
+          ? 'This is an ADMIN account. They lose access to this console and cannot sign in until you unblock them.'
+          : 'They will not be able to sign in until you unblock them.'
         : 'They will be able to sign in again.',
       confirmLabel: blocking ? 'Block' : 'Unblock',
       busyLabel: blocking ? 'Blocking…' : 'Unblocking…',
@@ -203,7 +230,13 @@ function UsersPage() {
     })
   }
 
-  /** Suspend via onboarding status — what the provider apps actually read. */
+  /*
+    Suspend via onboarding status — what the provider apps actually read.
+    Only providers: for a customer, worker or admin `onboarding.status` is
+    read by nothing, so "Suspend" reported success and changed nothing they
+    could feel (Customers says the same). Block is the action for them.
+  */
+  const canSuspend = (u: any) => PROVIDER_ROLE_KEYS.includes(u.roleKey) && u.id !== myId
   const setSuspended = async (u: any, suspend: boolean) =>
     confirmAndRun({
       title: suspend ? `Suspend ${u.name}?` : `Reinstate ${u.name}?`,
@@ -300,6 +333,20 @@ function UsersPage() {
         searchPlaceholder={translatePortalText('Search name, email, ID…')}
       />
 
+      {error && (
+        <div className="card mb-4 !border-rose-200 !bg-rose-50 p-4 text-sm text-rose-600">
+          {translatePortalText('Could not load users')}: {error}{' '}
+          <button className="font-bold underline" onClick={() => { setLoading(true); void load() }}>{translatePortalText('Retry')}</button>
+        </div>
+      )}
+      {/* Search and filters run in the browser over what was loaded, so an
+          account past the newest 500 could not be found and nothing said so. */}
+      {total > users.length && (
+        <p className="mb-3 rounded-xl bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-700">
+          {translatePortalText('Showing the newest')} {formatPortalNumber(users.length)} {translatePortalText('of')} {formatPortalNumber(total)} {translatePortalText('accounts — search and filters cover only these.')}
+        </p>
+      )}
+
       {users.length > 0 && list.length === 0 && <NoFilterMatches noun={translatePortalText('users')} onClear={tf.clear} />}
 
       <div className="card overflow-hidden">
@@ -325,10 +372,17 @@ function UsersPage() {
                 <div className="flex justify-end gap-1.5 whitespace-nowrap">
                   <button onClick={() => setSel(u)} className="grid h-8 w-8 place-items-center rounded-lg bg-slate-100 text-slate-500 hover:bg-slate-200" title={translatePortalText('View')}><Eye size={13} /></button>
                   <button onClick={() => void resetPassword(u)} className="grid h-8 w-8 place-items-center rounded-lg bg-slate-100 text-slate-500 hover:bg-slate-200" title={translatePortalText('Send password reset')}><KeyRound size={13} /></button>
-                  <button onClick={() => void toggleBlocked(u)} className="grid h-8 w-8 place-items-center rounded-lg bg-rose-50 text-rose-500 hover:bg-rose-100" title={u.status === 'Blocked' ? translatePortalText('Unblock') : translatePortalText('Block')}><Ban size={13} /></button>
+                  {/* Unblock looked identical to Block — same red ban icon. */}
+                  <button onClick={() => void toggleBlocked(u)} disabled={u.id === myId}
+                    className={`grid h-8 w-8 place-items-center rounded-lg disabled:cursor-not-allowed disabled:opacity-40 ${u.status === 'Blocked' ? 'bg-emerald-50 text-emerald-600 hover:bg-emerald-100' : 'bg-rose-50 text-rose-500 hover:bg-rose-100'}`}
+                    title={u.id === myId ? translatePortalText('You cannot block your own account') : u.status === 'Blocked' ? translatePortalText('Unblock') : translatePortalText('Block')}>
+                    {u.status === 'Blocked' ? <Check size={13} /> : <Ban size={13} />}
+                  </button>
                 </div>
               </motion.div>
             ))}
+            {loading && users.length === 0 && <div className="px-4 py-14 text-center text-sm text-slate-400">{translatePortalText('Loading users…')}</div>}
+            {!loading && !error && users.length === 0 && <div className="px-4 py-14 text-center text-sm text-slate-400">{translatePortalText('No accounts yet.')}</div>}
           </div>
           <TablePagination state={tf} noun={translatePortalText('users')} />
         </div>
@@ -344,7 +398,7 @@ function UsersPage() {
                 <p className="text-xs text-slate-400">{sel.email} · {sel.id} · {translatePortalText('joined')} {sel.joined}</p>
                 <div className="mt-1.5 flex gap-1.5">{sel.tags.map((t: string) => <span key={t} className="chip bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200 !text-[10px]">{translatePortalText(t)}</span>)}</div>
               </div>
-              <ABadge dot>{translatePortalText(sel.status)}</ABadge>
+              <ABadge dot={sel.status === 'Active'}>{translatePortalText(sel.status)}</ABadge>
             </div>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
               {[
@@ -356,11 +410,16 @@ function UsersPage() {
                 <div key={l} className="rounded-xl bg-sand p-3 text-center"><p className="text-[10px] font-bold uppercase text-slate-400">{l}</p><p className="font-display text-base font-extrabold text-deep-900">{v}</p></div>
               ))}
             </div>
-            <div className="flex flex-wrap justify-end gap-2 border-t border-slate-100 pt-4">
+            <div className="flex flex-wrap items-center justify-end gap-2 border-t border-slate-100 pt-4">
+              {!canSuspend(sel) && (
+                <p className="me-auto text-[11px] text-slate-400">
+                  {translatePortalText(sel.id === myId ? 'This is your own account.' : 'Suspension applies to provider accounts only — use Block for this account.')}
+                </p>
+              )}
               {sel.status === 'Suspended' ? (
-                <button className="btn-admin" onClick={() => void setSuspended(sel, false)}>{translatePortalText('Reinstate')}</button>
+                <button className="btn-admin disabled:opacity-50" disabled={!canSuspend(sel)} onClick={() => void setSuspended(sel, false)}>{translatePortalText('Reinstate')}</button>
               ) : (
-                <button className="btn-ghost !text-amber-600" onClick={() => void setSuspended(sel, true)}>{translatePortalText('Suspend')}</button>
+                <button className="btn-ghost !text-amber-600 disabled:opacity-50" disabled={!canSuspend(sel)} onClick={() => void setSuspended(sel, true)}>{translatePortalText('Suspend')}</button>
               )}
             </div>
           </div>
@@ -411,7 +470,7 @@ function ProvidersPage() {
           icon: u.role === 'marina_provider' ? '⚓' : u.role === 'boat_provider' ? '⛵' : u.role === 'fuel_provider' ? '⛽' : '🔧',
           owner: u.name,
           email: u.email,
-          avatar: u.avatar || avatar(1),
+          avatar: fileUrl(u.avatar) || avatar(1),
           status: !u.isActive ? 'Blocked' : u.onboarding?.status === 'suspended' ? 'Suspended' : u.onboarding?.status === 'pending' ? 'Pending' : u.onboarding?.status === 'approved' ? 'Live' : 'Pending',
           verified: u.onboarding?.status === 'approved',
           joinedAt: u.createdAt || '',

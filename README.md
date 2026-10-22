@@ -1,4 +1,4 @@
-# HarborLink — Marina & Port Provider Portal
+# BoatPro — Provider & Admin Console (boatpro.club)
 
 A full-featured web portal for marina / port providers (companion to the BoatPro boater app), built with **React 18 + TypeScript + Vite + Tailwind CSS + Framer Motion + Recharts**. All data is dummy/demo data defined in [`src/data.ts`](src/data.ts).
 

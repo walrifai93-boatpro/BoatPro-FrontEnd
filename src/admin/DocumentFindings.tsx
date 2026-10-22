@@ -71,9 +71,11 @@ function Finding({ finding }: { finding: DocumentFinding }) {
     <div className={`flex items-start gap-2.5 border-s-2 ${tone.rail} ps-2.5 py-1`}>
       <Icon size={13} className={`shrink-0 mt-[3px] ${tone.icon}`} />
       <div className="min-w-0 flex-1">
-        <p className="text-[12px] font-bold leading-snug text-deep-900">{finding.message}</p>
+        {/* Translated here as the summary below already does — the same finding
+            read in English on the card and Arabic in the summary. */}
+        <p className="text-[12px] font-bold leading-snug text-deep-900">{translatePortalText(finding.message)}</p>
         {finding.detail && (
-          <p className="mt-1 text-[11px] leading-relaxed text-slate-500">{finding.detail}</p>
+          <p className="mt-1 text-[11px] leading-relaxed text-slate-500">{translatePortalText(finding.detail)}</p>
         )}
       </div>
       <code className="shrink-0 rounded-md bg-slate-100 px-1.5 py-0.5 text-[9.5px] font-bold uppercase tracking-wide text-slate-400">
@@ -169,13 +171,35 @@ export function DocumentFindingsSummary({ review }: { review?: DocumentReview | 
 
   const { counts, current, submitted, submittedAt } = review
 
+  /*
+    "Cleared every document" was printed whenever there were no findings —
+    including for an applicant with no documents at all, and for documents the
+    reading never ran on (the API reports an unread document as `clear`). Both
+    read to a reviewer as a pass that never happened.
+  */
+  if ((counts?.documents ?? 0) === 0) {
+    return (
+      <div className="flex items-center gap-2.5 rounded-2xl border border-amber-200 bg-amber-50/70 px-3.5 py-2.5">
+        <AlertTriangle size={15} className="shrink-0 text-amber-600" />
+        <p className="text-[12px] font-bold text-amber-800">
+          {translatePortalText('No documents on file — there was nothing for the automated reading to check.')}
+        </p>
+      </div>
+    )
+  }
+
   if (current.length === 0) {
     return (
-      <div className="flex items-center gap-2.5 rounded-2xl border border-emerald-200 bg-emerald-50/70 px-3.5 py-2.5">
-        <ShieldCheck size={15} className="shrink-0 text-emerald-600" />
-        <p className="text-[12px] font-bold text-emerald-800">
-          {translatePortalText('The automated reading cleared every document on file.')}
-        </p>
+      <div className="flex items-start gap-2.5 rounded-2xl border border-emerald-200 bg-emerald-50/70 px-3.5 py-2.5">
+        <ShieldCheck size={15} className="mt-[1px] shrink-0 text-emerald-600" />
+        <div>
+          <p className="text-[12px] font-bold text-emerald-800">
+            {translatePortalText('No AI findings on the documents on file.')}
+          </p>
+          <p className="text-[11px] text-emerald-700/80">
+            {translatePortalText('A document the AI has not read also has no findings — open each one before approving.')}
+          </p>
+        </div>
       </div>
     )
   }
@@ -210,11 +234,13 @@ export function DocumentFindingsSummary({ review }: { review?: DocumentReview | 
       </div>
 
       <div className="divide-y divide-slate-100">
-        {current.map((group) => {
-          const tone = TONE[group.severity]
+        {current.map((group, gi) => {
+          const tone = TONE[group.severity] ?? TONE.warning
           const Icon = tone.Icon
           return (
-            <div key={group.docType} className="flex items-start gap-2.5 px-3.5 py-2.5">
+            // Index in the key: the API sends one group per document row, and a
+            // type with an older version on file appears more than once.
+            <div key={`${group.docType}-${gi}`} className="flex items-start gap-2.5 px-3.5 py-2.5">
               <Icon size={14} className={`mt-[2px] shrink-0 ${tone.icon}`} />
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
@@ -231,7 +257,7 @@ export function DocumentFindingsSummary({ review }: { review?: DocumentReview | 
                   )}
                 </div>
                 <ul className="mt-1 space-y-1">
-                  {group.findings.map((f, i) => (
+                  {(group.findings ?? []).map((f, i) => (
                     <li key={`${f.code}-${i}`} className="text-[11.5px] leading-snug text-slate-600">
                       <span className="font-bold text-slate-700">{translatePortalText(f.message)}</span>
                       {f.detail && <span className="text-slate-500"> {translatePortalText(f.detail)}</span>}

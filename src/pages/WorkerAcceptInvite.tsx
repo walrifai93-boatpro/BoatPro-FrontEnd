@@ -4,7 +4,7 @@ import { motion, AnimatePresence } from 'framer-motion'
 import { Eye, EyeOff, Lock, ShieldCheck, ArrowRight } from 'lucide-react'
 import { toast, FieldWarning } from '../ui'
 import { ThemeToggle } from '../theme'
-import { workerInviteApi, maintWorkerInviteApi, crewInviteApi } from '../api'
+import { workerInviteApi, maintWorkerInviteApi, crewInviteApi, marinaWorkerInviteApi } from '../api'
 import { useAuth, type PortalRole } from '../auth'
 import { translatePortalText } from '../i18n/runtime'
 
@@ -14,7 +14,7 @@ import { translatePortalText } from '../i18n/runtime'
  * `dest: null` below.
  */
 type Stage = 'checking' | 'ready' | 'invalid' | 'pending' | 'done'
-type InvitePortal = 'fuel' | 'maint' | 'crew'
+type InvitePortal = 'fuel' | 'maint' | 'crew' | 'marina'
 
 const PORTAL_CFG: Record<InvitePortal, {
   label: string
@@ -30,12 +30,17 @@ const PORTAL_CFG: Record<InvitePortal, {
    * no pages they may open would be a dead end.
    */
   dest: PortalRole | null
-  api: typeof workerInviteApi
+  api: typeof workerInviteApi | typeof marinaWorkerInviteApi
 }> = {
   fuel: { label: 'Fuel Portal', gradient: 'bg-fuel-gradient', button: 'btn-fuel', ownerNoun: 'fuel station owner', dest: 'fuel', api: workerInviteApi },
   maint: { label: 'Maintenance Portal', gradient: 'bg-maint-gradient', button: 'btn-maint', ownerNoun: 'workshop owner', dest: 'maint', api: maintWorkerInviteApi },
   crew: { label: 'Vessel Crew', gradient: 'bg-fuel-gradient', button: 'btn-fuel', ownerNoun: 'boat owner', dest: null, api: crewInviteApi },
+  // Marina staff land in the marina console, which is mounted at `/`.
+  marina: { label: 'Marina Portal', gradient: 'bg-hero-gradient', button: 'btn-primary', ownerNoun: 'marina owner', dest: 'marina', api: marinaWorkerInviteApi },
 }
+
+/** Where each portal's console is mounted (the marina console is the root). */
+const portalHome = (dest: PortalRole) => (dest === 'marina' ? '/' : `/${dest}`)
 
 export default function WorkerAcceptInvite() {
   const { portal, token = '' } = useParams()
@@ -44,7 +49,7 @@ export default function WorkerAcceptInvite() {
   const { adoptSession } = useAuth()
 
   const [stage, setStage] = useState<Stage>('checking')
-  const [invite, setInvite] = useState<{ name: string; email: string } | null>(null)
+  const [invite, setInvite] = useState<{ name: string; email: string; marinaName?: string; role?: string } | null>(null)
   const [pw, setPw] = useState('')
   const [confirm, setConfirm] = useState('')
   const [showPw, setShowPw] = useState(false)
@@ -87,7 +92,7 @@ export default function WorkerAcceptInvite() {
       if (!res.data.accessToken) throw new Error('Portal access has not been issued yet.')
       await adoptSession({ ...res.data, accessToken: res.data.accessToken }, cfg.dest)
       toast(`Welcome to the team, ${res.data.user.name} 🎉`)
-      nav(`/${cfg.dest}`, { replace: true })
+      nav(portalHome(cfg.dest), { replace: true })
     } catch (err) {
       toast(err instanceof Error ? err.message : 'Could not complete signup. Please try again.', 'warn')
     } finally {
@@ -154,7 +159,14 @@ export default function WorkerAcceptInvite() {
                     <p className="text-xs text-slate-400">{invite.email}</p>
                   </div>
                 </div>
-                <p className="mt-3 text-xs text-slate-500">{translatePortalText("Set a password to finish joining the ")}{cfg.label.toLowerCase()} {translatePortalText("team.")}</p>
+                {invite.marinaName ? (
+                  <p className="mt-3 text-xs text-slate-500">
+                    {translatePortalText("Set a password to join the team at ")}<strong>{invite.marinaName}</strong>
+                    {invite.role ? <> {translatePortalText("as")} {translatePortalText(invite.role)}</> : null}.
+                  </p>
+                ) : (
+                  <p className="mt-3 text-xs text-slate-500">{translatePortalText("Set a password to finish joining the ")}{cfg.label.toLowerCase()} {translatePortalText("team.")}</p>
+                )}
 
                 <form onSubmit={submit} className="mt-5 space-y-4">
                   <div>

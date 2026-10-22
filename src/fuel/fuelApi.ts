@@ -505,6 +505,8 @@ export interface ApiFuelOverview {
   pendingBookings: ApiFuelBooking[]
   emergencyBooking: ApiFuelBooking | null
   activeDeliveries: ApiFuelDelivery[]
+  /** Accepted, scheduled or fuelling — boats due at, or alongside, the fuel dock. */
+  openOrders?: ApiFuelBooking[]
   alerts: ApiFuelNotification[]
   kpis: {
     revenueMonth: number
@@ -512,6 +514,8 @@ export interface ApiFuelOverview {
     salesToday: number
     volumeToday: number
     pendingOrders: number
+    /** Orders taken and not yet finished. Absent from a backend older than station-only fuel. */
+    openOrders?: number
     activeDeliveries: number
     completedToday: number
     lowStockAlerts: number

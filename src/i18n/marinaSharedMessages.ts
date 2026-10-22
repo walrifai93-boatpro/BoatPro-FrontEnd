@@ -275,4 +275,13 @@ export const MARINA_SHARED_ARABIC_MESSAGES: Record<string, string> = {
   'Next page': 'الصفحة التالية',
   'Last page': 'الصفحة الأخيرة',
   'Search berths, boats, customers, bookings…': 'ابحث عن أرصفة أو قوارب أو عملاء أو حجوزات…',
+
+  // Inbox & Help / Account standing (2026-10-15 audit)
+  'Load earlier messages': 'تحميل الرسائل الأقدم',
+  'Could not load earlier messages': 'تعذّر تحميل الرسائل الأقدم',
+  'A commission statement is overdue': 'كشف عمولة متأخر السداد',
+  'You have reached your cash commission limit': 'لقد بلغت حد العمولة النقدية',
+  'Pay the overdue statement from Billing & Payments to keep cash bookings open. Online bookings are not affected.': 'سدّد الكشف المتأخر من الفوترة والمدفوعات لإبقاء الحجوزات النقدية متاحة. الحجوزات الإلكترونية غير متأثرة.',
+  'Cash bookings pause until the commission you owe is paid down. Online bookings are not affected. Settle it from Billing & Payments.': 'تتوقف الحجوزات النقدية حتى تسدّد العمولة المستحقة عليك. الحجوزات الإلكترونية غير متأثرة. سدّدها من الفوترة والمدفوعات.',
+  'fading': 'يتلاشى',
 }

@@ -56,9 +56,14 @@ export default function MarinaLocationPicker({
 
   const reverse = (lat: number, lng: number) => {
     setResolving(true)
+    // A failed lookup (or one the server could not resolve) saves "Location
+    // pinned", never the coordinates as text — they were stored as the
+    // address and shown as a place ("21.48580, 39.19250").
+    const pinned = translatePortalText('Location pinned')
+    const isCoordText = (a?: string) => !a || /^\s*-?\d+(\.\d+)?\s*,\s*-?\d+(\.\d+)?\s*$/.test(a)
     mapsApi.reverse(lat, lng)
-      .then((r) => onChange({ latitude: lat, longitude: lng, address: r.data.address }))
-      .catch(() => onChange({ latitude: lat, longitude: lng, address: `${lat.toFixed(5)}, ${lng.toFixed(5)}` }))
+      .then((r) => onChange({ latitude: lat, longitude: lng, address: isCoordText(r.data.address) ? pinned : r.data.address }))
+      .catch(() => onChange({ latitude: lat, longitude: lng, address: pinned }))
       .finally(() => setResolving(false))
   }
 

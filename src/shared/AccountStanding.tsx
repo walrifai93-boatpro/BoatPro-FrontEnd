@@ -18,6 +18,13 @@ import { translatePortalText, formatPortalNumber, formatPortalDate } from '../i1
 const label = (s: string) => translatePortalText(s.replace(/_/g, ' '))
 const when = (d?: string) => (d ? formatPortalDate(new Date(d), { dateStyle: 'medium' }) : '')
 
+/** `RISK_FULL_WEIGHT_DAYS` on the API: after this an event's weight starts to fade, so "+30" is no longer what it adds. */
+const FULL_WEIGHT_DAYS = 90
+const isFading = (d?: string) => !!d && Date.now() - new Date(d).getTime() > FULL_WEIGHT_DAYS * 86_400_000
+
+/** The server refuses a shorter appeal (`fileAppeal`); said in the dialog rather than after it closes. */
+const APPEAL_MIN = 10
+
 /** Plain-language names for the event types a provider may see. */
 const EVENT_LABEL: Record<string, string> = {
   cash_disputed: 'A customer disputed a cash payment',
@@ -40,7 +47,7 @@ function AppealState({ appeal }: { appeal?: RiskAppeal }) {
   if (!appeal) return null
   const tone = appeal.status === 'pending' ? 'bg-violet-50 text-violet-700' : appeal.status === 'upheld' ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-600'
   return (
-    <div className={`mt-2 rounded-lg px-2.5 py-1.5 text-[11.5px] ${tone}`}>
+    <div dir="auto" className={`mt-2 break-words rounded-lg px-2.5 py-1.5 text-[11.5px] ${tone}`}>
       <b>{translatePortalText(appeal.status === 'pending' ? 'Appeal under review' : appeal.status === 'upheld' ? 'Appeal accepted' : 'Appeal not accepted')}</b>
       {appeal.response ? ` — ${appeal.response}` : ''}
     </div>
@@ -50,13 +57,18 @@ function AppealState({ appeal }: { appeal?: RiskAppeal }) {
 export default function AccountStanding() {
   const [data, setData] = useState<Standing | null>(null)
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
 
   const load = async () => {
     setLoading(true)
     try {
       setData((await standingApi.mine()).data)
+      setError('')
     } catch (e) {
-      toast(translatePortalText(e instanceof Error ? e.message : 'Could not load your account standing'), 'warn')
+      const message = e instanceof Error ? e.message : 'Could not load your account standing'
+      setError(message)
+      // A refresh that fails over data already on screen says so, and keeps it.
+      if (data) toast(translatePortalText(message), 'warn')
     } finally {
       setLoading(false)
     }
@@ -75,6 +87,7 @@ export default function AccountStanding() {
         required: true,
         multiline: true,
         maxLength: 2000,
+        validate: text => (text.trim().length < APPEAL_MIN ? translatePortalText('Explain what is wrong, in at least a sentence.') : undefined),
       },
       success: translatePortalText('Appeal sent'),
       run: async text => {
@@ -85,11 +98,41 @@ export default function AccountStanding() {
   }
 
   if (loading && !data) return <div className="flex justify-center py-20"><Spinner /></div>
-  if (!data) return null
+  // A failed load used to render nothing at all — a blank page under the menu.
+  if (!data) {
+    return (
+      <div className="mx-auto max-w-4xl p-4 md:p-6">
+        <div role="alert" className="card p-6 text-center">
+          <ShieldAlert size={26} className="mx-auto text-amber-500" />
+          <p className="mt-2 font-bold text-deep-900">{translatePortalText('Could not load your account standing')}</p>
+          {error && <p className="mt-1 text-sm text-slate-500">{translatePortalText(error)}</p>}
+          <button onClick={() => void load()} className="btn-ghost mt-4 !py-1.5 !px-3 !text-[12px]"><RefreshCw size={13} /> {translatePortalText('Try again')}</button>
+        </div>
+      </div>
+    )
+  }
 
   const { thresholds: t } = data
-  const good = data.score < t.WARNING && !data.cashBlocked && !data.underReview
+  /*
+    What the numbers say about money, beside what the risk events say. An
+    overdue commission statement or a reached cash limit pauses cash bookings
+    too, and this page called such an account "in good standing — nothing is
+    counting against you" because it only looked at the score.
+  */
+  const owes = data.financialState === 'overdue' || data.financialState === 'limit_reached'
+  const good = data.score < t.WARNING && !data.cashBlocked && !data.underReview && !owes
   const tone = data.score >= t.CASH_WITHDRAWN ? 'text-rose-600' : data.score >= t.WARNING ? 'text-amber-600' : 'text-emerald-600'
+  const headline = good ? 'Your account is in good standing'
+    : data.cashBlocked ? 'Cash bookings are paused on your account'
+      : data.underReview ? 'Your account is being reviewed'
+        : data.financialState === 'overdue' ? 'A commission statement is overdue'
+          : data.financialState === 'limit_reached' ? 'You have reached your cash commission limit'
+            : 'Your account has warnings'
+  const explanation = data.underReview ? 'An admin is looking at recent activity on your account. Online bookings continue as normal.'
+    : good ? 'Nothing is counting against you right now.'
+      : data.financialState === 'overdue' ? 'Pay the overdue statement from Billing & Payments to keep cash bookings open. Online bookings are not affected.'
+        : data.financialState === 'limit_reached' ? 'Cash bookings pause until the commission you owe is paid down. Online bookings are not affected. Settle it from Billing & Payments.'
+          : 'The items below count against your account. They fade out over time, and you can appeal any you think are wrong.'
 
   return (
     <div className="mx-auto max-w-4xl space-y-5 p-4 md:p-6">
@@ -98,7 +141,7 @@ export default function AccountStanding() {
           <h1 className="font-display text-2xl font-extrabold text-deep-900">{translatePortalText('Account standing')}</h1>
           <p className="text-sm text-slate-500">{translatePortalText('What BoatPro\'s trust checks say about your account, and why.')}</p>
         </div>
-        <button onClick={() => void load()} className="btn-ghost !py-1.5 !px-3 !text-[12px]"><RefreshCw size={13} /> {translatePortalText('Refresh')}</button>
+        <button onClick={() => void load()} disabled={loading} className="btn-ghost !py-1.5 !px-3 !text-[12px] disabled:opacity-60"><RefreshCw size={13} className={loading ? 'animate-spin' : ''} /> {translatePortalText('Refresh')}</button>
       </div>
 
       <div className="card flex flex-wrap items-center gap-5 p-5">
@@ -107,14 +150,10 @@ export default function AccountStanding() {
         </span>
         <div className="min-w-0 flex-1">
           <p className="text-[15px] font-extrabold text-deep-900">
-            {translatePortalText(good ? 'Your account is in good standing' : data.cashBlocked ? 'Cash bookings are paused on your account' : data.underReview ? 'Your account is being reviewed' : 'Your account has warnings')}
+            {translatePortalText(headline)}
           </p>
-          <p className="mt-0.5 text-[12.5px] text-slate-500">
-            {data.cashBlockedReason || translatePortalText(
-              data.underReview ? 'An admin is looking at recent activity on your account. Online bookings continue as normal.'
-                : good ? 'Nothing is counting against you right now.'
-                : 'The items below count against your account. They fade out over time, and you can appeal any you think are wrong.'
-            )}
+          <p dir="auto" className="mt-0.5 break-words text-[12.5px] text-slate-500">
+            {data.cashBlockedReason ? translatePortalText(data.cashBlockedReason) : translatePortalText(explanation)}
           </p>
         </div>
         <div className="text-end">
@@ -141,8 +180,8 @@ export default function AccountStanding() {
             <div key={e._id} className="rounded-xl border border-slate-100 p-3">
               <div className="flex flex-wrap items-start gap-2">
                 <div className="min-w-0 flex-1">
-                  <p className="text-[12.5px] font-bold text-deep-900">{translatePortalText(EVENT_LABEL[e.type] ?? label(e.type))} <span className="font-normal text-slate-400">· +{formatPortalNumber(e.weight)} · {when(e.createdAt)}</span></p>
-                  <p className="mt-0.5 text-[12px] text-slate-600">{e.detail}</p>
+                  <p className="text-[12.5px] font-bold text-deep-900">{translatePortalText(EVENT_LABEL[e.type] ?? label(e.type))} <span className="font-normal text-slate-400">· +{formatPortalNumber(e.weight)}{isFading(e.createdAt) ? ` (${translatePortalText('fading')})` : ''} · {when(e.createdAt)}</span></p>
+                  <p dir="auto" className="mt-0.5 break-words text-[12px] text-slate-600">{e.detail}</p>
                 </div>
                 {!e.appeal && (
                   <button onClick={() => void appeal('event', e._id, e.detail)} className="btn-ghost !py-1 !px-2.5 !text-[11px]"><Gavel size={12} /> {translatePortalText('Appeal')}</button>
@@ -163,7 +202,7 @@ export default function AccountStanding() {
               <div className="flex flex-wrap items-start gap-2">
                 <div className="min-w-0 flex-1">
                   <p className="text-[12.5px] font-bold text-deep-900">{translatePortalText(d.summary)} <span className="font-normal text-slate-400">· {when(d.decidedAt)}</span></p>
-                  {d.note && <p className="mt-0.5 text-[12px] text-slate-600">{d.note}</p>}
+                  {d.note && <p dir="auto" className="mt-0.5 break-words text-[12px] text-slate-600">{d.note}</p>}
                 </div>
                 {!d.appeal && (
                   <button onClick={() => void appeal('decision', d._id, d.summary)} className="btn-ghost !py-1 !px-2.5 !text-[11px]"><Gavel size={12} /> {translatePortalText('Appeal')}</button>

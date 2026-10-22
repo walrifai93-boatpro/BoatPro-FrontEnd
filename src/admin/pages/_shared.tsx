@@ -1,7 +1,7 @@
 import React from 'react'
 import { avatar } from '../../format'
 import { translatePortalText, formatPortalNumber  , formatPortalDate} from '../../i18n/runtime'
-import type { AIDocument, ApiAdminPayment, ApiKycDocument, ApiReview } from '../../api'
+import { fileUrl, type AIDocument, type ApiAdminPayment, type ApiApplicantDocChecklist, type ApiKycDocument, type ApiReview } from '../../api'
 import type { KycItem, Provider } from '../adminData'
 
 export function PageWrap({ children }: { children: React.ReactNode }) {
@@ -100,6 +100,25 @@ export function vatCertificateLabel(hasVatCertificate: boolean | undefined): str
   return translatePortalText('Not asked — required')
 }
 
+const VESSEL_AND_CREW_DOC_TYPES = ['captain_license', 'boat_registration', 'boat_license']
+
+/**
+ * A provider's registration documents, less vessel and crew papers when the
+ * provider is not a boat operator and the checklist does not ask for them.
+ *
+ * The server leaves those out itself; this keeps a fuel station's review free
+ * of boat registrations even when an older server still sends them.
+ */
+export function relevantRegistrationDocs<T extends { docType?: string }>(
+  docs: T[],
+  role: string | undefined,
+  checklist: ApiApplicantDocChecklist | null | undefined,
+): T[] {
+  if (!role || role === 'boat_provider') return docs
+  const onChecklist = new Set([...(checklist?.required ?? []), ...(checklist?.optional ?? [])].map((s) => s.docType))
+  return docs.filter((d) => !VESSEL_AND_CREW_DOC_TYPES.includes(d.docType ?? '') || onChecklist.has(d.docType ?? ''))
+}
+
 // Real DocumentVerification.docType values grouped into the same broad
 // categories the KYC UI already presents (Identity/Business/License/Insurance/Tax).
 const DOC_TYPE_KIND: Record<string, KycItem['kind']> = {
@@ -122,7 +141,7 @@ export function toKycItem(doc: ApiKycDocument): KycItem {
   return {
     id: doc._id,
     who: owner?.name || 'Unknown',
-    avatar: owner?.avatar || seededAvatar(doc._id),
+    avatar: fileUrl(owner?.avatar) || seededAvatar(doc._id),
     kind: DOC_TYPE_KIND[doc.docType] || 'Business',
     doc: docTypeLabel(doc.docType),
     submitted: formatPortalDate(new Date(doc.createdAt)),
@@ -147,7 +166,7 @@ export function aiDocToKycItem(doc: AIDocument): KycItem {
   return {
     id,
     who: owner?.name || 'Unknown',
-    avatar: owner?.avatar || seededAvatar(id),
+    avatar: fileUrl(owner?.avatar) || seededAvatar(id),
     kind: DOC_TYPE_KIND[doc.docType] || 'Business',
     doc: doc.docType === 'unknown' ? 'Unrecognised document' : docTypeLabel(doc.docType),
     submitted: formatPortalDate(new Date(doc.createdAt)),

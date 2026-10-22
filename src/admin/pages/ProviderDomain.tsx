@@ -1,5 +1,5 @@
 import { useNavigate } from 'react-router-dom'
-import React, { useState, useEffect, useCallback, useMemo } from 'react'
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { motion } from 'framer-motion'
 import {
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend,
@@ -15,7 +15,7 @@ import {
   type Provider, type ABooking,
 } from '../adminData'
 import { listingPhoto } from '../../images'
-import { PageWrap, ChartTip, BOOKING_TYPE_META, PAYMENT_STATUS_META, seededAvatar, personName, MONTH_NAMES, toKycItem, aiDocToKycItem, REVIEW_TARGET_TYPES_FOR_KIND, REVIEW_STAFF_MODEL_FOR_KIND, vatCertificateLabel, earnedCommission, platformCut, paymentProviderLabel } from './_shared'
+import { PageWrap, ChartTip, BOOKING_TYPE_META, PAYMENT_STATUS_META, seededAvatar, personName, MONTH_NAMES, toKycItem, aiDocToKycItem, REVIEW_TARGET_TYPES_FOR_KIND, REVIEW_STAFF_MODEL_FOR_KIND, vatCertificateLabel, earnedCommission, platformCut, paymentProviderLabel, relevantRegistrationDocs } from './_shared'
 import { Section, toast, Img, Counter, Modal, CardGridSkeleton, TableSkeleton, downloadCsv } from '../../ui'
 import { TableToolbar, useTableFilters, NoFilterMatches, TablePagination, type TableFiltersConfig } from '../../shared/TableFilters'
 import { AdminHeader, ABadge, AProgress, ViewToggle } from '../adminUi'
@@ -29,6 +29,7 @@ import type { ApiApplicantDocChecklist } from '../../api'
 import { AiDocumentVerificationModal } from '../../components/AiDocumentVerificationModal'
 import { RequestReuploadModal } from '../../components/RequestReuploadModal'
 import { planKindOf, planModelLabel, planTermsLabel, providerPlanLabel } from '../../shared/planLabel'
+import { PlanPricingPanel } from '../ProviderPlanControls'
 import { BASE_CURRENCY } from '../../currency'
 import { formatMoney } from '../../live'
 import { isPortalArabic, translatePortalText, translatePortalTemplate, formatPortalDate, formatPortalNumber, formatPortalPercent } from '../../i18n/runtime'
@@ -43,6 +44,71 @@ function formatAdminDayCount(value: number | null | undefined): string {
   const remainder = days % 100
   const unit = days === 2 ? 'يومان' : remainder >= 3 && remainder <= 10 ? 'أيام' : remainder >= 11 && remainder <= 99 ? 'يوماً' : 'يوم'
   return `${amount} ${unit}`
+}
+
+/**
+ * Text that is only numbers — "25.20494, 55.27042" — is a map pin, not a place.
+ *
+ * The provider apps' location picker writes the raw coordinates into `address`
+ * when reverse-geocoding fails, and the listing and directory columns fell back
+ * to that field, so a station's Location read "25.20494".
+ */
+const COORDINATE_TEXT = /^[-+\d\s.,°]+$/
+function isCoordinateText(v: unknown): boolean {
+  return typeof v === 'string' && /\d/.test(v) && COORDINATE_TEXT.test(v.trim())
+}
+
+/** The first real place name, "Location pinned" if all we hold is a pin, else null. */
+function placeLabel(...vals: (string | null | undefined)[]): string | null {
+  let pinned = false
+  for (const v of vals) {
+    const t = typeof v === 'string' ? v.trim() : ''
+    if (!t) continue
+    if (isCoordinateText(t)) { pinned = true; continue }
+    return t
+  }
+  return pinned ? translatePortalText('Location pinned') : null
+}
+
+/**
+ * When a package's display label and its billed term disagree.
+ *
+ * A package carries two terms: `duration`, free text shown on Packages &
+ * Pricing ("1 Month"), and `durationMonths`, which billing and expiry use. They
+ * are set separately and never reconciled, so a package can read "1 Month" there
+ * while charging — and here, correctly, showing — "/yr" and a 321-day expiry.
+ * Returns a note when they differ, so the directory explains itself.
+ */
+function packageTermMismatch(onboarding: any): string | null {
+  const pkg = onboarding?.subscriptionPackageId
+  if (!pkg || typeof pkg !== 'object' || typeof pkg.duration !== 'string') return null
+  const m = pkg.duration.match(/(\d+)\s*(month|year|yr|mo)/i)
+  if (!m) return null
+  const labelled = Number(m[1]) * (/^y/i.test(m[2]) ? 12 : 1)
+  const billed = pkg.durationMonths || 1
+  if (labelled === billed) return null
+  return `${translatePortalText('Package is labelled')} “${pkg.duration}” ${translatePortalText('but bills')} ${formatPortalNumber(billed)} ${translatePortalText(billed === 1 ? 'month' : 'months')}`
+}
+
+/** A failed load, said as one — never an empty table that reads as "none". */
+function LoadError({ message, onRetry }: { message: string; onRetry: () => void }) {
+  return (
+    <div className="card mb-4 flex flex-wrap items-center justify-between gap-3 !border-rose-200 !bg-rose-50 p-4 text-sm text-rose-700">
+      <span className="flex items-center gap-2"><AlertTriangle size={15} className="shrink-0" /> {message}</span>
+      <button onClick={onRetry} className="btn-ghost !py-1.5 !px-3 !text-xs !text-rose-700 border border-rose-200 bg-white"><RotateCcw size={12} /> {translatePortalText('Retry')}</button>
+    </div>
+  )
+}
+
+/** "Showing 100 of 240" with a button for the next page, when there is one. */
+function LoadMore({ shown, total, busy, onMore, noun }: { shown: number; total: number; busy: boolean; onMore: () => void; noun: string }) {
+  if (total <= shown) return null
+  return (
+    <div className="mt-4 flex flex-wrap items-center justify-center gap-3 text-xs text-slate-500">
+      <span>{translatePortalText('Showing')} {formatPortalNumber(shown)} {translatePortalText('of')} {formatPortalNumber(total)} {translatePortalText(noun)}</span>
+      <button onClick={onMore} disabled={busy} className="btn-ghost !py-1.5 !px-3 !text-xs disabled:opacity-60">{translatePortalText(busy ? 'Loading…' : 'Load more')}</button>
+    </div>
+  )
 }
 
 // Provider["kind"] ('Boat'/'Marina'/'Fuel'/'Maintenance') → the Payment
@@ -61,14 +127,22 @@ export function ProviderDirectory({ cfg }: { cfg: DomainCfg }) {
   const nav = useNavigate()
   const [filter, setFilter] = useState('All')
   const [view, setView] = useState<'card' | 'table'>('table')
-  const filters = ['All', 'Live', 'Expiring / Expired', 'Pending', 'Awaiting Payment', 'Rejected', 'Suspended']
+  // Incomplete and Blocked are statuses a row can carry, so each has a chip —
+  // without them those providers were reachable only under "All".
+  const filters = ['All', 'Live', 'Expiring / Expired', 'Pending', 'Awaiting Payment', 'Rejected', 'Suspended', 'Incomplete', 'Blocked']
   const [all, setAll] = useState<any[]>([])
+  const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  // The latest request only — switching vertical mid-load must not let the
+  // slower, older response write another vertical's providers in here.
+  const loadSeq = useRef(0)
   const [detail, setDetail] = useState<any | null>(null)
   const [registration, setRegistration] = useState<any | null>(null)
   const [regDocs, setRegDocs] = useState<any[]>([])
   const [docReview, setDocReview] = useState<DocumentReview | null>(null)
   const [docChecklist, setDocChecklist] = useState<ApiApplicantDocChecklist | null>(null)
   const [regLoading, setRegLoading] = useState(false)
+  const [regError, setRegError] = useState<string | null>(null)
   const [expandedDocTypes, setExpandedDocTypes] = useState<Record<string, boolean>>({})
   const [aiDoc, setAiDoc] = useState<AIDocument | null>(null)
   // The document a reviewer is asking the provider to replace, if any.
@@ -102,24 +176,35 @@ export function ProviderDirectory({ cfg }: { cfg: DomainCfg }) {
       error: `Could not ${status === 'approved' ? 'approve' : 'reject'} the document. Please try again.`,
     })
 
+  // The latest provider opened only — a slower answer for the one opened
+  // before it must not fill this modal with that provider's documents.
+  const detailSeq = useRef(0)
   const openDetail = async (p: any) => {
-    setDetail(p); setRegistration(null); setRegDocs([]); setDocReview(null); setDocChecklist(null); setRegLoading(true); setExpandedDocTypes({});
+    const seq = ++detailSeq.current
+    setDetail(p); setRegistration(null); setRegDocs([]); setDocReview(null); setDocChecklist(null); setRegLoading(true); setRegError(null); setExpandedDocTypes({});
     try {
       const r = await adminApi.getRegistration(p._id || p.id)
+      if (seq !== detailSeq.current) return
       setRegistration(r.data.registration)
-      setRegDocs(r.data.documents)
+      setRegDocs(relevantRegistrationDocs(r.data.documents, p.role ?? `${cfg.slug}_provider`, r.data.documentChecklist))
       setDocReview(r.data.documentReview ?? null)
       setDocChecklist(r.data.documentChecklist ?? null)
     } catch (e) {
-      console.error('Failed to load registration', e)
+      if (seq !== detailSeq.current) return
+      // Said in the modal: the empty document list below otherwise reads as
+      // "this provider uploaded nothing".
+      setRegError(translatePortalText(e instanceof Error ? e.message : 'Could not load their registration and documents'))
     } finally {
-      setRegLoading(false)
+      if (seq === detailSeq.current) setRegLoading(false)
     }
   }
 
   const load = useCallback(() => {
-    adminApi.listProviders({ role: `${cfg.slug}_provider` })
+    const seq = ++loadSeq.current
+    setLoadError(null)
+    return adminApi.listProviders({ role: `${cfg.slug}_provider` })
       .then(res => {
+        if (seq !== loadSeq.current) return
         setAll(res.data.providers.map(p => {
           // `providerKind`, never `role`. A diving operator is a `boat_provider`
           // whose kind is `scuba_diver` — "scuba_diver" is not, and never was, a
@@ -135,7 +220,7 @@ export function ProviderDirectory({ cfg }: { cfg: DomainCfg }) {
             isDiver,
             icon: isDiver ? '🤿' : cfg.icon,
             owner: p.name,
-            avatar: p.avatar || seededAvatar(p.id || p._id),
+            avatar: fileUrl(p.avatar) || seededAvatar(p.id || p._id),
             status: !(p as any).isActive
               ? 'Blocked'
               : p.onboarding?.status === 'suspended'
@@ -151,10 +236,14 @@ export function ProviderDirectory({ cfg }: { cfg: DomainCfg }) {
               // with an Approve button, indistinguishable from one awaiting review.
               : p.onboarding?.status === 'rejected'
               ? 'Rejected'
-              : p.onboarding?.status === 'incomplete' || p.onboarding?.status === 'draft'
+              // No onboarding record at all is an account that never applied —
+              // it showed as "Pending", with an Approve button.
+              : !p.onboarding?.status || p.onboarding.status === 'incomplete' || (p.onboarding.status as string) === 'draft'
               ? 'Incomplete'
               : 'Pending',
             verified: p.onboarding?.status === 'approved',
+            // Sent back with approve/reject: the server refuses (409) if it changed meanwhile.
+            onboardingStatus: p.onboarding?.status ?? 'pending',
             // Real figures from the list (`stats`) — these were hardcoded to 0,
             // so Revenue and Rating read "—" on every row and "Has bookings"
             // could never match anyone.
@@ -166,32 +255,69 @@ export function ProviderDirectory({ cfg }: { cfg: DomainCfg }) {
             // said the same thing for every subscriber. Never the `|| 15` this
             // once fell back to: a fixed-fee provider has no percentage.
             plan: providerPlanLabel(p.onboarding),
-            paymentModel: p.onboarding?.billingModel || 'subscription',
+            // No `|| 'subscription'`: an account that never chose a plan is not a
+            // subscriber, and the fallback gave it a Remind button and an
+            // "awaiting payment" approval toast it had nothing to do with.
+            paymentModel: p.onboarding?.billingModel || null,
+            // "Fixed fee" told apart from "Commission" — both ride on `commission`.
+            planKind: planKindOf(p.onboarding),
             subscriptionExpiry: (p.onboarding as any)?.subscriptionExpiry || p.onboarding?.subscriptionExpiresAt,
-            subStatus: (p as any).subscriptionInfo?.status || (p.onboarding?.billingModel === 'commission' ? 'commission' : 'active'),
-            daysUntilExpiry: (p as any).subscriptionInfo?.daysUntilExpiry ?? null,
-            isExpiringSoon: (p as any).subscriptionInfo?.isExpiringSoon || false,
-            isExpired: (p as any).subscriptionInfo?.isExpired || false,
+            subStatus: p.subscriptionInfo?.status || 'none',
+            daysUntilExpiry: p.subscriptionInfo?.daysUntilExpiry ?? null,
+            isExpiringSoon: p.subscriptionInfo?.status === 'expiring_soon',
+            // From the status, not `isExpired`: the server sets that flag on an
+            // account awaiting its first payment too, so every Awaiting Payment
+            // provider was counted, filtered and badged as "Expired".
+            isExpired: p.subscriptionInfo?.status === 'expired',
             joined: p.createdAt ? formatPortalDate(new Date(p.createdAt)) : 'Unknown',
             email: p.email,
+            // The business's city, never the raw pin some accounts hold instead.
+            place: placeLabel(p.business?.city, p.business?.region),
             image: cfg.hero,
             raw: p,
           }
         }))
       })
-      .catch(() => toast(translatePortalText(`Failed to load ${cfg.name} providers`), 'warn'))
-  }, [cfg.slug, cfg.kind, cfg.icon, cfg.hero])
+      .catch((e) => {
+        if (seq !== loadSeq.current) return
+        // Said on the page, with a retry — it used to leave "No providers in
+        // All" on screen, which reads as a vertical with nobody in it.
+        setAll([])
+        setLoadError(translatePortalText(e instanceof Error ? e.message : `Failed to load ${cfg.name} providers`))
+      })
+      .finally(() => { if (seq === loadSeq.current) setLoading(false) })
+  }, [cfg.slug, cfg.kind, cfg.icon, cfg.hero, cfg.name])
 
-  useEffect(() => { load() }, [load])
+  // A new vertical starts from a skeleton, not the last one's rows.
+  useEffect(() => { setLoading(true); setAll([]); load() }, [load])
 
-  const act = async (p: any, fn: () => Promise<any>, msg: string, tone: any = 'success') => {
-    try {
-      await fn()
-      toast(translatePortalText(msg), tone)
-      load()
-    } catch (e) {
-      toast(translatePortalText(e instanceof Error ? e.message : 'Action failed'), 'warn')
-    }
+  // A plan change in the detail modal reloads the directory; the open modal
+  // follows the reloaded row so its Billing Model and Package lines are not
+  // left describing the plan they were just moved off.
+  useEffect(() => {
+    if (!detail) return
+    const id = detail._id || detail.id
+    const row = all.find(r => r.id === id)
+    if (row && row.raw !== detail) setDetail(row.raw)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [all])
+
+  /**
+   * What the server says happened, not what the button hoped would.
+   *
+   * Approve can land a subscriber on "awaiting payment" rather than live, and an
+   * approval can succeed while the provider's marina/station/shop fails to be
+   * created (`provisioningWarning`) — the toast used to say "now live" either way.
+   */
+  const approvalOutcome = (p: any, res: any, verb: 'approved' | 'reactivated') => {
+    const status = res?.data?.user?.onboarding?.status
+    const warning: string | undefined = res?.provisioningWarning
+    const base = status === 'pending_subscription_payment'
+      ? `${p.name} ${verb} — now awaiting provider subscription payment`
+      : status === 'approved'
+      ? `${p.name} ${verb} — now live`
+      : `${p.name} ${verb}`
+    return warning ? `${base}. But their listing could not be set up: ${warning}` : base
   }
 
   const sendReminder = (p: any) =>
@@ -214,11 +340,63 @@ export function ProviderDirectory({ cfg }: { cfg: DomainCfg }) {
       error: 'Failed to send subscription reminder',
     })
 
-  // Only a subscription provider waits on a payment after approval; a commission
-  // or fixed-fee provider goes live at once, and used to be told otherwise.
-  const approve = (p: any) => act(p, () => adminApi.approve(p.id), p.paymentModel === 'subscription'
-    ? `${p.name} approved — now awaiting provider subscription payment`
-    : `${p.name} approved — now live`)
+  const [checkingId, setCheckingId] = useState<string | null>(null)
+
+  /**
+   * Approve, after looking at what is being approved.
+   *
+   * This was a one-click call. Approving also marks every document still
+   * pending as approved (server-side), so a provider whose licence the AI had
+   * flagged critical went live without the admin ever being told. The
+   * registration is read first, and the dialog says what is wrong with the file
+   * — or that it could not be checked — before anything is written. A provider
+   * another admin has already decided on is refreshed instead of re-approved.
+   */
+  const approve = async (p: any) => {
+    if (checkingId) return
+    setCheckingId(p.id)
+    const warnings: string[] = []
+    let stale = false
+    try {
+      const r = await adminApi.getRegistration(p.id)
+      const regStatus = r.data.registration?.status
+      if (regStatus === 'approved' || regStatus === 'rejected') stale = true
+      const counts = r.data.documentReview?.counts
+      if (counts?.critical) warnings.push(`${counts.critical} critical AI finding${counts.critical === 1 ? '' : 's'} on their documents`)
+      if (counts?.warning) warnings.push(`${counts.warning} AI warning${counts.warning === 1 ? '' : 's'} on their documents`)
+      const outstanding = r.data.documentChecklist?.outstanding?.length ?? 0
+      if (!p.isDiver && outstanding) warnings.push(`${outstanding} required document${outstanding === 1 ? '' : 's'} missing or rejected`)
+      const pendingDocs = r.data.documents.filter(d => d.status === 'pending').length
+      if (pendingDocs) warnings.push(`${pendingDocs} document${pendingDocs === 1 ? '' : 's'} not yet reviewed will be marked approved`)
+    } catch {
+      warnings.push('Their documents could not be checked just now')
+    } finally {
+      setCheckingId(null)
+    }
+    if (stale) {
+      toast(translatePortalText(`${p.name} has already been decided on — refreshing the list`), 'warn')
+      load()
+      return
+    }
+    const res = await confirmAndRun({
+      title: `Approve ${p.name}?`,
+      body: warnings.length
+        ? `Before you approve: ${warnings.join('; ')}. Open Documents to review them first.`
+        : p.paymentModel === 'subscription'
+        ? 'Their documents raised no AI findings. As a subscriber they go live once they pay.'
+        : 'Their documents raised no AI findings. They go live straight away.',
+      confirmLabel: warnings.length ? 'Approve anyway' : 'Approve',
+      busyLabel: 'Approving...',
+      danger: warnings.length > 0,
+      run: () => adminApi.approve(p.id, { expectedStatus: p.onboardingStatus }),
+      error: 'Could not approve this provider. Please try again.',
+    })
+    if (res) {
+      const msg = approvalOutcome(p, res, 'approved')
+      toast(translatePortalText(msg), (res as any).provisioningWarning ? 'warn' : 'success')
+    }
+    load()
+  }
   // The old flow validated the reason *after* the prompt closed, so a too-short
   // answer lost the typed text and fired a toast. The dialog now blocks confirm
   // until a reason is entered, and keeps it on screen while the call runs.
@@ -230,12 +408,43 @@ export function ProviderDirectory({ cfg }: { cfg: DomainCfg }) {
       confirmLabel: 'Reject',
       busyLabel: 'Rejecting...',
       danger: true,
-      run: (reason) => adminApi.reject(p.id, reason),
+      run: (reason) => adminApi.reject(p.id, reason, p.onboardingStatus),
       success: `${p.name} rejected`,
       error: 'Could not reject this provider. Please try again.',
+    }).finally(() => load()) // the row kept its Approve button until a manual reload
+  // One click used to suspend outright. It stops every listing taking bookings
+  // and notifies the provider, so it asks first. (The API takes no reason.)
+  const suspend = (p: any) =>
+    confirmAndRun({
+      title: `Suspend ${p.name}?`,
+      body: 'Their listings stop taking bookings at once and they are notified. Existing bookings are not cancelled.',
+      confirmLabel: 'Suspend',
+      busyLabel: 'Suspending...',
+      danger: true,
+      run: () => adminApi.suspend(p.id),
+      success: `${p.name} suspended`,
+      error: 'Could not suspend this provider. Please try again.',
+    }).finally(() => load())
+  /*
+    Reactivating is the approve endpoint — there is no separate reinstate. On a
+    subscriber that restarts the paid period from today (or, unpaid, sends them
+    to "awaiting payment"), and re-sends the welcome notice. Said in the dialog
+    rather than discovered afterwards; the toast reports where they landed.
+  */
+  const reactivate = async (p: any) => {
+    const res = await confirmAndRun({
+      title: `Reactivate ${p.name}?`,
+      body: p.paymentModel === 'subscription'
+        ? 'This re-approves the account. A subscriber keeps the period they already paid for (a new one starts only if it has run out), or is asked to pay if they never did. Any document still pending is marked approved.'
+        : 'This re-approves the account and their listings can take bookings again. Any document still pending is marked approved.',
+      confirmLabel: 'Reactivate',
+      busyLabel: 'Reactivating...',
+      run: () => adminApi.approve(p.id, { expectedStatus: p.onboardingStatus }),
+      error: 'Could not reactivate this provider. Please try again.',
     })
-  const suspend = (p: any) => act(p, () => adminApi.suspend(p.id), `${p.name} suspended`, 'warn')
-  const reactivate = (p: any) => act(p, () => adminApi.approve(p.id), `${p.name} reactivated`)
+    if (res) toast(translatePortalText(approvalOutcome(p, res, 'reactivated')), (res as any).provisioningWarning ? 'warn' : 'success')
+    load()
+  }
 
 
   const byStatus = all.filter(p => {
@@ -252,7 +461,7 @@ export function ProviderDirectory({ cfg }: { cfg: DomainCfg }) {
    * providers rather than silently jumping back to all of them.
    */
   const filterCfg: TableFiltersConfig<any> = useMemo(() => ({
-    searchFields: (p) => [p.name, p.owner, p.raw?.email, p.raw?.phone, p.id, p.plan, cfg.slug === 'boat' ? (p.isDiver ? 'scuba diver' : 'boat charter') : undefined],
+    searchFields: (p) => [p.name, p.raw?.business?.businessNameAr, p.owner, p.raw?.email, p.raw?.phone, p.place, p.id, p.plan, cfg.slug === 'boat' ? (p.isDiver ? 'scuba diver' : 'boat charter') : undefined],
     filters: [
       ...(cfg.slug === 'boat' ? [{
         key: 'operatorType',
@@ -264,7 +473,8 @@ export function ProviderDirectory({ cfg }: { cfg: DomainCfg }) {
         ],
         get: (p: any) => (p.isDiver ? 'scuba_diver' : 'standard'),
       }] : []),
-      { key: 'plan', label: 'Billing model', get: (p) => p.paymentModel },
+      // The model by name — a fixed-fee provider filed under "commission" here.
+      { key: 'plan', label: 'Billing model', get: (p) => planModelLabel(p.raw?.onboarding) },
       { key: 'verified', label: 'Verification', get: (p) => (p.verified ? 'Verified' : 'Unverified') },
       {
         key: 'expiry',
@@ -319,7 +529,7 @@ export function ProviderDirectory({ cfg }: { cfg: DomainCfg }) {
         {kpis.map(([l, v, icon, p], i) => (
           <motion.div key={l} initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: i * 0.05 }} className="card p-4 flex items-center gap-3">
             <span className="text-2xl">{icon}</span>
-            <div><p className="font-display text-2xl font-extrabold text-deep-900"><Counter value={v} prefix={p} /></p><p className="text-[11px] font-bold uppercase tracking-wider text-slate-400">{translatePortalText(String(l))}</p></div>
+            <div><p className="font-display text-2xl font-extrabold text-deep-900">{loading || loadError ? '—' : <Counter value={v} prefix={p} />}</p><p className="text-[11px] font-bold uppercase tracking-wider text-slate-400">{translatePortalText(String(l))}</p></div>
           </motion.div>
         ))}
       </div>
@@ -338,7 +548,15 @@ export function ProviderDirectory({ cfg }: { cfg: DomainCfg }) {
         searchPlaceholder={translatePortalText(`Search ${cfg.name.toLowerCase()} providers by name, owner, email...`)}
       />
 
-      {view === 'card' ? (
+      {loadError && <LoadError message={loadError} onRetry={() => { setLoading(true); load() }} />}
+      {/* The API returns at most 200 providers, newest submissions first. */}
+      {!loading && all.length >= 200 && (
+        <p className="mb-3 text-[11px] font-semibold text-amber-700">{translatePortalText('Showing the 200 most recent providers — older accounts are not loaded here.')}</p>
+      )}
+
+      {loading ? (
+        view === 'card' ? <CardGridSkeleton count={6} /> : <TableSkeleton rows={6} cols={5} />
+      ) : loadError ? null : view === 'card' ? (
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
           {list.map((p, i) => (
             <motion.div key={p.id} initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: i * 0.05 }}
@@ -384,7 +602,7 @@ export function ProviderDirectory({ cfg }: { cfg: DomainCfg }) {
                 <div className="flex items-center gap-2.5">
                   <img src={p.avatar} className="h-8 w-8 rounded-full object-cover" />
                   <div className="min-w-0 flex-1"><p className="flex items-center gap-1 truncate text-xs font-extrabold text-deep-900">{p.owner}{p.verified && <BadgeCheck size={12} className="text-emerald-500" />}</p><p className="truncate text-[10px] text-slate-400">{p.email}</p></div>
-                  <ABadge>{translatePortalText(p.plan)}</ABadge>
+                  <ABadge truncate className="max-w-[55%] shrink-0">{p.plan}</ABadge>
                 </div>
                 <div className="mt-3 grid grid-cols-3 gap-2 text-center">
                   <div className="rounded-xl bg-sand py-2"><p className="font-display text-sm font-extrabold text-deep-900">{p.revenue ? money(p.revenue) : '—'}</p><p className="text-[9px] font-bold uppercase text-slate-400">{translatePortalText("Revenue")}</p></div>
@@ -393,7 +611,7 @@ export function ProviderDirectory({ cfg }: { cfg: DomainCfg }) {
                 </div>
                 <div className="mt-3 flex gap-1.5 border-t border-slate-100 pt-3">
                   {p.status === 'Pending' ? (<>
-                    <button onClick={() => approve(p)} className="btn-admin flex-1 !justify-center !py-1.5 !text-[11px]"><Check size={12} /> {translatePortalText("Approve")}</button>
+                    <button onClick={() => approve(p)} disabled={!!checkingId} className="btn-admin flex-1 !justify-center !py-1.5 !text-[11px] disabled:opacity-60"><Check size={12} /> {translatePortalText(checkingId === p.id ? 'Checking…' : 'Approve')}</button>
                     <button onClick={() => reject(p)} className="btn-ghost flex-1 !justify-center !py-1.5 !text-[11px] !text-rose-500"><X size={12} /> {translatePortalText("Reject")}</button>
                   </>) : p.status === 'Awaiting Payment' ? (<>
                     <button onClick={() => sendReminder(p)} className="btn-admin flex-1 !justify-center !py-1.5 !text-[11px] !bg-amber-600 !hover:bg-amber-700" title={translatePortalText("Remind provider to complete payment")}><Bell size={12} /> {translatePortalText("Remind")}</button>
@@ -402,6 +620,11 @@ export function ProviderDirectory({ cfg }: { cfg: DomainCfg }) {
                     // Waiting on the provider (to correct and resubmit, or to finish),
                     // so there is nothing to approve, verify or suspend yet.
                     <p className="flex-1 text-center text-[11px] font-semibold text-slate-400">{translatePortalText(p.status === 'Rejected' ? 'Waiting for the provider to resubmit' : 'Application not submitted yet')}</p>
+                  ) : p.status === 'Blocked' ? (
+                    // A deactivated login. Approve and Suspend change the
+                    // application, not the login, so neither would unblock it —
+                    // they used to be offered here as if they would.
+                    <p className="flex-1 text-center text-[11px] font-semibold text-slate-400">{translatePortalText('Account deactivated — restore it from Users')}</p>
                   ) : p.status === 'Suspended' ? (<>
                     <button onClick={() => reactivate(p)} className="btn-admin flex-1 !justify-center !py-1.5 !text-[11px]"><ShieldCheck size={12} /> {translatePortalText("Reactivate")}</button>
                     <button onClick={() => sendReminder(p)} className="btn-ghost !justify-center !py-1.5 !px-2 text-amber-600" title={translatePortalText("Send renewal reminder")}><Bell size={12} /></button>
@@ -409,7 +632,11 @@ export function ProviderDirectory({ cfg }: { cfg: DomainCfg }) {
                     {(p.isExpiringSoon || p.isExpired || p.paymentModel === 'subscription') && (
                       <button onClick={() => sendReminder(p)} className="btn-ghost !justify-center !py-1.5 !px-2 text-amber-600 hover:bg-amber-50" title={translatePortalText("Send subscription reminder")}><Bell size={12} /></button>
                     )}
-                    <button onClick={() => reactivate(p)} className="btn-ghost flex-1 !justify-center !py-1.5 !text-[11px]"><ShieldCheck size={12} /> {translatePortalText("Verify")}</button>
+                    {/* Called approve on a live provider, which restarts a
+                        subscriber's paid period from today, marks every pending
+                        document approved and re-sends the welcome notice.
+                        Verifying is done document by document, so it opens them. */}
+                    <button onClick={() => openDetail(p.raw)} className="btn-ghost flex-1 !justify-center !py-1.5 !text-[11px]" title={translatePortalText("Review and verify their documents")}><ShieldCheck size={12} /> {translatePortalText("Verify")}</button>
                     <button onClick={() => suspend(p)} className="btn-ghost flex-1 !justify-center !py-1.5 !text-[11px] !text-amber-600"><Ban size={12} /> {translatePortalText("Suspend")}</button>
                   </>)}
                   <button onClick={() => openDetail(p.raw)} className="grid h-8 w-8 place-items-center rounded-lg bg-slate-100 text-slate-500 hover:bg-slate-200" title={translatePortalText("Documents")}><FileCheck2 size={13} /></button>
@@ -449,21 +676,24 @@ export function ProviderDirectory({ cfg }: { cfg: DomainCfg }) {
                         ) : null}
                       </div>
                       {/* Was the raw database id — nothing an admin can read or search by. */}
-                      <p className="truncate text-[11px] text-slate-400">{formatPortalNumber(p.bookings)} {translatePortalText(p.bookings === 1 ? 'booking' : 'bookings')}{p.raw?.business?.city ? ` · ${p.raw.business.city}` : ''}</p>
+                      <p className="truncate text-[11px] text-slate-400">{formatPortalNumber(p.bookings)} {translatePortalText(p.bookings === 1 ? 'booking' : 'bookings')}{p.place ? ` · ${p.place}` : ''}</p>
                     </div>
                   </div>
                   <div className="flex items-center gap-2 text-xs font-semibold text-slate-600 min-w-0">
                     <img src={p.avatar} className="h-6 w-6 shrink-0 rounded-full object-cover ring-1 ring-slate-200" />
                     <span className="truncate">{p.owner}</span>{p.verified && <BadgeCheck size={12} className="shrink-0 text-emerald-500" />}
                   </div>
-                  <div className="flex justify-center whitespace-nowrap"><ABadge>{p.plan}</ABadge></div>
+                  {/* Capped and truncating: each row is its own grid, so a long plan
+                      name ("Expand Your Bunkering Reach: …") took its full width and
+                      squeezed Provider and Owner to nothing. */}
+                  <div className="flex items-center justify-center gap-1 whitespace-nowrap" title={packageTermMismatch(p.raw?.onboarding) ?? undefined}><ABadge truncate className="max-w-[14rem]">{p.plan}</ABadge>{packageTermMismatch(p.raw?.onboarding) && <AlertTriangle size={12} className="shrink-0 text-amber-500" />}</div>
                   <div className="text-right text-[13px] font-extrabold text-deep-900 whitespace-nowrap">{p.revenue ? money(p.revenue) : '—'}</div>
                   <div className="text-center text-xs font-bold text-emerald-600 whitespace-nowrap" title={p.reviewCount ? `${p.reviewCount} reviews` : undefined}>{p.rating ? `${formatPortalNumber(p.rating, { maximumFractionDigits: 1 })}★` : '—'}{p.reviewCount ? <span className="ms-1 text-[10px] font-semibold text-slate-400">({formatPortalNumber(p.reviewCount)})</span> : null}</div>
                   <div className="flex justify-center whitespace-nowrap">
                     {p.status === 'Live' ? (
                       p.paymentModel === 'commission' ? (
                         <span className="inline-flex items-center gap-1 rounded-full bg-purple-50 px-2.5 py-0.5 text-[11px] font-bold text-purple-700 ring-1 ring-purple-200">
-                          {translatePortalText("\n                          Live · Comm.\n                        ")}</span>
+                          {translatePortalText(p.planKind === 'fixed_fee' ? 'Live · Fixed fee' : 'Live · Comm.')}</span>
                       ) : p.isExpired ? (
                         <span className="inline-flex items-center gap-1 rounded-full bg-rose-100 px-2.5 py-0.5 text-[11px] font-extrabold text-rose-800 ring-1 ring-rose-300">
                           <AlertOctagon size={11} /> {translatePortalText(" Expired (")}{formatAdminDayCount(p.daysUntilExpiry)})
@@ -473,7 +703,9 @@ export function ProviderDirectory({ cfg }: { cfg: DomainCfg }) {
                           <AlertTriangle size={11} /> {translatePortalText(" Expiring (")}{formatAdminDayCount(p.daysUntilExpiry)})
                         </span>
                       ) : (
-                        <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2.5 py-0.5 text-[11px] font-bold text-emerald-700 ring-1 ring-emerald-200">
+                        // The date behind the day count, so "Active (321d)" can be
+                        // checked against the package's term at a glance.
+                        <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2.5 py-0.5 text-[11px] font-bold text-emerald-700 ring-1 ring-emerald-200" title={p.subscriptionExpiry ? `${translatePortalText('Paid until')} ${formatPortalDate(new Date(p.subscriptionExpiry))}` : undefined}>
                           <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" /> {translatePortalText(" Active ")}{p.daysUntilExpiry !== null ? `(${formatAdminDayCount(p.daysUntilExpiry)})` : ''}
                         </span>
                       )
@@ -486,13 +718,16 @@ export function ProviderDirectory({ cfg }: { cfg: DomainCfg }) {
                   </div>
                   <div className="sticky end-0 z-[1] flex justify-end gap-1.5 whitespace-nowrap bg-white ps-2 shadow-[-12px_0_12px_-12px_rgba(15,23,42,0.18)]">
                     {p.status === 'Pending' ? (<>
-                      <button onClick={() => approve(p)} className="btn-admin !py-1.5 !px-2.5 !text-[11px]"><Check size={12} /> {translatePortalText("Approve")}</button>
+                      <button onClick={() => approve(p)} disabled={!!checkingId} className="btn-admin !py-1.5 !px-2.5 !text-[11px] disabled:opacity-60"><Check size={12} /> {translatePortalText(checkingId === p.id ? 'Checking…' : 'Approve')}</button>
                       <button onClick={() => reject(p)} className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-rose-50 text-rose-500 hover:bg-rose-100" title={translatePortalText("Reject")}><X size={13} /></button>
                     </>) : p.status === 'Awaiting Payment' ? (<>
                       <button onClick={() => sendReminder(p)} className="btn-admin !py-1.5 !px-2.5 !text-[11px] !bg-amber-600 !hover:bg-amber-700" title={translatePortalText("Send payment reminder")}><Bell size={12} /> {translatePortalText("Remind")}</button>
                       <button onClick={() => reject(p)} className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-rose-50 text-rose-500 hover:bg-rose-100" title={translatePortalText("Reject")}><X size={13} /></button>
                     </>) : p.status === 'Rejected' || p.status === 'Incomplete' ? (
                       <span className="text-[11px] font-semibold text-slate-400">{translatePortalText(p.status === 'Rejected' ? 'Waiting for resubmission' : 'Not submitted')}</span>
+                    ) : p.status === 'Blocked' ? (
+                      // See the card view: neither action would restore the login.
+                      <span className="text-[11px] font-semibold text-slate-400" title={translatePortalText('Account deactivated — restore it from Users')}>{translatePortalText('Account deactivated')}</span>
                     ) : p.status === 'Suspended' ? (<>
                       <button onClick={() => reactivate(p)} className="btn-admin !py-1.5 !px-2.5 !text-[11px]"><ShieldCheck size={12} /> {translatePortalText(" Reactivate")}</button>
                       <button onClick={() => sendReminder(p)} className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-amber-50 text-amber-600 hover:bg-amber-100" title={translatePortalText("Send reminder")}><Bell size={13} /></button>
@@ -500,7 +735,8 @@ export function ProviderDirectory({ cfg }: { cfg: DomainCfg }) {
                       {(p.isExpiringSoon || p.isExpired || p.paymentModel === 'subscription') && (
                         <button onClick={() => sendReminder(p)} className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-amber-50 text-amber-700 hover:bg-amber-100" title={translatePortalText("Send subscription reminder")}><Bell size={13} /></button>
                       )}
-                      <button onClick={() => reactivate(p)} className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-emerald-50 text-emerald-600 hover:bg-emerald-100" title={translatePortalText("Verify")}><ShieldCheck size={13} /></button>
+                      {/* Opens the documents — see the card view for why it no longer re-approves. */}
+                      <button onClick={() => openDetail(p.raw)} className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-emerald-50 text-emerald-600 hover:bg-emerald-100" title={translatePortalText("Review and verify their documents")}><ShieldCheck size={13} /></button>
                       <button onClick={() => suspend(p)} className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-amber-50 text-amber-600 hover:bg-amber-100" title={translatePortalText("Suspend")}><Ban size={13} /></button>
                     </>)}
                     <button onClick={() => openDetail(p.raw)} className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-slate-100 text-slate-500 hover:bg-slate-200" title={translatePortalText("Documents")}><FileCheck2 size={13} /></button>
@@ -540,27 +776,30 @@ export function ProviderDirectory({ cfg }: { cfg: DomainCfg }) {
               </button>
             </div>
 
+            {/* Plan & pricing: what they are on, what they pay right now and
+                why, any scheduled change and their offers — with Change plan
+                and Give discount / offer. Replaces the "Subscription &
+                Lifecycle Health" card, keeping its reminder and its line of
+                model / status / expiry. A change reloads the directory row. */}
             {detail && (
-              <div className="rounded-2xl border border-amber-200 bg-amber-50/50 p-3.5 flex items-center justify-between gap-3">
-                <div className="flex items-center gap-2.5">
-                  <div className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-amber-100 text-amber-700">
-                    <Bell size={18} />
-                  </div>
-                  <div>
-                    <p className="text-xs font-extrabold text-amber-950">{translatePortalText("Subscription & Lifecycle Health")}</p>
-                    <p className="text-[11px] text-amber-800">
-                      {translatePortalText("Model:")} <span className="font-bold">{translatePortalText(detail.onboarding?.billingModel || 'subscription')}</span> · {translatePortalText("Status:")} <span className="font-bold">{translatePortalText(detail.onboarding?.status || 'approved')}</span>
-                      {detail.onboarding?.subscriptionExpiry ? ` · ${translatePortalText('Expires:')} ${formatPortalDate(new Date(detail.onboarding.subscriptionExpiry))}` : ''}
-                    </p>
-                  </div>
-                </div>
-                <button
-                  onClick={() => sendReminder({ id: detail._id || detail.id, name: detail.business?.businessName || detail.name, owner: detail.name, raw: detail })}
-                  className="btn-admin !py-1.5 !px-3 !text-xs !bg-amber-600 hover:!bg-amber-700 shrink-0"
-                >
-                  <Bell size={13} className="me-1" /> {translatePortalText("Send Reminder")}
-                </button>
-              </div>
+              <PlanPricingPanel
+                providerId={detail._id || detail.id}
+                onChanged={() => { void load() }}
+                facts={<>
+                  {/* No `|| 'subscription'` / `|| 'approved'`: an account with
+                      no onboarding record was shown as an approved subscriber. */}
+                  {translatePortalText("Model:")} <span className="font-bold">{translatePortalText(planModelLabel(detail.onboarding))}</span> · {translatePortalText("Status:")} <span className="font-bold">{translatePortalText((detail.onboarding?.status || 'incomplete').replace(/_/g, ' '))}</span>
+                  {detail.onboarding?.subscriptionExpiry ? ` · ${translatePortalText('Expires:')} ${formatPortalDate(new Date(detail.onboarding.subscriptionExpiry))}` : ''}
+                </>}
+                actions={
+                  <button
+                    onClick={() => sendReminder({ id: detail._id || detail.id, name: detail.business?.businessName || detail.name, owner: detail.name, raw: detail })}
+                    className="btn-admin !py-1.5 !px-3 !text-xs !bg-amber-600 hover:!bg-amber-700 shrink-0"
+                  >
+                    <Bell size={13} className="me-1" /> {translatePortalText("Send Reminder")}
+                  </button>
+                }
+              />
             )}
 
             {cfg.slug === 'boat' && (
@@ -599,9 +838,9 @@ export function ProviderDirectory({ cfg }: { cfg: DomainCfg }) {
                 ['Business Name', detail.business?.businessName || '—'],
                 ['Operator Type', detail.providerKind === 'scuba_diver' ? '🤿 Scuba Diver (No docs)' : (cfg.slug === 'boat' ? '⛵ Boat Charter Provider' : (detail.role || '').replace(/_/g, ' '))],
                 ['Phone', detail.business?.contactNumber || '—'],
-                ['Country', detail.business?.country || '—'], ['City', detail.business?.city || '—'],
+                ['Country', detail.business?.country || '—'], ['City', placeLabel(detail.business?.city) || '—'],
                 ['Billing Model', planModelLabel(detail.onboarding)],
-                ['Package', providerPlanLabel(detail.onboarding)],
+                ['Package', [providerPlanLabel(detail.onboarding), packageTermMismatch(detail.onboarding)].filter(Boolean).join(' — ')],
                 ['Provider Role', (detail.onboarding?.providerType || detail.role || '').replace(/_/g, ' ')],
                 ['Status', detail.onboarding?.status || 'incomplete'],
                 ['Submitted', detail.onboarding?.submittedAt ? formatPortalDate(new Date(detail.onboarding.submittedAt)) : '—'],
@@ -611,10 +850,13 @@ export function ProviderDirectory({ cfg }: { cfg: DomainCfg }) {
                 <div key={l as string} className="rounded-xl bg-sand px-3 py-2.5"><p className="text-[10px] font-bold uppercase text-slate-400">{translatePortalText(l)}</p><p className="font-bold text-deep-900 break-all">{translatePortalText(String(v))}</p></div>
               ))}
             </div>
-            {detail.business?.address && <div><p className="label">{translatePortalText("Address")}</p><p className="rounded-xl border border-slate-100 p-3 text-slate-600">{detail.business.address}</p></div>}
+            {/* A pin saved as the address is said to be one, with its numbers
+                beside it for whoever needs to look it up. */}
+            {detail.business?.address && <div><p className="label">{translatePortalText("Address")}</p><p className="rounded-xl border border-slate-100 p-3 text-slate-600">{isCoordinateText(detail.business.address) ? <>{translatePortalText('Location pinned on the map — no street address')} <span className="ms-1 font-mono text-[11px] text-slate-400" dir="ltr">{detail.business.address}</span></> : detail.business.address}</p></div>}
             {detail.business?.description && <div><p className="label">{translatePortalText("About")}</p><p className="rounded-xl border border-slate-100 p-3 text-slate-600">{detail.business.description}</p></div>}
 
             {regLoading && <p className="text-xs text-slate-400">{translatePortalText("Loading full registration…")}</p>}
+            {regError && <LoadError message={regError} onRetry={() => openDetail(detail)} />}
 
             {registration && (
               <div className="space-y-3 border-t border-slate-100 pt-4">
@@ -638,7 +880,7 @@ export function ProviderDirectory({ cfg }: { cfg: DomainCfg }) {
               </div>
             )}
 
-            {!regLoading && (() => {
+            {!regLoading && !regError && (() => {
               const groupedDocs: Record<string, any[]> = {};
               regDocs.forEach(d => {
                 const type = d.docType || 'other';
@@ -649,7 +891,10 @@ export function ProviderDirectory({ cfg }: { cfg: DomainCfg }) {
               
               return (
                 <div className="space-y-3 border-t border-slate-100 pt-4">
-                  {!detail.isDiver && <RequiredDocsChecklist checklist={docChecklist} />}
+                  {/* `detail` is the API record, which has no `isDiver` — that is
+                      on the directory row — so divers were shown a checklist of
+                      documents they never owe. */}
+                  {detail.providerKind !== 'scuba_diver' && <RequiredDocsChecklist checklist={docChecklist} />}
                   <DocumentFindingsSummary review={docReview} />
                   <div className="flex items-center justify-between">
                     <p className="label">{translatePortalText("Verification Documents")} ({formatPortalNumber(regDocs.length)})</p>
@@ -892,19 +1137,19 @@ function marinaListingState(m: any): MarinaListingState {
  * relist one they took down. Approval is decided on the vertical's Approvals
  * page, where the documents are — so an unapproved listing links there.
  */
-function ListingActions({ state, onListed, reviewPath, hideHint }: {
-  state: MarinaListingState; onListed: (listed: boolean) => void; reviewPath: string; hideHint: string
+function ListingActions({ state, onListed, reviewPath, hideHint, busy }: {
+  state: MarinaListingState; onListed: (listed: boolean) => void; reviewPath: string; hideHint: string; busy?: boolean
 }) {
   const nav = useNavigate()
   if (state === 'Listed') {
     return (
-      <button onClick={() => onListed(false)} className="btn-ghost !py-1.5 !px-2.5 !text-[11px] !text-rose-500" title={translatePortalText(hideHint)}>
+      <button onClick={() => onListed(false)} disabled={busy} className="btn-ghost !py-1.5 !px-2.5 !text-[11px] !text-rose-500 disabled:opacity-60" title={translatePortalText(hideHint)}>
         <Ban size={12} /> {translatePortalText('Take down')}
       </button>
     )
   }
   if (state === 'Taken down') {
-    return <button onClick={() => onListed(true)} className="btn-admin !py-1.5 !px-2.5 !text-[11px]"><RotateCcw size={12} /> {translatePortalText('Relist')}</button>
+    return <button onClick={() => onListed(true)} disabled={busy} className="btn-admin !py-1.5 !px-2.5 !text-[11px] disabled:opacity-60"><RotateCcw size={12} /> {translatePortalText('Relist')}</button>
   }
   if (state === 'Unpublished') return null
   return (
@@ -973,40 +1218,94 @@ export function ProviderListings({ cfg }: { cfg: DomainCfg }) {
   const [view, setView] = useState<'card' | 'table'>('table')
   const [items, setItems] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  // The API pages at 100. Only the first page was ever read, with nothing to
+  // say there were more — a vertical's 101st listing simply did not exist here.
+  const [page, setPage] = useState(1)
+  const [total, setTotal] = useState(0)
+  const [moreLoading, setMoreLoading] = useState(false)
+  const loadSeq = useRef(0)
 
   const typeParam = cfg.kind === 'Boat' ? 'boat' : cfg.kind === 'Marina' ? 'marina' : cfg.kind === 'Fuel' ? 'fuel' : 'maintenance-catalogue'
 
-  const load = useCallback(async () => {
-    setLoading(true)
+  /** Pages 1..`upTo`, so a refresh after an action keeps what was scrolled to. */
+  const load = useCallback(async (upTo = 1) => {
+    const seq = ++loadSeq.current
+    setLoadError(null)
     try {
-      const res = await adminPortalApi.listings({ type: typeParam, limit: 100 })
-      setItems(res.data.items)
-    } catch {
-      toast(translatePortalText(`Could not load ${cfg.listLabel}`), 'warn')
+      const pages = await Promise.all(Array.from({ length: upTo }, (_, i) => adminPortalApi.listings({ type: typeParam, limit: 100, page: i + 1 })))
+      if (seq !== loadSeq.current) return
+      setItems(pages.flatMap(r => r.data.items))
+      setTotal(pages[0]?.data.pagination?.total ?? 0)
+      setPage(upTo)
+    } catch (e) {
+      if (seq !== loadSeq.current) return
+      // An error, said as one — it used to fall through to "No … yet.".
+      setLoadError(translatePortalText(e instanceof Error ? e.message : `Could not load ${cfg.listLabel}`))
     } finally {
-      setLoading(false)
+      if (seq === loadSeq.current) { setLoading(false); setMoreLoading(false) }
     }
   }, [typeParam, cfg.listLabel])
-  useEffect(() => { load() }, [load])
+  useEffect(() => { setLoading(true); setItems([]); setTotal(0); load(1) }, [load])
+
+  /*
+    Take down / relist, asked first and run once.
+
+    These hide a listing from every customer, and fired on a single click with
+    nothing to stop a second one — two quick clicks sent two requests and two
+    toasts. Relisting is the undo, so it does not ask; taking down does.
+  */
+  const [busyId, setBusyId] = useState<string | null>(null)
+  const runListingChange = async (id: string, call: () => Promise<unknown>, done: string, failed: string, warn: boolean) => {
+    if (busyId) return
+    setBusyId(id)
+    try {
+      await call()
+      toast(done, warn ? 'warn' : undefined)
+      load(page)
+    } catch (e) {
+      toast(translatePortalText(e instanceof Error && e.message ? e.message : failed), 'warn')
+      load(page) // the row may have changed under us
+    } finally {
+      setBusyId(null)
+    }
+  }
+  const confirmTakeDown = (name: string, run: () => Promise<unknown>) =>
+    confirmAndRun({
+      title: `Take down ${name}?`,
+      body: 'Customers stop seeing it and cannot book it until it is relisted. Existing bookings are kept.',
+      confirmLabel: 'Take down',
+      busyLabel: 'Taking down...',
+      danger: true,
+      run,
+      error: 'Could not take this listing down. Please try again.',
+    })
 
   // Taking a boat down is operational (`status`), not an approval decision —
   // those are made on Boat Approvals. It used to read "rejected" / "approved".
   // The "Feature" toggle that sat beside it is gone: `Boat.featured` is read by
   // no customer screen; paid promotion is Featured Listings.
   const setBoatStatus = (b: any, status: 'active' | 'out_of_service') => {
-    adminPortalApi.updateBoatListing(b.id || b._id, { status }).then(() => { toast(translatePortalTemplate(status === 'active' ? '{{name}} is listed again' : '{{name}} taken down', { name: b.name }), status === 'active' ? undefined : 'warn'); load() }).catch(() => toast(translatePortalText('Could not update listing'), 'warn'))
+    const call = () => adminPortalApi.updateBoatListing(b.id || b._id, { status })
+    if (status === 'active') return runListingChange(b.id || b._id, call, translatePortalTemplate('{{name}} is listed again', { name: b.name }), 'Could not update listing', false)
+    confirmTakeDown(b.name, call).then(r => { if (r) { toast(translatePortalTemplate('{{name}} taken down', { name: b.name }), 'warn') } load(page) })
   }
   // Taking a marina down or relisting it is `isActive`. Verifying one is not —
   // that is Marina Approvals, which checks it is complete and publishes it.
   const setMarinaListed = (m: any, listed: boolean) => {
-    adminPortalApi.updateMarinaListing(m.id || m._id, { isActive: listed }).then(() => { toast(translatePortalTemplate(listed ? '{{name}} is listed again' : '{{name}} taken down', { name: m.name }), listed ? undefined : 'warn'); load() }).catch(() => toast(translatePortalText('Could not update listing'), 'warn'))
+    const call = () => adminPortalApi.updateMarinaListing(m.id || m._id, { isActive: listed })
+    if (listed) return runListingChange(m.id || m._id, call, translatePortalTemplate('{{name}} is listed again', { name: m.name }), 'Could not update listing', false)
+    confirmTakeDown(m.name, call).then(r => { if (r) { toast(translatePortalTemplate('{{name}} taken down', { name: m.name }), 'warn') } load(page) })
   }
   // Take down / relist is `isActive`; approving a station is Station Approvals.
   const setStationListed = (s: any, listed: boolean) => {
-    adminPortalApi.updateFuelStationListing(s._id || s.id, { isActive: listed }).then(() => { toast(translatePortalTemplate(listed ? '{{name}} is listed again' : '{{name}} taken down', { name: s.name }), listed ? undefined : 'warn'); load() }).catch(() => toast(translatePortalText('Could not update station'), 'warn'))
+    const call = () => adminPortalApi.updateFuelStationListing(s._id || s.id, { isActive: listed })
+    if (listed) return runListingChange(s._id || s.id, call, translatePortalTemplate('{{name}} is listed again', { name: s.name }), 'Could not update station', false)
+    confirmTakeDown(s.name, call).then(r => { if (r) { toast(translatePortalTemplate('{{name}} taken down', { name: s.name }), 'warn') } load(page) })
   }
   const toggleServiceStatus = (s: any) => {
-    adminPortalApi.updateMaintenanceServiceListing(s._id || s.id, { status: s.status === 'active' ? 'paused' : 'active' }).then(() => { toast(translatePortalText(`${s.name} ${s.status === 'active' ? 'paused' : 'activated'}`)); load() }).catch(() => toast(translatePortalText('Could not update service'), 'warn'))
+    const next = s.status === 'active' ? 'paused' : 'active'
+    runListingChange(s._id || s.id, () => adminPortalApi.updateMaintenanceServiceListing(s._id || s.id, { status: next }), translatePortalText(`${s.name} ${next === 'paused' ? 'paused' : 'activated'}`), 'Could not update service', next === 'paused')
   }
 
   if (loading) return <PageWrap><AdminHeader title={translatePortalText(cfg.listLabel)} sub={translatePortalText(cfg.listSub)} icon={cfg.icon} /><CardGridSkeleton count={6} /></PageWrap>
@@ -1016,7 +1315,8 @@ export function ProviderListings({ cfg }: { cfg: DomainCfg }) {
       <AdminHeader title={cfg.listLabel} sub={cfg.listSub} icon={cfg.icon}
         actions={<ViewToggle view={view} onChange={setView} />} />
 
-      {items.length === 0 && <div className="rounded-2xl border border-dashed border-slate-200 py-14 text-center text-sm text-slate-400">{translatePortalText("No ")}{cfg.listLabel.toLowerCase()} {translatePortalText(" yet.")}</div>}
+      {loadError && <LoadError message={loadError} onRetry={() => { setLoading(true); load(1) }} />}
+      {!loadError && items.length === 0 && <div className="rounded-2xl border border-dashed border-slate-200 py-14 text-center text-sm text-slate-400">{translatePortalText("No ")}{cfg.listLabel.toLowerCase()} {translatePortalText(" yet.")}</div>}
 
       {/* ── BOAT ── */}
       {cfg.kind === 'Boat' && items.length > 0 && view === 'card' && (
@@ -1038,7 +1338,7 @@ export function ProviderListings({ cfg }: { cfg: DomainCfg }) {
                 <div className="text-xs font-bold text-deep-900">{boatTripsLabel(b)}</div>
                 <div className="text-[11px] text-slate-400">{b.rating ? `${formatPortalNumber(b.rating, { maximumFractionDigits: 1 })}★${b.reviewCount ? ` (${formatPortalNumber(b.reviewCount)})` : ''}` : translatePortalText('No ratings yet')}</div>
                 <div className="ms-auto flex gap-1.5">
-                  <ListingActions state={state} onListed={(on) => setBoatStatus(b, on ? 'active' : 'out_of_service')} reviewPath="/admin/boat/approvals" hideHint="Hide this boat from customers" />
+                  <ListingActions state={state} onListed={(on) => setBoatStatus(b, on ? 'active' : 'out_of_service')} reviewPath="/admin/boat/approvals" busy={!!busyId} hideHint="Hide this boat from customers" />
                 </div>
               </div>
             </motion.div>
@@ -1068,7 +1368,7 @@ export function ProviderListings({ cfg }: { cfg: DomainCfg }) {
                   <div className="text-center text-xs font-bold text-emerald-600 whitespace-nowrap">{b.rating ? `${formatPortalNumber(b.rating, { maximumFractionDigits: 1 })}★` : '—'}{b.reviewCount ? <span className="ms-1 text-[10px] font-semibold text-slate-400">({formatPortalNumber(b.reviewCount)})</span> : null}</div>
                   <div className="flex justify-center whitespace-nowrap"><ABadge dot={state !== 'Listed'}>{translatePortalText(state)}</ABadge></div>
                   <div className="flex justify-end gap-1.5 whitespace-nowrap">
-                    <ListingActions state={state} onListed={(on) => setBoatStatus(b, on ? 'active' : 'out_of_service')} reviewPath="/admin/boat/approvals" hideHint="Hide this boat from customers" />
+                    <ListingActions state={state} onListed={(on) => setBoatStatus(b, on ? 'active' : 'out_of_service')} reviewPath="/admin/boat/approvals" busy={!!busyId} hideHint="Hide this boat from customers" />
                   </div>
                 </motion.div>
               )})}
@@ -1091,10 +1391,10 @@ export function ProviderListings({ cfg }: { cfg: DomainCfg }) {
                     <p className="truncate font-display text-[15px] font-extrabold text-deep-900">⚓ {m.name}</p>
                     <ABadge dot={state !== 'Listed'}>{translatePortalText(state)}</ABadge>
                   </div>
-                  <p className="truncate text-[11px] text-slate-400">{[m.city || m.region, providerName(m.owner)].filter(Boolean).join(' · ')}</p>
+                  <p className="truncate text-[11px] text-slate-400">{[placeLabel(m.city, m.region, m.address), providerName(m.owner)].filter(Boolean).join(' · ')}</p>
                   <p className="mt-1 text-[11px] font-semibold text-slate-600">{marinaBerthsLabel(m)} · {m.rating ? ratingLabel(m) : translatePortalText('No ratings yet')}</p>
                   <div className="mt-3 flex gap-1.5">
-                    <ListingActions state={state} onListed={(on) => setMarinaListed(m, on)} reviewPath="/admin/marina/approvals" hideHint="Hide this marina from customers" />
+                    <ListingActions state={state} onListed={(on) => setMarinaListed(m, on)} reviewPath="/admin/marina/approvals" busy={!!busyId} hideHint="Hide this marina from customers" />
                   </div>
                 </div>
               </div>
@@ -1120,7 +1420,7 @@ export function ProviderListings({ cfg }: { cfg: DomainCfg }) {
                     <div className="min-w-0"><p className="truncate text-[13px] font-extrabold text-deep-900">{m.name}</p>{m.nameAr && <p className="truncate text-[11px] text-slate-400" dir="rtl">{m.nameAr}</p>}</div>
                   </div>
                   <div className="truncate text-xs font-semibold text-slate-600">{providerName(m.owner)}</div>
-                  <div className="truncate text-xs text-slate-500">{m.city || m.region || '—'}</div>
+                  <div className="truncate text-xs text-slate-500">{placeLabel(m.city, m.region) || '—'}</div>
                   <div className="text-right text-xs font-bold text-deep-900 whitespace-nowrap">
                     {marinaBerthsLabel(m)}
                     {m.occupancyPct != null && <p className="text-[10px] font-semibold text-slate-400">{formatPortalPercent(m.occupancyPct)} {translatePortalText('full')}</p>}
@@ -1128,7 +1428,7 @@ export function ProviderListings({ cfg }: { cfg: DomainCfg }) {
                   <div className="text-center text-xs font-bold text-emerald-600 whitespace-nowrap">{ratingLabel(m)}</div>
                   <div className="flex justify-center whitespace-nowrap"><ABadge dot={state !== 'Listed'}>{translatePortalText(state)}</ABadge></div>
                   <div className="flex justify-end gap-1.5 whitespace-nowrap">
-                    <ListingActions state={state} onListed={(on) => setMarinaListed(m, on)} reviewPath="/admin/marina/approvals" hideHint="Hide this marina from customers" />
+                    <ListingActions state={state} onListed={(on) => setMarinaListed(m, on)} reviewPath="/admin/marina/approvals" busy={!!busyId} hideHint="Hide this marina from customers" />
                   </div>
                 </motion.div>
               )})}
@@ -1150,7 +1450,7 @@ export function ProviderListings({ cfg }: { cfg: DomainCfg }) {
                 <Img src={s.images?.[0] || listingPhoto(s.name, 'fuel')} className="h-full w-full" />
                 <div className="absolute inset-0 bg-gradient-to-t from-deep-950/80 to-transparent" />
                 <span className="absolute end-2 top-2"><ABadge dot={state !== 'Listed'}>{translatePortalText(state)}</ABadge></span>
-                <div className="absolute bottom-2 start-3 text-white"><p className="font-display text-[15px] font-extrabold">⛽ {s.name}</p><p className="text-[10px] text-white/70">{[s.city || s.area || s.address, owner.text].filter(Boolean).join(' · ')}</p></div>
+                <div className="absolute bottom-2 start-3 text-white"><p className="font-display text-[15px] font-extrabold">⛽ {s.name}</p><p className="text-[10px] text-white/70">{[placeLabel(s.city, s.area, s.address), owner.text].filter(Boolean).join(' · ')}</p></div>
               </div>
               <div className="p-4">
                 <div className="grid grid-cols-2 gap-2 text-center">
@@ -1162,7 +1462,7 @@ export function ProviderListings({ cfg }: { cfg: DomainCfg }) {
                 </div>
                 {s.stockPct != null && <div className="mt-3"><AProgress pct={s.stockPct} /></div>}
                 <div className="mt-3 flex gap-1.5 border-t border-slate-100 pt-3">
-                  <ListingActions state={state} onListed={(on) => setStationListed(s, on)} reviewPath="/admin/fuel/approvals" hideHint="Hide this station from customers" />
+                  <ListingActions state={state} onListed={(on) => setStationListed(s, on)} reviewPath="/admin/fuel/approvals" busy={!!busyId} hideHint="Hide this station from customers" />
                 </div>
               </div>
             </motion.div>
@@ -1188,7 +1488,7 @@ export function ProviderListings({ cfg }: { cfg: DomainCfg }) {
                     <div className="min-w-0"><p className="truncate text-[13px] font-extrabold text-deep-900">{s.name}</p><p className="truncate text-[11px] text-slate-400">{fuelNamesLabel(s)}</p></div>
                   </div>
                   <div className={`truncate text-xs font-semibold ${owner.missing ? 'text-rose-600' : 'text-slate-600'}`}>{owner.text}</div>
-                  <div className="truncate text-xs text-slate-500">{s.city || s.area || s.address}</div>
+                  <div className="truncate text-xs text-slate-500" title={placeLabel(s.address) ?? undefined}>{placeLabel(s.city, s.area, s.address) || '—'}</div>
                   <div className="text-right text-[13px] font-extrabold text-deep-900 whitespace-nowrap">{fuelPriceLabel(s)}</div>
                   <div className="flex items-center justify-center gap-1.5 whitespace-nowrap">
                     {s.stockPct != null
@@ -1197,7 +1497,7 @@ export function ProviderListings({ cfg }: { cfg: DomainCfg }) {
                   </div>
                   <div className="flex justify-center whitespace-nowrap"><ABadge dot={state !== 'Listed'}>{translatePortalText(state)}</ABadge></div>
                   <div className="flex justify-end gap-1.5 whitespace-nowrap">
-                    <ListingActions state={state} onListed={(on) => setStationListed(s, on)} reviewPath="/admin/fuel/approvals" hideHint="Hide this station from customers" />
+                    <ListingActions state={state} onListed={(on) => setStationListed(s, on)} reviewPath="/admin/fuel/approvals" busy={!!busyId} hideHint="Hide this station from customers" />
                   </div>
                 </motion.div>
               )})}
@@ -1227,7 +1527,7 @@ export function ProviderListings({ cfg }: { cfg: DomainCfg }) {
                 <div className="rounded-xl bg-sand py-2"><p className="font-display text-sm font-extrabold text-deep-900">{s.turnaroundLabel || '—'}</p><p className="text-[9px] font-bold uppercase text-slate-400">{translatePortalText("Turnaround")}</p></div>
               </div>
               <div className="mt-3 flex gap-1.5 border-t border-slate-100 pt-3">
-                <button onClick={() => toggleServiceStatus(s)} className="btn-ghost flex-1 !justify-center !py-1.5 !text-[11px]">{translatePortalText(s.status === 'active' ? 'Pause' : 'Activate')}</button>
+                <button onClick={() => toggleServiceStatus(s)} disabled={!!busyId} className="btn-ghost disabled:opacity-60 flex-1 !justify-center !py-1.5 !text-[11px]">{translatePortalText(s.status === 'active' ? 'Pause' : 'Activate')}</button>
               </div>
             </motion.div>
           ))}
@@ -1253,7 +1553,7 @@ export function ProviderListings({ cfg }: { cfg: DomainCfg }) {
                   <div className="text-xs text-slate-500 whitespace-nowrap">{s.turnaroundLabel || '—'}</div>
                   <div className="whitespace-nowrap"><ABadge dot={s.status === 'active'}>{translatePortalText(s.status === 'active' ? 'Active' : 'Paused')}</ABadge></div>
                   <div className="flex justify-end gap-1.5 whitespace-nowrap">
-                    <button onClick={() => toggleServiceStatus(s)} className="btn-ghost !py-1.5 !px-2.5 !text-[11px]">{translatePortalText(s.status === 'active' ? 'Pause' : 'Activate')}</button>
+                    <button onClick={() => toggleServiceStatus(s)} disabled={!!busyId} className="btn-ghost disabled:opacity-60 !py-1.5 !px-2.5 !text-[11px]">{translatePortalText(s.status === 'active' ? 'Pause' : 'Activate')}</button>
                   </div>
                 </motion.div>
               ))}
@@ -1261,6 +1561,7 @@ export function ProviderListings({ cfg }: { cfg: DomainCfg }) {
           </div>
         </div>
       )}
+      {!loadError && <LoadMore shown={items.length} total={total} busy={moreLoading} noun="listings" onMore={() => { setMoreLoading(true); load(page + 1) }} />}
     </PageWrap>
   )
 }
@@ -1275,17 +1576,41 @@ export function ProviderBookings({ cfg }: { cfg: DomainCfg }) {
   const [sel, setSel] = useState<ApiAdminPayment | null>(null)
   const statuses: ('All' | ApiAdminPayment['status'])[] = ['All', 'paid', 'pending', 'failed', 'refunded', 'partially_refunded']
 
+  const [loadError, setLoadError] = useState<string | null>(null)
+  // Pages of 100 (the API's cap). Only the first was read, so the table, and
+  // the CSV built from it, silently stopped at the 100 newest payments.
+  const [page, setPage] = useState(1)
+  const [total, setTotal] = useState(0)
+  const [moreLoading, setMoreLoading] = useState(false)
+  const [reloadKey, setReloadKey] = useState(0)
+  const loadSeq = useRef(0)
+  const query = (p: number) => ({ type: BOOKING_TYPE_FOR_KIND[cfg.kind], role: ROLE_FOR_KIND[cfg.kind], limit: 100, page: p, ...(status === 'All' ? {} : { status }) })
+
   useEffect(() => {
-    setLoading(true)
+    // Latest request only: flicking between status chips could otherwise land
+    // an older chip's rows under the newer chip.
+    const seq = ++loadSeq.current
+    setLoading(true); setLoadError(null); setPage(1)
     // `role` as well as `type`: the same scope as this vertical's revenue pages.
-    adminPortalApi.payments({ type: BOOKING_TYPE_FOR_KIND[cfg.kind], role: ROLE_FOR_KIND[cfg.kind], limit: 100, ...(status === 'All' ? {} : { status }) })
+    adminPortalApi.payments(query(1))
       // The header is what was collected (`earned`) — `totals` follows the
       // status chip, which under "All" added pending and failed charges into a
       // "gross value" that never arrived.
-      .then(res => { setItems(res.data.items); setTotals(res.data.earned ?? res.data.totals) })
-      .catch(() => toast(translatePortalText(`Failed to load ${cfg.name} bookings`), 'warn'))
-      .finally(() => setLoading(false))
-  }, [cfg.kind, status])
+      .then(res => { if (seq !== loadSeq.current) return; setItems(res.data.items); setTotal(res.data.pagination?.total ?? res.data.items.length); setTotals(res.data.earned ?? res.data.totals) })
+      // Cleared, not left showing the previous chip's rows and totals.
+      .catch((e) => { if (seq !== loadSeq.current) return; setItems([]); setTotal(0); setLoadError(translatePortalText(e instanceof Error ? e.message : `Failed to load ${cfg.name} bookings`)) })
+      .finally(() => { if (seq === loadSeq.current) setLoading(false) })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cfg.kind, status, reloadKey])
+
+  const loadMore = () => {
+    const seq = loadSeq.current
+    setMoreLoading(true)
+    adminPortalApi.payments(query(page + 1))
+      .then(res => { if (seq !== loadSeq.current) return; setItems(prev => [...prev, ...res.data.items]); setPage(page + 1) })
+      .catch(() => toast(translatePortalText('Could not load more bookings'), 'warn'))
+      .finally(() => setMoreLoading(false))
+  }
 
   return (
     <PageWrap>
@@ -1314,7 +1639,10 @@ export function ProviderBookings({ cfg }: { cfg: DomainCfg }) {
                   p.transactionId,
                 ]),
               ])
-              toast(translatePortalText(`Exported ${items.length} booking${items.length === 1 ? '' : 's'}`))
+              // Says when it is a part: the export holds the rows loaded so far.
+              toast(translatePortalText(total > items.length
+                ? `Exported the ${items.length} bookings loaded of ${total} — use Load more for the rest`
+                : `Exported ${items.length} booking${items.length === 1 ? '' : 's'}`))
             }}
           >
             {translatePortalText("Export report")}
@@ -1326,10 +1654,11 @@ export function ProviderBookings({ cfg }: { cfg: DomainCfg }) {
         {([['Paid bookings', totals.count, undefined], ['Collected (after refunds)', totals.gross, BASE_CURRENCY], ['Platform earnings', totals.commission, BASE_CURRENCY]] as [string, number, string | undefined][]).map(([l, v, cur], i) => (
           <motion.div key={l} initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: i * 0.05 }} className="card p-4">
             <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400">{translatePortalText(l)}</p>
-            <p className="mt-1 font-display text-2xl font-extrabold text-deep-900"><Counter value={v} currency={cur} /></p>
+            <p className="mt-1 font-display text-2xl font-extrabold text-deep-900">{loadError ? '—' : <Counter value={v} currency={cur} />}</p>
           </motion.div>
         ))}
       </div>
+      {loadError && <LoadError message={loadError} onRetry={() => setReloadKey(k => k + 1)} />}
 
       <div className="mb-4 flex flex-wrap gap-1.5">
         {statuses.map(s => (
@@ -1341,7 +1670,7 @@ export function ProviderBookings({ cfg }: { cfg: DomainCfg }) {
 
       {loading ? (
         <TableSkeleton rows={6} cols={4} />
-      ) : (
+      ) : loadError ? null : (<>
         <div className="card overflow-hidden">
           <div className="overflow-x-auto custom-scrollbar">
             <div className="min-w-[1000px]">
@@ -1379,7 +1708,8 @@ export function ProviderBookings({ cfg }: { cfg: DomainCfg }) {
             </div>
           </div>
         </div>
-      )}
+        <LoadMore shown={items.length} total={total} busy={moreLoading} noun="bookings" onMore={loadMore} />
+      </>)}
 
       <Modal open={!!sel} onClose={() => setSel(null)} title={sel ? `📋 ${sel.booking?.title || sel.booking?.code || translatePortalText('Payment')}` : ''}>
         {sel && (
@@ -1434,6 +1764,10 @@ export function ProviderAnalytics({ cfg }: { cfg: DomainCfg }) {
   const [byProvider, setByProvider] = useState<ApiCommissionRevenueRow[]>([])
   const [totals, setTotals] = useState<ApiRevenueTotals>({ gross: 0, commission: 0, providerNet: 0, count: 0 })
   const [loading, setLoading] = useState(true)
+  // A failed load read "SAR 0 total revenue" under a toast that soon faded —
+  // a vertical that had sold nothing, as far as the page could tell anyone.
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [reloadKey, setReloadKey] = useState(0)
 
   useEffect(() => {
     /*
@@ -1447,6 +1781,7 @@ export function ProviderAnalytics({ cfg }: { cfg: DomainCfg }) {
     */
     let alive = true
     setLoading(true)
+    setLoadError(null)
     // The vertical's revenue from the endpoint Commission Revenue uses, scoped by
     // role on the server. This read the platform-wide top 20 and filtered it
     // here, so a provider outside the platform's top 20 vanished from their own
@@ -1473,23 +1808,31 @@ export function ProviderAnalytics({ cfg }: { cfg: DomainCfg }) {
         setByProvider(revRes.data.providers)
         setTotals(revRes.data.totals)
       })
-      .catch(() => { if (alive) toast(translatePortalText(`Failed to load ${cfg.name} analytics`), 'warn') })
+      .catch((e) => {
+        if (!alive) return
+        setProviders([]); setTrend([]); setByProvider([]); setTotals({ gross: 0, commission: 0, providerNet: 0, count: 0 })
+        setLoadError(translatePortalText(e instanceof Error ? e.message : `Failed to load ${cfg.name} analytics`))
+      })
       .finally(() => { if (alive) setLoading(false) })
     return () => { alive = false }
-  }, [cfg.kind])
+  }, [cfg.kind, reloadKey])
 
   const revenue = totals.gross
   const bookings = totals.count
   // The same buckets as the directory, which lists "Awaiting payment" apart
-  // from "Pending" — this folded the two together.
+  // from "Pending" — this folded the two together. Rejected and unfinished
+  // applications fell into "Pending" too, swelling the review backlog the donut
+  // reported with accounts nobody needed to review.
   const statusOf = (p: AdminProvider) =>
     !(p as any).isActive ? 'Blocked'
       : p.onboarding?.status === 'suspended' ? 'Suspended'
       : p.onboarding?.status === 'approved' ? 'Live'
       : p.onboarding?.status === 'pending_subscription_payment' ? 'Awaiting payment'
+      : p.onboarding?.status === 'rejected' ? 'Rejected'
+      : !p.onboarding?.status || p.onboarding.status === 'incomplete' || (p.onboarding.status as string) === 'draft' ? 'Incomplete'
       : 'Pending'
-  const statusPie = ['Live', 'Awaiting payment', 'Pending', 'Suspended', 'Blocked'].map(st => ({ name: st, value: providers.filter(p => statusOf(p) === st).length })).filter(d => d.value > 0)
-  const pieColors: Record<string, string> = { Live: '#10b981', 'Awaiting payment': '#06b6d4', Pending: '#f59e0b', Suspended: '#f43f5e', Blocked: '#94a3b8' }
+  const statusPie = ['Live', 'Awaiting payment', 'Pending', 'Incomplete', 'Rejected', 'Suspended', 'Blocked'].map(st => ({ name: st, value: providers.filter(p => statusOf(p) === st).length })).filter(d => d.value > 0)
+  const pieColors: Record<string, string> = { Live: '#10b981', 'Awaiting payment': '#06b6d4', Pending: '#f59e0b', Incomplete: '#cbd5e1', Rejected: '#fb7185', Suspended: '#f43f5e', Blocked: '#94a3b8' }
   const leaders = [...byProvider].filter(p => p.gross > 0).sort((a, b) => b.gross - a.gross)
   const maxRev = Math.max(1, ...leaders.map(l => l.gross))
   const liveCount = providers.filter(p => statusOf(p) === 'Live').length
@@ -1527,13 +1870,15 @@ export function ProviderAnalytics({ cfg }: { cfg: DomainCfg }) {
           </button>
         } />
 
+      {loadError && <LoadError message={loadError} onRetry={() => setReloadKey(k => k + 1)} />}
+
       <motion.div initial={{ opacity: 0, scale: 0.99 }} animate={{ opacity: 1, scale: 1 }} className="relative mb-5 overflow-hidden rounded-3xl text-white shadow-lift">
         <Img src={cfg.hero} className="absolute inset-0 h-full w-full opacity-30" />
         <div className="absolute inset-0 bg-gradient-to-r from-[#041410]/90 via-[#062b22]/55 to-transparent" />
         <div className="relative z-10 flex flex-wrap items-center justify-between gap-6 p-6 md:p-8">
           <div>
             <p className="flex items-center gap-2 text-xs font-extrabold uppercase tracking-[0.22em] text-emerald-300"><Gauge size={14} /> {cfg.provPlural}</p>
-            <h2 className="mt-2 font-display text-2xl font-extrabold md:text-3xl">{money(revenue)} {translatePortalText("total revenue")}</h2>
+            <h2 className="mt-2 font-display text-2xl font-extrabold md:text-3xl">{loading || loadError ? '—' : money(revenue)} {translatePortalText("total revenue")}</h2>
             <p className="mt-1 text-sm text-white/70">{formatPortalNumber(providers.length)} {translatePortalText(" providers · ")}{formatPortalNumber(bookings)} {translatePortalText('bookings')}</p>
           </div>
           <div className="flex gap-3">
@@ -1583,7 +1928,7 @@ export function ProviderAnalytics({ cfg }: { cfg: DomainCfg }) {
             {statusPie.map(d => (
               <div key={d.name} className="flex items-center gap-2 text-xs"><span className="h-2.5 w-2.5 rounded-full" style={{ background: pieColors[d.name] }} /><span className="flex-1 font-semibold text-deep-800">{translatePortalText(d.name)}</span><b className="text-slate-500">{formatPortalNumber(d.value)}</b></div>
             ))}
-            {statusPie.length === 0 && !loading && <div className="py-4 text-center text-xs text-slate-400">{translatePortalText("No providers yet.")}</div>}
+            {statusPie.length === 0 && !loading && !loadError && <div className="py-4 text-center text-xs text-slate-400">{translatePortalText("No providers yet.")}</div>}
           </div>
         </Section>
       </div>
@@ -1607,7 +1952,7 @@ export function ProviderAnalytics({ cfg }: { cfg: DomainCfg }) {
               </div>
             )
           })}
-          {leaders.length === 0 && !loading && <div className="py-4 text-center text-xs text-slate-400">{translatePortalText("No revenue recorded yet for this vertical.")}</div>}
+          {leaders.length === 0 && !loading && !loadError && <div className="py-4 text-center text-xs text-slate-400">{translatePortalText("No revenue recorded yet for this vertical.")}</div>}
         </div>
       </Section>
     </PageWrap>
@@ -1618,19 +1963,38 @@ export function ProviderAnalytics({ cfg }: { cfg: DomainCfg }) {
 export function ProviderReviews({ cfg }: { cfg: DomainCfg }) {
   const [reviews, setReviews] = useState<ApiReview[]>([])
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  // The rating cards and the export are worked out from the reviews loaded, so
+  // past the first 100 the page has to say it is reading a part, and offer more.
+  const [page, setPage] = useState(1)
+  const [total, setTotal] = useState(0)
+  const [moreLoading, setMoreLoading] = useState(false)
+  const loadSeq = useRef(0)
   const targetTypes = REVIEW_TARGET_TYPES_FOR_KIND[cfg.kind]
+  const staffModel = REVIEW_STAFF_MODEL_FOR_KIND[cfg.kind]
+  const query = (p: number) => ({ targetType: targetTypes, limit: 100, page: p, ...(staffModel ? { staffModel } : {}) })
 
   const load = () => {
     if (!targetTypes) { setReviews([]); setLoading(false); return }
-    setLoading(true)
+    const seq = ++loadSeq.current
+    setLoading(true); setLoadError(null); setPage(1)
     // 100 is the API's cap; `200` was quietly clamped to it.
-    const staffModel = REVIEW_STAFF_MODEL_FOR_KIND[cfg.kind]
-    adminPortalApi.reviews({ targetType: targetTypes, limit: 100, ...(staffModel ? { staffModel } : {}) })
-      .then(res => setReviews(res.data.items))
-      .catch(() => toast(translatePortalText(`Could not load ${cfg.name.toLowerCase()} reviews`), 'warn'))
-      .finally(() => setLoading(false))
+    adminPortalApi.reviews(query(1))
+      .then(res => { if (seq !== loadSeq.current) return; setReviews(res.data.items); setTotal(res.data.pagination?.total ?? res.data.items.length) })
+      // An error, not "no reviews match this filter".
+      .catch((e) => { if (seq !== loadSeq.current) return; setReviews([]); setTotal(0); setLoadError(translatePortalText(e instanceof Error ? e.message : `Could not load ${cfg.name.toLowerCase()} reviews`)) })
+      .finally(() => { if (seq === loadSeq.current) setLoading(false) })
   }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { load() }, [cfg.kind])
+  const loadMore = () => {
+    const seq = loadSeq.current
+    setMoreLoading(true)
+    adminPortalApi.reviews(query(page + 1))
+      .then(res => { if (seq !== loadSeq.current) return; setReviews(prev => [...prev, ...res.data.items]); setPage(page + 1) })
+      .catch(() => toast(translatePortalText('Could not load more reviews'), 'warn'))
+      .finally(() => setMoreLoading(false))
+  }
 
   // Every moderation action, take-down and restore included — see `useReviewModeration`.
   const moderation = useReviewModeration(setReviews)
@@ -1664,11 +2028,16 @@ export function ProviderReviews({ cfg }: { cfg: DomainCfg }) {
             {translatePortalText("Rating analytics")}
           </button>
         } />
+      {loadError && <LoadError message={loadError} onRetry={load} />}
       {loading ? (
         <CardGridSkeleton count={6} cols="sm:grid-cols-2" />
-      ) : (<>
+      ) : loadError ? null : (<>
+        {total > reviews.length && (
+          <p className="mb-3 text-[11px] font-semibold text-amber-700">{translatePortalText('Figures below cover the')} {formatPortalNumber(reviews.length)} {translatePortalText('most-reported reviews loaded, of')} {formatPortalNumber(total)}.</p>
+        )}
         <ReviewStatCards reviews={reviews} />
         <ReviewsBoard reviews={reviews} emptyLabel={targetTypes ? translatePortalText(`No ${cfg.name.toLowerCase()} reviews match this filter.`) : `${translatePortalText(cfg.name)} ${translatePortalText('providers are not a reviewable listing type yet.')}`} {...moderation.boardProps} />
+        <LoadMore shown={reviews.length} total={total} busy={moreLoading} noun="reviews" onMore={loadMore} />
       </>)}
       {moderation.modals}
     </PageWrap>
@@ -1699,7 +2068,14 @@ function AiDocumentReviewModal({ docId, onClose, onReviewed }: { docId: string; 
     return () => { alive = false }
   }, [docId])
 
-  const handleApprove = () => aiDocumentApi.review(docId, 'approved').then(() => { toast(translatePortalText('Document approved')); onReviewed(); onClose() }).catch(e => toast(translatePortalText((e as any).message), 'warn'))
+  // Once: a second click while the first was in flight sent a second review,
+  // which the server refuses as already decided — an error toast after success.
+  const [approving, setApproving] = useState(false)
+  const handleApprove = () => {
+    if (approving) return
+    setApproving(true)
+    aiDocumentApi.review(docId, 'approved').then(() => { toast(translatePortalText('Document approved')); onReviewed(); onClose() }).catch(e => toast(translatePortalText((e as any).message), 'warn')).finally(() => setApproving(false))
+  }
   const handleReject = () =>
     confirmAndRun({
       title: 'Reject this document?',
@@ -1779,7 +2155,7 @@ function AiDocumentReviewModal({ docId, onClose, onReviewed }: { docId: string; 
 
            {doc.status !== 'approved' && doc.status !== 'rejected' && (
              <div className="flex gap-3 pt-4 border-t border-slate-100 sticky bottom-0 bg-white pb-2">
-               <button className="btn-admin flex-1" onClick={handleApprove}><Check size={14} className="me-1"/> {translatePortalText("Approve Document")}</button>
+               <button className="btn-admin flex-1 disabled:opacity-60" disabled={approving} onClick={handleApprove}><Check size={14} className="me-1"/> {translatePortalText(approving ? 'Approving...' : 'Approve Document')}</button>
                <button className="btn-ghost flex-1 !text-rose-500" onClick={handleReject}><X size={14} className="me-1"/> {translatePortalText(" Reject")}</button>
              </div>
            )}
@@ -1806,9 +2182,15 @@ export function ProviderKyc({ cfg }: { cfg: DomainCfg }) {
    */
   const [status, setStatus] = useState('')
   const [expiringOnly, setExpiringOnly] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [total, setTotal] = useState(0)
+  const loadSeq = useRef(0)
 
   const load = () => {
-    setLoading(true)
+    // Latest request only — the filter chips refetch, and an older chip's
+    // answer must not land under a newer chip.
+    const seq = ++loadSeq.current
+    setLoading(true); setLoadError(null)
     // This vertical's documents only (`providerType`) — the queue was one mixed
     // list across every vertical and customers. And 100, the API's cap: `200`
     // failed validation outright, so this page only ever showed its error toast
@@ -1819,9 +2201,10 @@ export function ProviderKyc({ cfg }: { cfg: DomainCfg }) {
       ...(status ? { status } : {}),
       ...(expiringOnly ? { expiring: 'true' as const } : {}),
     })
-      .then(res => setDocs(res.data.items))
-      .catch(() => toast(translatePortalText('Could not load AI KYC documents'), 'warn'))
-      .finally(() => setLoading(false))
+      .then(res => { if (seq !== loadSeq.current) return; setDocs(res.data.items); setTotal(res.data.pagination?.total ?? res.data.items.length) })
+      // Said as an error — an empty board read as "nobody is waiting".
+      .catch((e) => { if (seq !== loadSeq.current) return; setDocs([]); setTotal(0); setLoadError(translatePortalText(e instanceof Error ? e.message : 'Could not load AI KYC documents')) })
+      .finally(() => { if (seq === loadSeq.current) setLoading(false) })
   }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { load() }, [cfg.kind, status, expiringOnly])
@@ -1829,7 +2212,48 @@ export function ProviderKyc({ cfg }: { cfg: DomainCfg }) {
   // The board's own shape — see `aiDocToKycItem`.
   const items = docs.map(aiDocToKycItem)
 
-  const approve = (id: string) => aiDocumentApi.review(id, 'approved').then(() => { toast(translatePortalText('Document approved')); load() }).catch(() => toast(translatePortalText('Could not approve document'), 'warn'))
+  /*
+    Approve from the board, once — and not blind.
+
+    It was a single click with no busy state, so a double click sent two
+    reviews, and a document the AI had flagged critical was approved as quietly
+    as a clean one. A flagged document now asks first and names the findings.
+  */
+  const [approvingId, setApprovingId] = useState<string | null>(null)
+  const approve = async (id: string) => {
+    if (approvingId) return
+    const doc = docs.find(d => (d._id || d.id) === id)
+    const flags = (doc?.validation ?? []).filter(v => v.severity === 'critical' || v.severity === 'warning')
+    const missing = (doc?.missingFields ?? []).filter(f => f.required)
+    if (flags.length || missing.length) {
+      const parts = [
+        ...flags.slice(0, 3).map(f => f.message),
+        ...(missing.length ? [`missing: ${missing.map(f => f.label).join(', ')}`] : []),
+      ]
+      await confirmAndRun({
+        title: 'Approve a flagged document?',
+        body: `The AI reading raised: ${parts.join('; ')}${flags.length > 3 ? ` (and ${flags.length - 3} more)` : ''}. Open it to check before approving.`,
+        confirmLabel: 'Approve anyway',
+        busyLabel: 'Approving...',
+        danger: true,
+        run: () => aiDocumentApi.review(id, 'approved'),
+        success: 'Document approved',
+        error: 'Could not approve document',
+      })
+      load()
+      return
+    }
+    setApprovingId(id)
+    try {
+      await aiDocumentApi.review(id, 'approved')
+      toast(translatePortalText('Document approved'))
+    } catch (e) {
+      toast(translatePortalText(e instanceof Error && e.message ? e.message : 'Could not approve document'), 'warn')
+    } finally {
+      setApprovingId(null)
+      load()
+    }
+  }
   const reject = (id: string) =>
     confirmAndRun({
       title: 'Reject this document?',
@@ -1889,9 +2313,13 @@ export function ProviderKyc({ cfg }: { cfg: DomainCfg }) {
           </button>
         ))}
       </div>
+      {loadError && <LoadError message={loadError} onRetry={load} />}
       {loading ? (
         <CardGridSkeleton count={6} cols="sm:grid-cols-2" />
-      ) : (<>
+      ) : loadError ? null : (<>
+        {total > items.length && (
+          <p className="mb-3 text-[11px] font-semibold text-amber-700">{translatePortalText('Showing the newest')} {formatPortalNumber(items.length)} {translatePortalText('of')} {formatPortalNumber(total)} {translatePortalText('documents — narrow with the filters above to reach the rest.')}</p>
+        )}
         <KycStatCards items={items} />
         <KycBoard items={items} emptyLabel={translatePortalText(`No ${cfg.name.toLowerCase()} providers in the verification queue.`)} onView={(id) => setReviewId(id)} onApprove={approve} onReject={reject} />
       </>)}
@@ -1980,21 +2408,21 @@ export function ProviderCommissionRevenue({ cfg }: { cfg: DomainCfg }) {
       <div className="mb-5 grid grid-cols-2 gap-4 md:grid-cols-4">
         <div className="card p-4">
           <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400">{translatePortalText("Total Commission Earned")}</p>
-          <p className="mt-1 font-display text-2xl font-extrabold text-emerald-600"><Counter value={totals.commission} currency={BASE_CURRENCY} /></p>
+          <p className="mt-1 font-display text-2xl font-extrabold text-emerald-600">{error ? '—' : <Counter value={totals.commission} currency={BASE_CURRENCY} />}</p>
         </div>
         <div className="card p-4">
           <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400">{translatePortalText("Gross Transaction Volume")}</p>
-          <p className="mt-1 font-display text-2xl font-extrabold text-deep-900"><Counter value={totals.gross} currency={BASE_CURRENCY} /></p>
+          <p className="mt-1 font-display text-2xl font-extrabold text-deep-900">{error ? '—' : <Counter value={totals.gross} currency={BASE_CURRENCY} />}</p>
         </div>
         <div className="card p-4">
           <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400">{translatePortalText("Effective Avg. Rate")}</p>
-          <p className="mt-1 font-display text-2xl font-extrabold text-teal-600">{avgRate}</p>
+          <p className="mt-1 font-display text-2xl font-extrabold text-teal-600">{error ? '—' : avgRate}</p>
         </div>
         <div className="card p-4">
           {/* Providers who actually paid commission — this counted every row,
               subscription providers with none included. */}
           <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400">{translatePortalText("Providers paying commission")}</p>
-          <p className="mt-1 font-display text-2xl font-extrabold text-deep-900">{formatPortalNumber(items.filter(it => it.comm > 0).length)}</p>
+          <p className="mt-1 font-display text-2xl font-extrabold text-deep-900">{error ? '—' : formatPortalNumber(items.filter(it => it.comm > 0).length)}</p>
         </div>
       </div>
 
@@ -2014,10 +2442,12 @@ export function ProviderCommissionRevenue({ cfg }: { cfg: DomainCfg }) {
         ))}
       </div>
 
-      {error && <div className="card mb-4 !border-rose-200 !bg-rose-50 text-sm text-rose-600">{translatePortalText("Couldn't load: ")}{error}</div>}
+      {/* With a retry, and the table held back: it rendered beneath the error
+          as "No … providers earned …", an empty result rather than a failed one. */}
+      {error && <LoadError message={`${translatePortalText("Couldn't load: ")}${error}`} onRetry={load} />}
       {loading && <TableSkeleton rows={6} cols={4} />}
 
-      {!loading && (
+      {!loading && !error && (
         <div className="card overflow-hidden">
           <div className="overflow-x-auto custom-scrollbar">
             <div className="min-w-[960px]">
@@ -2143,6 +2573,7 @@ export function ProviderPackageRevenue({ cfg }: { cfg: DomainCfg }) {
     billing: p.plan ? cycle(p.plan.months) : '—',
     state: p.state,
     expires: p.expiresAt ? formatPortalDate(new Date(p.expiresAt)) : null,
+    expiresPast: p.expiresAt ? new Date(p.expiresAt).getTime() < Date.now() : false,
     joined: p.createdAt ? formatPortalDate(new Date(p.createdAt), { month: 'short', year: 'numeric' }) : 'Unknown',
   }))
 
@@ -2182,26 +2613,28 @@ export function ProviderPackageRevenue({ cfg }: { cfg: DomainCfg }) {
       <div className="mb-5 grid grid-cols-2 gap-4 md:grid-cols-4">
         <div className="card p-4">
           <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400">{translatePortalText("Monthly Recurring (MRR)")}</p>
-          <p className="mt-1 font-display text-2xl font-extrabold text-amber-500"><Counter value={Math.round(mrr)} prefix="SAR " /></p>
+          <p className="mt-1 font-display text-2xl font-extrabold text-amber-500">{error ? '—' : <Counter value={Math.round(mrr)} prefix="SAR " />}</p>
         </div>
         <div className="card p-4">
           <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400">{translatePortalText("ARR (Projected)")}</p>
-          <p className="mt-1 font-display text-2xl font-extrabold text-deep-900"><Counter value={Math.round(arr)} prefix="SAR " /></p>
+          <p className="mt-1 font-display text-2xl font-extrabold text-deep-900">{error ? '—' : <Counter value={Math.round(arr)} prefix="SAR " />}</p>
         </div>
         <div className="card p-4">
           <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400">{translatePortalText("Paid Subscribers")}</p>
-          <p className="mt-1 font-display text-2xl font-extrabold text-emerald-600">{formatPortalNumber(subscribersCount)}</p>
+          <p className="mt-1 font-display text-2xl font-extrabold text-emerald-600">{error ? '—' : formatPortalNumber(subscribersCount)}</p>
         </div>
         <div className="card p-4">
           <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400">{translatePortalText("Avg. Revenue Per Sub")}</p>
-          <p className="mt-1 font-display text-2xl font-extrabold text-teal-600">{avgPerSub}</p>
+          <p className="mt-1 font-display text-2xl font-extrabold text-teal-600">{error ? '—' : avgPerSub}</p>
         </div>
       </div>
 
-      {error && <div className="card mb-4 !border-rose-200 !bg-rose-50 text-sm text-rose-600">{translatePortalText("Couldn't load: ")}{error}</div>}
+      {/* With a retry, and the table held back: it rendered beneath the error
+          as "No … providers earned …", an empty result rather than a failed one. */}
+      {error && <LoadError message={`${translatePortalText("Couldn't load: ")}${error}`} onRetry={load} />}
       {loading && <TableSkeleton rows={6} cols={4} />}
 
-      {!loading && (<>
+      {!loading && !error && (<>
         <div className="mb-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
           {packages.map((pkg, i) => (
             <motion.div
@@ -2284,16 +2717,20 @@ export function ProviderPackageRevenue({ cfg }: { cfg: DomainCfg }) {
                     </div>
                   </div>
 
+                  {/* Truncates, for the same reason as the directory's Plan column. */}
                   <div className="whitespace-nowrap">
-                    <span className="chip bg-amber-50 text-amber-800 font-extrabold !text-[11px]">
-                      {s.plan}
+                    <span className="chip min-w-0 max-w-[14rem] bg-amber-50 text-amber-800 font-extrabold !text-[11px]" title={s.plan}>
+                      <span className="truncate">{s.plan}</span>
                     </span>
                   </div>
 
                   <div className="text-xs font-bold text-deep-900 whitespace-nowrap">{s.price}{s.billing !== '—' && <p className="text-[10px] font-semibold text-slate-400">{s.billing}</p>}</div>
                   <div className="whitespace-nowrap">
                     <span className={`chip font-extrabold !text-[11px] ${STATE_LABEL[s.state].cls}`}>{translatePortalText(STATE_LABEL[s.state].label)}</span>
-                    {s.expires && s.state !== 'awaiting_payment' && <p className="mt-0.5 text-[10px] text-slate-400">{translatePortalText(s.state === 'expired' ? 'Expired' : 'Renews')} {s.expires}</p>}
+                    {/* By the date, not the state: a suspended subscriber is
+                        "expired" with a paid-up date still ahead, which read
+                        "Expired 3 Aug 2027". */}
+                    {s.expires && s.state !== 'awaiting_payment' && <p className="mt-0.5 text-[10px] text-slate-400">{translatePortalText(s.expiresPast ? 'Expired' : s.state === 'expired' ? 'Paid until' : 'Renews')} {s.expires}</p>}
                   </div>
                   <div className="text-xs text-slate-500 whitespace-nowrap">{s.joined}</div>
 

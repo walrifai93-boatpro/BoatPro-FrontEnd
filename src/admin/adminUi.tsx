@@ -74,10 +74,13 @@ const TONES: Record<string, string> = {
   Online: 'bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200', Offline: 'bg-rose-50 text-rose-600 ring-1 ring-rose-200',
   'Low stock': 'bg-amber-50 text-amber-700 ring-1 ring-amber-200',
 }
-export function ABadge({ children, dot, label }: { children: string; dot?: boolean; label?: string }) {
+// `truncate` for free text such as a plan name: the chip shrinks and ends in an
+// ellipsis (full text on hover) instead of forcing its own width on the layout.
+export function ABadge({ children, dot, label, truncate, className = '' }: { children: string; dot?: boolean; label?: string; truncate?: boolean; className?: string }) {
+  const text = label ?? translatePortalText(children)
   return (
-    <span className={`chip ${TONES[children] ?? 'bg-slate-100 text-slate-600'}`}>
-      {dot && <span className="h-1.5 w-1.5 rounded-full bg-current animate-pulse-soft" />}{label ?? translatePortalText(children)}
+    <span className={`chip ${TONES[children] ?? 'bg-slate-100 text-slate-600'}${truncate ? ' min-w-0' : ''}${className ? ` ${className}` : ''}`} title={truncate ? text : undefined}>
+      {dot && <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-current animate-pulse-soft" />}{truncate ? <span className="truncate">{text}</span> : text}
     </span>
   )
 }

@@ -15,7 +15,7 @@ import {
 import { useOps } from '../opsStore'
 import { invoicesApi, portalApi, reservationsApi, fileUrl, type ApiInvoice } from '../api'
 import { VendorWeeklyPayouts } from '../components/VendorWeeklyPayouts'
-import { formatPortalDate, formatPortalNumber, formatPortalPercent, portalLocale, translatePortalText } from '../i18n/runtime'
+import { formatPortalDate, formatPortalNumber, formatPortalPercent, portalLocale, translatePortalText, translatePortalTemplate } from '../i18n/runtime'
 
 
 const monthName = (ym: string) => {
@@ -27,13 +27,20 @@ const monthName = (ym: string) => {
 // ===========================================================================
 // Billing & payments
 // ===========================================================================
+/**
+ * Invoice `bookingType`s. A marina earns from berth leases (`dock`), short berth
+ * bookings (`berth` — hourly/daily, invoiced by the berth-booking flow) and its
+ * services. `berth` was missing, so those invoices showed under "All streams"
+ * and could not be filtered. Fuel and Trips are not offered: a marina earns
+ * only from berths and services, so those options were always empty.
+ */
 const BOOKING_TYPES = [
   { value: 'all', label: 'All streams' },
-  { value: 'dock', label: 'Berthing' },
+  { value: 'dock', label: 'Berth leases' },
+  { value: 'berth', label: 'Berth bookings' },
   { value: 'service', label: 'Services' },
-  { value: 'fuel', label: 'Fuel' },
-  { value: 'trip', label: 'Trips' },
 ]
+const streamLabel = (t?: string) => BOOKING_TYPES.find(b => b.value === t)?.label ?? humanize(t)
 
 /**
  * The status a billing row shows.
@@ -74,6 +81,8 @@ export function Billing() {
   const invoices = state.data?.items ?? []
   const totals = state.data?.totals
   const outstanding = state.data?.outstanding
+  /** The API returns at most 100 invoices per page; this many exist in all. */
+  const invoiceTotal = state.data?.pagination?.total ?? invoices.length
 
   /**
    * `bookingType` stays a separate select because it refetches — the server pages
@@ -130,20 +139,28 @@ export function Billing() {
     } finally { setBusy(false) }
   }
 
+  /**
+   * Every invoice that survives the search and filters — not just the page on
+   * screen, which is all this exported before (25 rows of a 100-row list).
+   * Credit notes go out negative, as the list shows them, so a column sum nets.
+   */
   const exportCsv = () => {
-    if (!rows.length) { toast(translatePortalText('Nothing to export'), 'warn'); return }
-    download(`invoices-${todayIso()}.csv`, toCSV(rows.map(inv => {
+    const out = tf.filtered
+    if (!out.length) { toast(translatePortalText('Nothing to export'), 'warn'); return }
+    const sign = (inv: ApiInvoice, n?: number) => (inv.kind === 'credit_note' ? -(n ?? 0) : n ?? 0)
+    download(`invoices-${todayIso()}.csv`, `﻿${toCSV(out.map(inv => {
       const who = personOf(inv.customer)
       const pay = typeof inv.payment === 'object' && inv.payment ? inv.payment : null
       return {
         [translatePortalText('Invoice')]: inv.invoiceNumber,
-        [translatePortalText('Stream')]: translatePortalText(humanize(inv.bookingType)),
+        [translatePortalText('Stream')]: translatePortalText(streamLabel(inv.bookingType)),
         [translatePortalText('Customer')]: who?.name ?? '',
         [translatePortalText('Email')]: who?.email ?? '',
-        [translatePortalText('Subtotal')]: inv.subtotal,
+        [translatePortalText('Subtotal')]: sign(inv, inv.subtotal),
         [translatePortalText('VAT %')]: inv.vatRate,
-        [translatePortalText('VAT')]: inv.vatAmount,
-        [translatePortalText('Total')]: inv.total,
+        [translatePortalText('VAT')]: sign(inv, inv.vatAmount),
+        [translatePortalText('Total')]: sign(inv, inv.total),
+        [translatePortalText('Refunded so far')]: inv.kind === 'credit_note' ? '' : inv.refundedTotal ?? 0,
         [translatePortalText('Currency')]: inv.currency,
         [translatePortalText('Status')]: translatePortalText(billingStatusLabel(inv)),
         [translatePortalText('Original invoice')]: inv.originalInvoiceNumber ?? '',
@@ -151,8 +168,8 @@ export function Billing() {
         [translatePortalText('Paid')]: pay?.paidAt ?? '',
         [translatePortalText('Raised')]: inv.createdAt,
       }
-    })), 'text/csv;charset=utf-8')
-    toast(translatePortalText(`Exported ${rows.length} invoice${rows.length === 1 ? '' : 's'}`))
+    }))}`, 'text/csv;charset=utf-8')
+    toast(translatePortalText(`Exported ${out.length} invoice${out.length === 1 ? '' : 's'}`))
   }
 
   return (
@@ -164,12 +181,35 @@ export function Billing() {
           <button className="btn-primary" onClick={exportCsv}><Download size={15} /> {translatePortalText("Export CSV")}</button>
         </>} />
 
-      <div className="mb-5 grid gap-3.5 sm:grid-cols-2 xl:grid-cols-4">
-        <StatCard i={0} label="Gross collected" value={totals?.gross ?? 0} prefix={`${currency} `} icon={<Wallet size={17} />} tone="green" />
-        <StatCard i={1} label="Your net earnings" value={totals?.net ?? 0} prefix={`${currency} `} icon={<TrendingUp size={17} />} tone="ocean" />
-        <StatCard i={2} label="Platform commission" value={totals?.commission ?? 0} prefix={`${currency} `} icon={<Percent size={17} />} tone="violet" />
-        <StatCard i={3} label="Awaiting payment" value={outstanding?.amount ?? 0} prefix={`${currency} `} icon={<Receipt size={17} />} tone="amber" />
+      {/*
+        `currency` (the marina's own, which these totals are stored in) goes to
+        the card as `currency`, not as a text prefix, so the SAR⇄USD switch
+        converts them like every other amount here — a prefix left them in SAR.
+
+        The third card is `gross − providerNet` on the server, and providerNet
+        already has the provider-borne card-processing fee (and any provider-funded
+        discount) taken out, so it is not commission alone (BK-13: a refunded
+        charge's card fee showed as "Platform commission SAR 29"). Labelled for
+        what it is until the billing endpoint returns the fee separately.
+      */}
+      <div className="mb-2 grid gap-3.5 sm:grid-cols-2 xl:grid-cols-4">
+        <StatCard i={0} label="Gross collected" value={totals?.gross ?? 0} currency={currency} icon={<Wallet size={17} />} tone="green" />
+        <StatCard i={1} label="Your net earnings" value={totals?.net ?? 0} currency={currency} icon={<TrendingUp size={17} />} tone="ocean" />
+        <StatCard i={2} label="Commission & card fees" value={totals?.commission ?? 0} currency={currency} icon={<Percent size={17} />} tone="violet" />
+        <StatCard i={3} label="Owed on approved berths" value={outstanding?.amount ?? 0} currency={currency} icon={<Receipt size={17} />} tone="amber" />
       </div>
+      {/* BK-13: why "net earnings" and the weekly payout below can differ on the same page. */}
+      {/* The split the server now returns: what BoatPro keeps vs. what the card
+          network takes, and the refund fees that come off the payout. */}
+      {totals?.platformCommission != null && (
+        <p className="mb-1 text-[12px] font-semibold text-slate-600">
+          {translatePortalText('Platform commission')}: {formatMoney(totals.platformCommission, currency)} · {translatePortalText('Card fees & discounts')}: {formatMoney(totals.processingFees ?? 0, currency)}
+          {(totals.refundCardFees ?? 0) > 0 && <> · {translatePortalText('Card fees on refunds')}: {formatMoney(totals.refundCardFees ?? 0, currency)}</>}
+        </p>
+      )}
+      <p className="mb-5 text-[11px] text-slate-400">
+        {translatePortalText('All-time totals from paid charges, net of refunds, across every stream — the stream selector below filters the invoice list only. Gross includes VAT. The card fee on a refunded charge is not returned by the acquirer and is deducted when the weekly payout is made, so the payout can be lower than net earnings.')}
+      </p>
 
       {outstanding && outstanding.items.length > 0 && (
         <Section title={translatePortalText("Approved but unpaid")} sub="These berths are held until the boater pays" className="mb-5">
@@ -199,10 +239,17 @@ export function Billing() {
         searchPlaceholder="Search by invoice number, customer or email..."
       >
         <select value={bookingType} onChange={e => setBookingType(e.target.value)} className="input !w-auto !py-2 text-xs font-semibold">
-          {BOOKING_TYPES.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
+          {BOOKING_TYPES.map(t => <option key={t.value} value={t.value}>{translatePortalText(t.label)}</option>)}
         </select>
-        <span className="text-xs font-semibold text-slate-400">{translatePortalText(`${rows.length} invoice${rows.length === 1 ? '' : 's'}`)}</span>
+        {/* Everything that matches, not the 25 on this page. */}
+        <span className="text-xs font-semibold text-slate-400">{translatePortalText(`${tf.totalFiltered} invoice${tf.totalFiltered === 1 ? '' : 's'}`)}</span>
       </TableToolbar>
+
+      {invoiceTotal > invoices.length && (
+        <p className="mb-3 text-xs font-semibold text-amber-700">
+          {translatePortalTemplate('Showing the newest {{shown}} of {{total}} invoices — search, filters and CSV cover these only.', { shown: formatPortalNumber(invoices.length), total: formatPortalNumber(invoiceTotal) })}
+        </p>
+      )}
 
       <AsyncBlock state={state} loadingLabel="Loading invoices…"
         empty={d => d.items.length === 0 ? { icon: '🧾', text: 'No invoices yet — they are raised automatically when a berth is paid.' } : null}>
@@ -240,11 +287,11 @@ export function Billing() {
                             </div>
                           ) : <span className="text-xs text-slate-400">—</span>}
                         </td>
-                        <td className="td text-xs text-slate-500">{translatePortalText(humanize(inv.bookingType))}</td>
+                        <td className="td text-xs text-slate-500">{translatePortalText(streamLabel(inv.bookingType))}</td>
                         <td className="td text-right text-slate-600">{signed(inv)}{asIssued(inv.subtotal, inv.currency)}</td>
                         <td className="td text-right text-slate-500">{signed(inv)}{asIssued(inv.vatAmount, inv.currency)}</td>
                         <td className="td text-right font-extrabold text-deep-900">{signed(inv)}{asIssued(inv.total, inv.currency)}</td>
-                        <td className="td"><Badge>{billingStatusLabel(inv)}</Badge></td>
+                        <td className="td"><Badge>{translatePortalText(billingStatusLabel(inv))}</Badge></td>
                         <td className="td">
                           <div className="flex justify-end gap-1.5">
                             {inv.pdfUrl && (
@@ -272,7 +319,7 @@ export function Billing() {
                 <p className="text-sm font-bold text-deep-900">{personOf(sel.customer)?.name ?? translatePortalText('Customer')}</p>
                 <p className="text-xs text-slate-400">{personOf(sel.customer)?.email}</p>
               </div>
-              <Badge>{billingStatusLabel(sel)}</Badge>
+              <Badge>{translatePortalText(billingStatusLabel(sel))}</Badge>
             </div>
             {sel.kind === 'credit_note' && (
               <div className="rounded-xl bg-slate-50 px-4 py-2.5 text-xs text-slate-600">
@@ -292,8 +339,8 @@ export function Billing() {
               ))}
             </div>
             <div className="space-y-1 text-sm">
-              <p className="flex justify-between"><span className="text-slate-500">{translatePortalText("Subtotal")}</span><span className="font-semibold text-deep-900">{asIssued(sel.subtotal, sel.currency)}</span></p>
-              <p className="flex justify-between"><span className="text-slate-500">{translatePortalText('VAT')} ({formatPortalNumber(sel.vatRate)}%)</span><span className="font-semibold text-deep-900">{asIssued(sel.vatAmount, sel.currency)}</span></p>
+              <p className="flex justify-between"><span className="text-slate-500">{translatePortalText("Subtotal")}</span><span className="font-semibold text-deep-900">{signed(sel)}{asIssued(sel.subtotal, sel.currency)}</span></p>
+              <p className="flex justify-between"><span className="text-slate-500">{translatePortalText('VAT')} ({formatPortalNumber(sel.vatRate)}%)</span><span className="font-semibold text-deep-900">{signed(sel)}{asIssued(sel.vatAmount, sel.currency)}</span></p>
               <p className="flex justify-between border-t border-slate-100 pt-1.5"><span className="font-bold text-deep-900">{translatePortalText("Total")}</span><span className="font-display text-lg font-extrabold text-deep-900">{signed(sel)}{asIssued(sel.total, sel.currency)}</span></p>
               {sel.kind !== 'credit_note' && (sel.refundedTotal ?? 0) > 0 && (
                 <p className="flex justify-between"><span className="text-slate-500">{translatePortalText('Refunded so far')}</span><span className="font-semibold text-rose-600">−{asIssued(sel.refundedTotal, sel.currency)}</span></p>
@@ -378,14 +425,21 @@ export function Calendar() {
   const daysInMonth = new Date(year, month, 0).getDate()
   const leading = (first.getDay() + 6) % 7 // Monday-first grid
 
+  /*
+    Only events dated inside the month shown. The server queries movements and
+    services by UTC month boundaries but dates them in the harbour's own day, so
+    a departure at 01:00 Riyadh on 1 November comes back in October's list dated
+    2026-11-01 — and bucketing by day-of-month alone painted it on 1 October.
+  */
+  const events = useMemo(() => (state.data?.events ?? []).filter(e => e.date?.startsWith(cursor)), [state.data, cursor])
   const byDay = useMemo(() => {
     const map: Record<number, { kind: string; label: string; tone: string }[]> = {}
-    for (const e of state.data?.events ?? []) {
+    for (const e of events) {
       const day = Number(e.date.slice(8, 10))
       ;(map[day] ??= []).push(e)
     }
     return map
-  }, [state.data])
+  }, [events])
 
   return (
     <div>
@@ -400,7 +454,7 @@ export function Calendar() {
         </>} />
 
       <AsyncBlock state={state} loadingLabel="Loading the calendar…">
-        {(d) => (
+        {() => (
           <>
             <div className="card !p-3 md:!p-5">
               <div className="mb-2 grid grid-cols-7 gap-1.5 text-center text-[10px] font-extrabold uppercase tracking-wider text-slate-400">
@@ -410,20 +464,20 @@ export function Calendar() {
                 {Array.from({ length: leading }).map((_, i) => <div key={`pad-${i}`} className="min-h-[92px] rounded-xl bg-slate-50/50" />)}
                 {Array.from({ length: daysInMonth }).map((_, i) => {
                   const day = i + 1
-                  const events = byDay[day] ?? []
+                  const dayEvents = byDay[day] ?? []
                   const isToday = todayIso() === `${cursor}-${String(day).padStart(2, '0')}`
                   return (
                     <motion.div key={day} initial={{ opacity: 0, scale: 0.97 }} animate={{ opacity: 1, scale: 1 }} transition={{ delay: Math.min(i * 0.008, 0.25) }}
                       className={`min-h-[92px] rounded-xl border p-1.5 ${isToday ? 'border-ocean-300 bg-ocean-50/40' : 'border-slate-100'}`}>
                       <p className={`mb-1 text-[11px] font-extrabold ${isToday ? 'text-ocean-700' : 'text-slate-400'}`}>{day}</p>
                       <div className="space-y-1">
-                        {events.slice(0, 3).map((e, k) => (
+                        {dayEvents.slice(0, 3).map((e, k) => (
                           <p key={k} title={e.label}
                             className={`truncate rounded-lg px-1.5 py-0.5 text-[10px] font-semibold ring-1 ${EVENT_TONE[e.tone] ?? EVENT_TONE.info}`}>
                             {KIND_ICON[e.kind] ?? '•'} {translatePortalText(e.label)}
                           </p>
                         ))}
-                        {events.length > 3 && <p className="px-1 text-[10px] font-bold text-slate-400">+{formatPortalNumber(events.length - 3)} {translatePortalText("more")}</p>}
+                        {dayEvents.length > 3 && <p className="px-1 text-[10px] font-bold text-slate-400">+{formatPortalNumber(dayEvents.length - 3)} {translatePortalText("more")}</p>}
                       </div>
                     </motion.div>
                   )
@@ -433,13 +487,14 @@ export function Calendar() {
 
             <OccupancyHeat month={cursor} />
 
-            <Section title={translatePortalText("Everything this month")} sub={translatePortalText(`${d.events.length} ${d.events.length === 1 ? 'event' : 'events'}`)} className="mt-5">
-              {d.events.length ? (
+            <Section title={translatePortalText("Everything this month")} sub={translatePortalText(`${events.length} ${events.length === 1 ? 'event' : 'events'}`)} className="mt-5">
+              {events.length ? (
                 <div className="space-y-1.5">
-                  {d.events.map((e, i) => (
+                  {events.map((e, i) => (
                     <div key={i} className="flex items-center gap-3 rounded-xl border border-slate-100 px-3 py-2">
                       <span className="text-base">{KIND_ICON[e.kind] ?? '•'}</span>
-                      <span className="w-24 shrink-0 text-xs font-bold text-slate-400">{fmtDate(e.date)}</span>
+                      {/* `e.date` is the harbour's calendar day; noon UTC keeps it from shifting a day west of UTC. */}
+                      <span className="w-24 shrink-0 text-xs font-bold text-slate-400">{fmtDate(`${e.date.slice(0, 10)}T12:00:00Z`)}</span>
                       <span className="min-w-0 flex-1 truncate text-sm text-deep-800">{e.label}</span>
                       <span className={`chip ring-1 ${EVENT_TONE[e.tone] ?? EVENT_TONE.info}`}>{translatePortalText(humanize(e.kind))}</span>
                     </div>
@@ -470,7 +525,7 @@ function OccupancyHeat({ month }: { month: string }) {
   if (!days.length) return null
 
   return (
-    <Section title={translatePortalText("Berth occupancy heat")} sub={`Share of ${berths} berths occupied per day — last two weeks`} className="mt-5">
+    <Section title={translatePortalText("Berth occupancy heat")} sub={translatePortalTemplate('Share of {{berths}} berths occupied per day — last two weeks', { berths: formatPortalNumber(berths) })} className="mt-5">
       <div className="flex flex-wrap gap-1.5">
         {days.map(d => (
           <div key={d.day} title={translatePortalText(`${fmtDate(d.day)} · ${d.pct}% occupied`)}

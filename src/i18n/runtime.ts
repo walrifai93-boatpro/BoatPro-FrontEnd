@@ -5,6 +5,7 @@ import { MARINA_PAGES_ARABIC_MESSAGES } from './marinaPagesMessages'
 import { MARINA_SETTINGS_ARABIC_MESSAGES } from './marinaSettingsMessages'
 import { MARINA_SHARED_ARABIC_MESSAGES } from './marinaSharedMessages'
 import { MARINA_ACCESS_ARABIC_MESSAGES } from './marinaAccessMessages'
+import { MARINA_STAFF_ARABIC_MESSAGES } from './marinaStaffMessages'
 import { MARINA_ONBOARDING_ARABIC_MESSAGES } from './marinaOnboardingMessages'
 import { BOAT_PORTAL_ARABIC_MESSAGES } from './boatMessages'
 import { FUEL_ARABIC_MESSAGES } from './fuelMessages'
@@ -18,6 +19,8 @@ import { GAP_SERVER_1_ARABIC_MESSAGES } from './gapServer1Messages'
 import { GAP_SERVER_2_ARABIC_MESSAGES } from './gapServer2Messages'
 import { GAP_SERVER_3_ARABIC_MESSAGES } from './gapServer3Messages'
 import { GAP_SERVER_4_ARABIC_MESSAGES } from './gapServer4Messages'
+import { PLAN_ADMIN_ARABIC_MESSAGES } from './planAdminMessages'
+import { PLAN_PROVIDER_ARABIC_MESSAGES } from './planProviderMessages'
 
 export type PortalLanguage = 'en' | 'ar'
 export const PORTAL_LANGUAGE_KEY = 'boatpro.portal.language'
@@ -207,6 +210,8 @@ addMessages(MARINA_PAGES_ARABIC_MESSAGES)
 addMessages(MARINA_SETTINGS_ARABIC_MESSAGES)
 addMessages(MARINA_SHARED_ARABIC_MESSAGES)
 addMessages(MARINA_ACCESS_ARABIC_MESSAGES)
+// Not overwriting: short labels here ('Security', 'Fuel') keep any wording already in use.
+addMessages(MARINA_STAFF_ARABIC_MESSAGES, false)
 addMessages(MARINA_ONBOARDING_ARABIC_MESSAGES)
 addMessages(BOAT_PORTAL_ARABIC_MESSAGES)
 addMessages(FUEL_ARABIC_MESSAGES)
@@ -232,6 +237,8 @@ addMessages(GAP_SERVER_1_ARABIC_MESSAGES, false)
 addMessages(GAP_SERVER_2_ARABIC_MESSAGES, false)
 addMessages(GAP_SERVER_3_ARABIC_MESSAGES, false)
 addMessages(GAP_SERVER_4_ARABIC_MESSAGES, false)
+addMessages(PLAN_ADMIN_ARABIC_MESSAGES, false)
+addMessages(PLAN_PROVIDER_ARABIC_MESSAGES, false)
 
 function createPartialTranslationPattern(): RegExp {
   return new RegExp(

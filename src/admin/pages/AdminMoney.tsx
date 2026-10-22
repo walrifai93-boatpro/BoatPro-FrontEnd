@@ -10,7 +10,7 @@ import {
 } from 'lucide-react'
 import { avatar } from '../adminData'
 import { PageWrap, ChartTip, BOOKING_TYPE_META } from './_shared'
-import { Section, Modal, toast, Counter, TableSkeleton } from '../../ui'
+import { Section, Modal, toast, Counter, TableSkeleton, downloadCsv } from '../../ui'
 import { AdminHeader, ABadge } from '../adminUi'
 import { confirm, confirmAndRun } from '../../async'
 import { CollectionsPanel } from './AdminCollections'
@@ -22,9 +22,20 @@ import {
   type MonetizationProvider, type MonetizationStats, type Settlement, type ModelChangeRequest,
   type LimitKeyDef, type ProviderTypeKey, type PackageLimits, fileUrl,
   type BillingSettingsData, type EffectivePlatformPolicy, TAMARA_SURFACES, TAMARA_SURFACE_LABELS,
+  providerBillingApi, type AdminOfferData, type OfferStatus, type ProviderBillingSnapshot,
 } from '../../api'
-import { isPortalArabic, translatePortalText, formatPortalNumber, formatPortalPercent, formatPortalDate, localizedField } from '../../i18n/runtime'
+import { isPortalArabic, translatePortalText, translatePortalTemplate, formatPortalNumber, formatPortalPercent, formatPortalDate, localizedField } from '../../i18n/runtime'
 import { formatMoney } from '../../live'
+import {
+  PricingPhasesEditor, IntroBadge, ScheduleTimeline, type PhaseDraft,
+  subscriptionSchedule, commissionSchedule, hasIntroSteps, scheduleSummary, commissionFigure, firstPhaseDraftError,
+  subscriptionDraftsForPackage, commissionDraftsForPackage, subscriptionPhasesPayload, commissionPhasesPayload, phasesSignature,
+  periodPrice, monthCount, sar,
+} from '../PricingPhasesEditor'
+import {
+  GiveOfferModal, ProviderPlanModal, OfferChips, OfferStatusChip, effectiveCommissionNote, candidateFromMonetization,
+  offerSummary, offerWindow, offerCycles, revokeOfferFlow, offerIsOpen, BILL_LABEL, OFFER_STATUS_LABEL,
+} from '../ProviderPlanControls'
 
 const PROVIDER_TYPE_LABELS: Record<string, string> = {
   boat_provider: 'Boat Provider',
@@ -47,6 +58,33 @@ const fmtDate = (d?: string | null) => (d ? formatPortalDate(new Date(d)) : '—
 const verticalLabel = (value: unknown) => {
   const key = String(value ?? 'other')
   return translatePortalText(BOOKING_TYPE_META[key]?.label ?? (key === 'other' ? 'Other' : key))
+}
+
+/**
+ * The period a subscription package bills for, from `durationMonths`.
+ *
+ * Renewal amounts and expiry dates are both computed from `durationMonths`;
+ * `duration` is a free-text label edited separately. The card printed the
+ * label, so a 1-month package labelled "1 Year" read as a yearly price.
+ */
+function packagePeriod(pkg: { duration?: string; durationMonths?: number }): string {
+  const m = pkg.durationMonths
+  if (!m) return translatePortalText(pkg.duration || 'month')
+  if (m === 1) return translatePortalText('month')
+  if (m === 12) return translatePortalText('year')
+  if (m % 12 === 0) return `${formatPortalNumber(m / 12)} ${translatePortalText('years')}`
+  return `${formatPortalNumber(m)} ${translatePortalText('months')}`
+}
+
+/** The label the server itself writes for a duration — kept in step with the months field. */
+const durationLabelFor = (m: number) =>
+  m === 12 ? '1 Year' : m > 12 && m % 12 === 0 ? `${m / 12} Years` : `${m} Month${m === 1 ? '' : 's'}`
+
+/** Months a free-text label like "1 Year" / "3 Months" claims, or null when it does not say. */
+function labelMonths(label?: string): number | null {
+  const m = /^\s*(\d+)\s*(month|year)s?\s*$/i.exec(label ?? '')
+  if (!m) return null
+  return Number(m[1]) * (m[2].toLowerCase() === 'year' ? 12 : 1)
 }
 
 function formatExpiryDays(value: number, direction: 'ago' | 'left'): string {
@@ -94,7 +132,10 @@ export function AdminPayments() {
           <button className="btn-ghost" onClick={async () => {
             try { await monetizationApi.downloadReport(); toast(translatePortalText('Financial report downloaded')) }
             catch (e: any) { toast(translatePortalText(e?.message || translatePortalText('Export failed')), 'warn') }
-          }}><Download size={15} /> {translatePortalText('Export')}</button>
+          }}
+            // Named for what it is: the year-to-date financial workbook. The
+            // transaction list has its own CSV download on its section.
+            title={translatePortalText('Year-to-date financial report (Excel)')}><Download size={15} /> {translatePortalText('Financial report')}</button>
         } />
 
       <div className="mb-5 flex flex-wrap gap-1 rounded-2xl bg-sand p-1.5 w-fit">
@@ -113,47 +154,114 @@ export function AdminPayments() {
   )
 }
 
+/** Every `Payment.status` the API can return, as the ledger labels it. */
+const PAYMENT_STATUS_LABELS: Record<string, string> = {
+  paid: 'Completed',
+  pending: 'Pending',
+  failed: 'Failed',
+  refunded: 'Refunded',
+  // Was folded into "Pending" — a charge that was taken and partly given back
+  // read as one that had not been taken at all.
+  partially_refunded: 'Partially refunded',
+}
+
+/** Rows per request — the API's cap on `/admin-portal/payments`. */
+const TXN_PAGE = 100
+
 function TransactionsPanel() {
   const [live, setLive] = useState<{ gross: number; commission: number; providerNet: number; count: number } | null>(null)
   const [txns, setTxns] = useState<any[]>([])
+  /** Every payment in scope, not just the rows fetched so far. */
+  const [txnTotal, setTxnTotal] = useState(0)
+  const [txnPage, setTxnPage] = useState(1)
+  const [moreBusy, setMoreBusy] = useState(false)
   const [trend, setTrend] = useState<{ m: string; gross: number; commission: number }[]>([])
+  const [trendError, setTrendError] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [detail, setDetail] = useState<any | null>(null)
 
-  useEffect(() => {
+  const toRow = (p: any) => ({
+    // The full id keys the row: the six-character display id can collide.
+    key: String(p._id),
+    id: `TXN-${String(p._id).slice(-6).toUpperCase()}`,
+    avatar: fileUrl(p.customer?.avatar) || avatar(1),
+    who: p.customer?.name || translatePortalText('Unknown customer'),
+    time: p.createdAt ? formatPortalDate(new Date(p.createdAt)) : '—',
+    // The raw value alongside the formatted one: `time` is a localised
+    // string and cannot be filtered or ordered reliably.
+    createdAt: p.createdAt || '',
+    kind: p.bookingType || 'Payment',
+    // No invented gateway: this defaulted to "hyperpay" for a row that
+    // recorded no method at all.
+    method: p.method || '—',
+    desc: `Payment to ${p.provider?.business?.businessName || p.provider?.name || translatePortalText('Platform')}`,
+    amount: p.amount,
+    refundAmount: p.refundAmount ?? 0,
+    status: PAYMENT_STATUS_LABELS[p.status] ?? p.status ?? 'Pending',
+    raw: p,
+  })
+
+  const load = () => {
     const year = new Date().getFullYear()
     setLoading(true)
-    Promise.all([
-      adminPortalApi.payments({ limit: 50 }),
-      // Real month-by-month platform economics for the chart, replacing the
-      // hardcoded demo series this page used to render.
-      monetizationApi.report({ from: `${year}-01-01`, to: `${year}-12-31` }),
-    ]).then(([pRes, rRes]) => {
-      setLive(pRes.data.totals)
-      setTxns((pRes.data.items || []).map((p: any) => ({
-        id: `TXN-${String(p._id).slice(-6).toUpperCase()}`,
-        avatar: p.customer?.avatar || avatar(1),
-        who: p.customer?.name || 'Unknown User',
-        time: p.createdAt ? formatPortalDate(new Date(p.createdAt)) : '—',
-        // The raw value alongside the formatted one: `time` is a localised
-        // string and cannot be filtered or ordered reliably.
-        createdAt: p.createdAt || '',
-        kind: p.bookingType || 'Payment',
-        method: p.method || 'hyperpay',
-        desc: `Payment to ${p.provider?.business?.businessName || p.provider?.name || translatePortalText('Platform')}`,
-        amount: p.amount,
-        status: p.status === 'paid' ? 'Completed' : p.status === 'failed' ? 'Failed' : p.status === 'refunded' ? 'Refunded' : 'Pending',
-      })))
+    setError('')
+    setTrendError('')
+    // Independent requests: the chart failing used to blank the ledger and
+    // its totals with it, and vice versa.
+    const payments = adminPortalApi.payments({ limit: TXN_PAGE, page: 1 }).then(pRes => {
+      /*
+        `earned`, not `totals`. With no status filter `totals` sums every row —
+        pending checkouts and failed charges included — so "Gross volume" and
+        "Platform commission" counted money that never arrived. `earned` is
+        paid and partially-refunded charges only, net of refunds.
+      */
+      const money = pRes.data.earned ?? pRes.data.totals
+      setLive({
+        gross: money?.gross ?? 0,
+        commission: money?.commission ?? 0,
+        providerNet: money?.providerNet ?? 0,
+        // The count is of the ledger below — every status — not of `earned`.
+        count: pRes.data.pagination?.total ?? pRes.data.totals?.count ?? 0,
+      })
+      setTxns((pRes.data.items || []).map(toRow))
+      setTxnTotal(pRes.data.pagination?.total ?? (pRes.data.items || []).length)
+      setTxnPage(1)
+    }).catch((e: any) => { setLive(null); setError(e?.message || 'Failed to load') })
 
+    // Real platform economics for the chart, replacing the hardcoded demo
+    // series this page used to render.
+    const report = monetizationApi.report({ from: `${year}-01-01`, to: `${year}-12-31` }).then(rRes => {
       // The report groups by vertical, not month — chart the verticals, which
       // is the breakdown the API actually provides.
       setTrend((rRes.data.byVertical || []).map(v => ({
         m: verticalLabel(v._id), gross: v.gross, commission: v.commission,
       })))
-      setError('')
-    }).catch((e: any) => setError(e?.message || 'Failed to load'))
-      .finally(() => setLoading(false))
-  }, [])
+    }).catch((e: any) => { setTrend([]); setTrendError(e?.message || 'Failed to load') })
+
+    void Promise.all([payments, report]).finally(() => setLoading(false))
+  }
+  useEffect(load, [])
+
+  /** The next page of the ledger, appended — filters only ever see fetched rows. */
+  const loadMore = async () => {
+    if (moreBusy) return
+    setMoreBusy(true)
+    try {
+      const next = txnPage + 1
+      const r = await adminPortalApi.payments({ limit: TXN_PAGE, page: next })
+      setTxns(prev => {
+        const seen = new Set(prev.map(x => x.key))
+        return [...prev, ...(r.data.items || []).map(toRow).filter(x => !seen.has(x.key))]
+      })
+      setTxnPage(next)
+      setTxnTotal(r.data.pagination?.total ?? txnTotal)
+    } catch (e: any) {
+      toast(translatePortalText(e?.message || 'Could not load more transactions'), 'warn')
+    } finally {
+      setMoreBusy(false)
+    }
+  }
 
   /**
    * The transaction ledger's filters.
@@ -207,19 +315,29 @@ function TransactionsPanel() {
 
   return (
     <>
-      {error && <div className="card mb-4 !border-rose-200 !bg-rose-50 text-sm text-rose-600">{translatePortalText("Couldn't load: ")}{error}</div>}
+      {error && (
+        <div className="card mb-4 flex flex-wrap items-center justify-between gap-3 !border-rose-200 !bg-rose-50 text-sm text-rose-600">
+          <span>{translatePortalText("Couldn't load: ")}{error}</span>
+          <button className="btn-ghost !py-1.5 !px-3 !text-[11px]" onClick={load}><RefreshCw size={12} /> {translatePortalText('Retry')}</button>
+        </div>
+      )}
 
       <div className="mb-5 grid grid-cols-2 gap-4 md:grid-cols-4">
         {cards.map(([l, v, p, t], i) => (
           <motion.div key={String(l)} initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: i * 0.05 }} className="card p-4">
             <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400">{l}</p>
-            <p className={`mt-1 font-display text-2xl font-extrabold ${t}`}><Counter value={Number(v)} prefix={String(p)} /></p>
+            {/* A dash, not a zero, when the figures could not be read — an
+                outage must not look like a day with no sales. */}
+            <p className={`mt-1 font-display text-2xl font-extrabold ${t}`}>{live ? <Counter value={Number(v)} prefix={String(p)} /> : '—'}</p>
           </motion.div>
         ))}
       </div>
+      <p className="-mt-3 mb-5 text-[11px] text-slate-400">{translatePortalText('Money figures count paid and partially refunded charges only, net of refunds. The count is every transaction, whatever its status.')}</p>
 
       <Section title={translatePortalText('Revenue vs commission')} sub={translatePortalText('Platform economics by booking vertical (this year)')}>
-        {trend.length === 0 && !loading
+        {trendError && !loading
+          ? <div className="py-16 text-center text-sm text-rose-500">{translatePortalText("Couldn't load: ")}{trendError}</div>
+          : trend.length === 0 && !loading
           ? <div className="py-16 text-center text-sm text-slate-400">{translatePortalText('No settled bookings yet this year.')}</div>
           : (
             <ResponsiveContainer width="100%" height={250}>
@@ -239,7 +357,17 @@ function TransactionsPanel() {
           )}
       </Section>
 
-      <Section title={translatePortalText('Recent transactions')} sub={translatePortalText('Customer payments, newest first')} className="mt-5">
+      <Section title={translatePortalText('Recent transactions')} sub={translatePortalText('Customer payments, newest first')} className="mt-5"
+        actions={
+          <button className="btn-ghost" disabled={!txnTf.filtered.length} onClick={() => {
+            // Exactly the rows that pass the search and filters on screen.
+            downloadCsv(`boatpro-transactions-${new Date().toISOString().slice(0, 10)}.csv`, [
+              ['Reference', 'Date', 'Customer', 'Service', 'Method', 'Description', 'Amount (SAR)', 'Refunded (SAR)', 'Status'],
+              ...txnTf.filtered.map((t: any) => [t.id, t.createdAt, t.who, t.kind, t.method, t.desc, t.amount, t.refundAmount, t.status]),
+            ])
+            if (txns.length < txnTotal) toast(`${translatePortalText('Downloaded the')} ${formatPortalNumber(txns.length)} ${translatePortalText('loaded rows of')} ${formatPortalNumber(txnTotal)} — ${translatePortalText('use "Load older" to include more')}`, 'warn')
+          }}><Download size={14} /> {translatePortalText('Download CSV')}</button>
+        }>
         {/*
           `txnCfg` declared searchable fields and there was no search box
           anywhere on this table — the config was wired to a control that did
@@ -257,9 +385,10 @@ function TransactionsPanel() {
             <span>{translatePortalText('Transaction')}</span><span>{translatePortalText('Type')}</span><span>{translatePortalText('Description')}</span><span>{translatePortalText('Amount')}</span><span>{translatePortalText('Status')}</span><span></span>
           </div>
           {loading && <TableSkeleton rows={6} cols={4} />}
-          {!loading && txns.length === 0 && <div className="py-14 text-center text-sm text-slate-400">{translatePortalText('No transactions yet.')}</div>}
+          {!loading && !error && txns.length === 0 && <div className="py-14 text-center text-sm text-slate-400">{translatePortalText('No transactions yet.')}</div>}
+          {!loading && txns.length > 0 && txnTf.pagedRows.length === 0 && <NoFilterMatches noun="transactions" onClear={txnTf.clear} />}
           {txnTf.pagedRows.map((t, i) => (
-            <motion.div key={t.id} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: i * 0.03 }}
+            <motion.div key={t.key} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: Math.min(i, 12) * 0.03 }}
               className="grid grid-cols-2 items-center gap-3 border-b border-slate-50 px-4 py-3 transition hover:bg-sand lg:grid-cols-[1.5fr_1fr_1.4fr_0.9fr_0.8fr_auto]">
               <div className="col-span-2 flex items-center gap-3 lg:col-span-1">
                 <img src={t.avatar} className="h-9 w-9 rounded-full object-cover" />
@@ -267,16 +396,62 @@ function TransactionsPanel() {
               </div>
               <div className="text-xs font-semibold text-slate-600">{translatePortalText(t.kind)} · {translatePortalText(t.method)}</div>
               <div className="truncate text-xs text-slate-500">{translatePortalText(t.desc)}</div>
-              <div className={`text-[13px] font-extrabold ${t.amount < 0 ? 'text-rose-600' : 'text-emerald-600'}`}>{fmt(Math.abs(t.amount))}</div>
-              <div><ABadge dot={t.status === 'Flagged'}>{translatePortalText(t.status)}</ABadge></div>
+              {/* Coloured by what happened to the money, not by sign — no
+                  payment amount is negative, so every row (failed and
+                  refunded included) used to read as green income. */}
+              <div>
+                <p className={`text-[13px] font-extrabold ${t.status === 'Completed' ? 'text-emerald-600' : t.status === 'Refunded' ? 'text-rose-600 line-through' : t.status === 'Partially refunded' ? 'text-amber-600' : 'text-slate-400'}`}>{fmt(t.amount)}</p>
+                {t.refundAmount > 0 && <p className="text-[10px] font-bold text-rose-500">−{fmt(t.refundAmount)} {translatePortalText('refunded')}</p>}
+              </div>
+              <div><ABadge dot={t.status === 'Failed'}>{translatePortalText(t.status)}</ABadge></div>
               <div className="col-span-2 flex justify-end lg:col-span-1">
-                <button onClick={() => toast(`${t.id} · ${translatePortalText(t.desc)}`, 'info')} className="btn-ghost !py-1.5 !px-2.5 !text-[11px]">{translatePortalText('Details')}</button>
+                <button onClick={() => setDetail(t.raw)} className="btn-ghost !py-1.5 !px-2.5 !text-[11px]">{translatePortalText('Details')}</button>
               </div>
             </motion.div>
           ))}
           <TablePagination state={txnTf} noun={translatePortalText('transactions')} />
+          {/* The API pages at 100; without this the ledger, and every filter on
+              it, silently stopped at the newest fifty charges. */}
+          {!loading && txns.length < txnTotal && (
+            <div className="flex flex-wrap items-center justify-center gap-3 border-t border-slate-100 px-4 py-3 text-[11px] text-slate-400">
+              <span>{translatePortalText('Showing the newest')} {formatPortalNumber(txns.length)} {translatePortalText('of')} {formatPortalNumber(txnTotal)} {translatePortalText('transactions — search and filters cover the loaded rows only.')}</span>
+              <button disabled={moreBusy} onClick={() => void loadMore()} className="btn-ghost !py-1.5 !px-3 !text-[11px] disabled:opacity-40">
+                {moreBusy ? <Loader2 size={12} className="animate-spin" /> : <Plus size={12} />} {translatePortalText('Load older')}
+              </button>
+            </div>
+          )}
         </div>
       </Section>
+
+      {/* The payment as the API records it. "Details" used to be a toast that
+          repeated the row's own id and description. */}
+      <Modal open={!!detail} onClose={() => setDetail(null)} title={detail ? `TXN-${String(detail._id).slice(-6).toUpperCase()}` : ''}>
+        {detail && (
+          <div className="space-y-1.5 text-xs">
+            {([
+              ['Status', translatePortalText(PAYMENT_STATUS_LABELS[detail.status] ?? detail.status)],
+              ['Customer', [detail.customer?.name, detail.customer?.email].filter(Boolean).join(' · ') || '—'],
+              ['Provider', detail.provider?.business?.businessName || detail.provider?.name || '—'],
+              ['Vertical', detail.bookingType ? verticalLabel(detail.bookingType) : '—'],
+              ['Booking', [detail.booking?.code, detail.booking?.title, detail.booking?.boat].filter(Boolean).join(' · ') || '—'],
+              ['Amount', `${fmt(detail.amount ?? 0)} ${detail.currency || ''}`],
+              ['Refunded', detail.refundAmount ? `${fmt(detail.refundAmount)} ${detail.currency || ''} · ${fmtDate(detail.refundedAt)}` : '—'],
+              ['Commission (at charge)', detail.commissionAmount != null ? fmt(detail.commissionAmount) : '—'],
+              ['Provider net (at charge)', detail.providerNet != null ? fmt(detail.providerNet) : '—'],
+              ['Method', detail.method || '—'],
+              ['Gateway reference', detail.transactionId || '—'],
+              ['Created', fmtDate(detail.createdAt)],
+              ['Paid', fmtDate(detail.paidAt)],
+              ['Notes', detail.notes || '—'],
+            ] as [string, string][]).map(([k, v]) => (
+              <div key={k} className="flex justify-between gap-4 rounded-lg bg-sand px-3 py-2">
+                <span className="font-bold text-slate-500">{translatePortalText(k)}</span>
+                <span className="min-w-0 break-all text-end font-semibold text-deep-900">{v}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </Modal>
     </>
   )
 }
@@ -286,8 +461,8 @@ function TransactionsPanel() {
 // is on which, requests to switch, and the platform-wide billing policy. Money
 // actually moving — weekly payouts, cash commission owed — is on Payments &
 // Payouts instead.
-type SubsTab = 'Subscription Packages' | 'Commission Packages' | 'Add-ons' | 'Invite Links' | 'Provider Models' | 'Model Change Requests' | 'Billing Settings'
-const SUBS_TABS: SubsTab[] = ['Subscription Packages', 'Commission Packages', 'Add-ons', 'Invite Links', 'Provider Models', 'Model Change Requests', 'Billing Settings']
+type SubsTab = 'Subscription Packages' | 'Commission Packages' | 'Add-ons' | 'Invite Links' | 'Provider Models' | 'Offers & Discounts' | 'Model Change Requests' | 'Billing Settings'
+const SUBS_TABS: SubsTab[] = ['Subscription Packages', 'Commission Packages', 'Add-ons', 'Invite Links', 'Provider Models', 'Offers & Discounts', 'Model Change Requests', 'Billing Settings']
 /** `?tab=` values, so a tab can be linked to. The provider directories open `invites` and `models`. */
 const SUBS_TAB_SLUGS: Record<SubsTab, string> = {
   'Subscription Packages': 'subscriptions',
@@ -295,6 +470,7 @@ const SUBS_TAB_SLUGS: Record<SubsTab, string> = {
   'Add-ons': 'addons',
   'Invite Links': 'invites',
   'Provider Models': 'models',
+  'Offers & Discounts': 'offers',
   'Model Change Requests': 'requests',
   'Billing Settings': 'billing',
 }
@@ -314,19 +490,38 @@ function SubsPage() {
   useEffect(loadPendingChanges, [])
   const [providerTypeFilter, setProviderTypeFilter] = useState<string>('boat_provider')
   const [loading, setLoading] = useState(true)
+  /**
+   * Why the packages/providers did not load. Without it a failed request left
+   * every tab on its "No packages for this provider type yet" copy — an outage
+   * that read as an empty catalogue.
+   */
+  const [loadError, setLoadError] = useState('')
   const [busyId, setBusyId] = useState<string | null>(null)
+  /** One save at a time across the package / tier / add-on modals — double-clicks created duplicates. */
+  const [savingPkg, setSavingPkg] = useState(false)
 
   const [subPkgs, setSubPkgs] = useState<SubscriptionPackageData[]>([])
   const [subModalOpen, setSubModalOpen] = useState(false)
   const [editingSubPkg, setEditingSubPkg] = useState<SubscriptionPackageData | null>(null)
   const [subForm, setSubForm] = useState({ providerType: 'boat_provider', name: '', price: 5000, duration: '1 Month', durationMonths: 1, isActive: true, isPublic: true })
   const [subLimits, setSubLimits] = useState<Record<string, string>>({})
+  /** Introductory price steps being edited, as typed. */
+  const [subPhases, setSubPhases] = useState<PhaseDraft[]>([])
 
   const [commPkgs, setCommPkgs] = useState<CommissionPackageData[]>([])
   const [commModalOpen, setCommModalOpen] = useState(false)
   const [editingCommPkg, setEditingCommPkg] = useState<CommissionPackageData | null>(null)
   const [commForm, setCommForm] = useState<{ providerType: string; name: string; commissionType: CommissionType; commissionPercentage: number; fixedAmountSar: number; isActive: boolean; isPublic: boolean }>({ providerType: 'boat_provider', name: '', commissionType: 'percentage', commissionPercentage: 10, fixedAmountSar: 5, isActive: true, isPublic: true })
   const [commLimits, setCommLimits] = useState<Record<string, string>>({})
+  const [commPhases, setCommPhases] = useState<PhaseDraft[]>([])
+  /** Set when a type change cleared the "set rate / fee" steps — shown until the modal is reopened. */
+  const [commTypeStepsReset, setCommTypeStepsReset] = useState(false)
+  useEffect(() => { if (commModalOpen) setCommTypeStepsReset(false) }, [commModalOpen])
+
+  /** The provider whose plan is open in the "Manage plan" modal. */
+  const [planFor, setPlanFor] = useState<{ id: string; name: string } | null>(null)
+  /** Bumped when that modal changes something, so the Offers & Discounts table reloads with it. */
+  const [offersReload, setOffersReload] = useState(0)
 
   // Add-on marketplace (extra capacity a provider buys when they hit a limit)
   const [addOns, setAddOns] = useState<AddOnTypeData[]>([])
@@ -370,9 +565,17 @@ function SubsPage() {
   const [billingSettings, setBillingSettings] = useState<BillingSettingsData | null>(null)
   const [effectivePolicy, setEffectivePolicy] = useState<EffectivePlatformPolicy | null>(null)
   const [billingSettingsBusy, setBillingSettingsBusy] = useState(false)
+  /** A failed read used to leave this tab on "Loading…" forever. */
+  const [billingError, setBillingError] = useState('')
+  const loadBillingSettings = () => {
+    setBillingError('')
+    packageLimitApi.getBillingSettings()
+      .then((r) => { setBillingSettings(r.data.settings); setEffectivePolicy(r.data.effective ?? null) })
+      .catch((e: any) => setBillingError(e?.message || 'Could not load billing settings'))
+  }
   useEffect(() => {
     if (tab !== 'Billing Settings') return
-    packageLimitApi.getBillingSettings().then((r) => { setBillingSettings(r.data.settings); setEffectivePolicy(r.data.effective ?? null) }).catch(() => {})
+    loadBillingSettings()
   }, [tab])
   const saveBillingSettings = async (patch: Partial<BillingSettingsData>) => {
     setBillingSettingsBusy(true)
@@ -408,7 +611,9 @@ function SubsPage() {
       setCommPkgs(cRes.data.packages || [])
       setProvidersOverview(oRes.data.providers || [])
       setStats(oRes.data.stats || null)
+      setLoadError('')
     } catch (e: any) {
+      setLoadError(e?.message || 'Failed to load monetization data')
       toast(translatePortalText(e?.message || 'Failed to load monetization data'), 'warn')
     } finally {
       setLoading(false)
@@ -441,14 +646,63 @@ function SubsPage() {
   const modelTf = useTableFilters(filteredProviders, modelCfg)
 
   const handleSaveSubPkg = async () => {
+    if (savingPkg) return
     if (!subForm.name.trim()) return toast(translatePortalText('Package name is required'), 'warn')
+    // The server checks only that a price is numeric on create, and nothing at
+    // all on update — a negative or blank (NaN) price went straight in.
+    if (!Number.isFinite(subForm.price) || subForm.price < 0) return toast(translatePortalText('Price must be zero or more'), 'warn')
+    if (!Number.isInteger(subForm.durationMonths) || subForm.durationMonths < 1 || subForm.durationMonths > 60) {
+      return toast(translatePortalText('Duration must be a whole number of months, 1–60'), 'warn')
+    }
+    const phaseError = firstPhaseDraftError(subPhases, { bill: 'subscription', durationMonths: subForm.durationMonths }, subForm.price)
+    if (phaseError) return toast(phaseError, 'warn')
+    const nextPhases = subscriptionPhasesPayload(subPhases, subForm.price)
+    // As the commission tier does: re-pricing a package with subscribers on it
+    // changes what they are charged at their next renewal, so it is stated and
+    // confirmed rather than saved on one click.
+    if (editingSubPkg) {
+      const was = periodPrice(editingSubPkg.price, editingSubPkg.durationMonths)
+      const now = periodPrice(subForm.price, subForm.durationMonths)
+      const savedPhases = editingSubPkg.pricingPhases ?? subscriptionPhasesPayload(subscriptionDraftsForPackage(editingSubPkg), editingSubPkg.price)
+      const stepsChanged = phasesSignature(savedPhases) !== phasesSignature(nextPhases)
+      if (was !== now || stepsChanged) {
+        const body: string[] = []
+        if (was !== now) {
+          body.push(translatePortalTemplate('{{was}} → {{now}}. Every subscriber on this package is charged the new price from their next renewal; periods already paid keep their price.', { was, now }))
+          if (!stepsChanged && nextPhases.some(p => p.discountType === 'percent' || p.discountType === 'amount')) {
+            body.push(translatePortalText('Introductory steps written as a discount follow the new price.'))
+          }
+        }
+        if (stepsChanged) {
+          body.push(nextPhases.length
+            ? translatePortalTemplate('Its introductory steps change too — now: {{schedule}}. Subscribers part-way through them are charged the new steps from their next renewal.', {
+                schedule: scheduleSummary(
+                  subscriptionSchedule({ price: subForm.price, durationMonths: subForm.durationMonths, pricingPhases: nextPhases }),
+                  { bill: 'subscription', durationMonths: subForm.durationMonths },
+                ),
+              })
+            : translatePortalText('Its introductory steps are removed: subscribers part-way through them pay the regular price from their next renewal.'))
+        }
+        const ok = await confirm({
+          title: was !== now
+            ? translatePortalTemplate('Re-price “{{name}}”?', { name: editingSubPkg.name })
+            : translatePortalTemplate('Change the introductory steps of “{{name}}”?', { name: editingSubPkg.name }),
+          body: body.join(' '),
+          confirmLabel: was !== now ? 'Save new price' : 'Save new steps',
+        })
+        if (!ok) return
+      }
+    }
+    setSavingPkg(true)
     try {
       const id = editingSubPkg?._id || editingSubPkg?.id
-      const payload = { ...subForm, limits: parseLimits(subLimits) }
+      // Always sent: `[]` is how a package's steps are removed.
+      const payload = { ...subForm, name: subForm.name.trim(), limits: parseLimits(subLimits), pricingPhases: nextPhases }
       if (id) { await monetizationApi.updateSubscriptionPackage(id, payload as any); toast(translatePortalText('Subscription package updated')) }
       else { await monetizationApi.createSubscriptionPackage(payload as any); toast(translatePortalText('Subscription package created')) }
       setSubModalOpen(false); loadData()
     } catch (e: any) { toast(translatePortalText(e.message || 'Action failed'), 'warn') }
+    finally { setSavingPkg(false) }
   }
 
   const handleDeleteSubPkg = (id: string, name: string) =>
@@ -468,14 +722,62 @@ function SubsPage() {
     })
 
   const handleSaveCommPkg = async () => {
+    if (savingPkg) return
     if (!commForm.name.trim()) return toast(translatePortalText('Package name is required'), 'warn')
+    if (commForm.commissionType === 'fixed') {
+      if (!Number.isFinite(commForm.fixedAmountSar) || commForm.fixedAmountSar <= 0) return toast(translatePortalText('The fixed amount must be more than zero'), 'warn')
+    } else if (!Number.isFinite(commForm.commissionPercentage) || commForm.commissionPercentage < 0 || commForm.commissionPercentage > 100) {
+      return toast(translatePortalText('Commission must be between 0 and 100%'), 'warn')
+    }
+    const phaseError = firstPhaseDraftError(commPhases, { bill: 'commission', commissionType: commForm.commissionType },
+      commForm.commissionType === 'fixed' ? commForm.fixedAmountSar : commForm.commissionPercentage)
+    if (phaseError) return toast(phaseError, 'warn')
+    const nextPhases = commissionPhasesPayload(commPhases, commForm.commissionType,
+      (commForm.commissionType === 'fixed' ? commForm.fixedAmountSar : commForm.commissionPercentage) || 0)
+    // Re-pricing a live tier changes what every provider on it pays, so the
+    // new figure is stated and confirmed rather than saved on one click — and
+    // so is a change to its introductory steps, which re-prices them too.
+    if (editingCommPkg) {
+      const was = commissionFigure(editingCommPkg.commissionType, editingCommPkg.commissionPercentage ?? 0, editingCommPkg.fixedAmountSar ?? 0)
+      const now = commissionFigure(commForm.commissionType, commForm.commissionPercentage, commForm.fixedAmountSar)
+      const savedPhases = editingCommPkg.pricingPhases ?? commissionPhasesPayload(
+        commissionDraftsForPackage(editingCommPkg),
+        editingCommPkg.commissionType || 'percentage',
+        (editingCommPkg.commissionType === 'fixed' ? editingCommPkg.fixedAmountSar : editingCommPkg.commissionPercentage) ?? 0,
+      )
+      const stepsChanged = phasesSignature(savedPhases) !== phasesSignature(nextPhases)
+      if (was !== now || stepsChanged) {
+        const body: string[] = []
+        if (was !== now) body.push(translatePortalTemplate('{{was}} → {{now}}. Every provider currently on this tier is charged the new rate from now on.', { was, now }))
+        if (stepsChanged) {
+          body.push(nextPhases.length
+            ? translatePortalTemplate('Its introductory steps change too — now: {{schedule}}. Providers already on the tier follow the new steps from their own start date.', {
+                schedule: scheduleSummary(
+                  commissionSchedule({ commissionType: commForm.commissionType, commissionPercentage: commForm.commissionPercentage, fixedAmountSar: commForm.fixedAmountSar, pricingPhases: nextPhases }),
+                  { bill: 'commission', commissionType: commForm.commissionType },
+                ),
+              })
+            : translatePortalText('Its introductory steps are removed: providers part-way through them move to the regular rate.'))
+        }
+        const ok = await confirm({
+          title: was !== now
+            ? translatePortalTemplate('Re-price “{{name}}”?', { name: editingCommPkg.name })
+            : translatePortalTemplate('Change the introductory steps of “{{name}}”?', { name: editingCommPkg.name }),
+          body: body.join(' '),
+          confirmLabel: was !== now ? 'Save new rate' : 'Save new steps',
+        })
+        if (!ok) return
+      }
+    }
+    setSavingPkg(true)
     try {
       const id = editingCommPkg?._id || editingCommPkg?.id
-      const payload = { ...commForm, limits: parseLimits(commLimits) }
+      const payload = { ...commForm, name: commForm.name.trim(), limits: parseLimits(commLimits), pricingPhases: nextPhases }
       if (id) { await monetizationApi.updateCommissionPackage(id, payload as any); toast(translatePortalText('Commission package updated')) }
       else { await monetizationApi.createCommissionPackage(payload as any); toast(translatePortalText('Commission package created')) }
       setCommModalOpen(false); loadData()
     } catch (e: any) { toast(translatePortalText(e.message || 'Action failed'), 'warn') }
+    finally { setSavingPkg(false) }
   }
 
   const handleDeleteCommPkg = (id: string, name: string) =>
@@ -494,17 +796,30 @@ function SubsPage() {
       error: 'Failed to delete the commission tier. Please try again.',
     })
 
-  const loadAddOns = () => { addOnApi.list({ providerType: providerTypeFilter }).then(r => setAddOns(r.data.addOns || [])).catch(() => {}) }
+  /** A failed list read used to show "No add-ons for this provider type yet". */
+  const [addOnsError, setAddOnsError] = useState('')
+  const loadAddOns = () => {
+    setAddOnsError('')
+    addOnApi.list({ providerType: providerTypeFilter })
+      .then(r => setAddOns(r.data.addOns || []))
+      .catch((e: any) => { setAddOns([]); setAddOnsError(e?.message || 'Could not load add-ons') })
+  }
   useEffect(() => { if (tab === 'Add-ons') loadAddOns() }, [tab, providerTypeFilter])
 
   const handleSaveAddOn = async () => {
+    if (savingPkg) return
     if (!addOnForm.name.trim() || !addOnForm.resourceKey) return toast(translatePortalText('Name and resource are required'), 'warn')
+    if (!Number.isInteger(addOnForm.incrementAmount) || addOnForm.incrementAmount < 1) return toast(translatePortalText('The increment must be a whole number, 1 or more'), 'warn')
+    if (!Number.isFinite(addOnForm.pricePerMonth) || addOnForm.pricePerMonth < 0) return toast(translatePortalText('Price must be zero or more'), 'warn')
+    setSavingPkg(true)
     try {
       const id = editingAddOn?._id || editingAddOn?.id
-      if (id) { await addOnApi.update(id, addOnForm); toast(translatePortalText('Add-on updated')) }
-      else { await addOnApi.create(addOnForm); toast(translatePortalText('Add-on created')) }
+      const payload = { ...addOnForm, name: addOnForm.name.trim() }
+      if (id) { await addOnApi.update(id, payload); toast(translatePortalText('Add-on updated')) }
+      else { await addOnApi.create(payload); toast(translatePortalText('Add-on created')) }
       setAddOnModalOpen(false); loadAddOns()
     } catch (e: any) { toast(translatePortalText(e.message || 'Action failed'), 'warn') }
+    finally { setSavingPkg(false) }
   }
 
   const handleDeleteAddOn = (id: string, name: string) =>
@@ -526,7 +841,14 @@ function SubsPage() {
   // Rows arrive with the plan resolved and the shareable URL already built, so
   // this no longer has to fetch every package and match ids client-side (which
   // rendered "—" for any package those listings happened to miss).
-  const loadInvites = () => { planInviteApi.list().then(r => setInvites(r.data.invites || [])).catch(() => {}) }
+  /** A failed read used to show "No invite links yet." */
+  const [invitesError, setInvitesError] = useState('')
+  const loadInvites = () => {
+    setInvitesError('')
+    planInviteApi.list()
+      .then(r => setInvites(r.data.invites || []))
+      .catch((e: any) => { setInvites([]); setInvitesError(e?.message || 'Could not load invite links') })
+  }
   useEffect(() => {
     if (tab !== 'Invite Links') return
     loadInvites()
@@ -543,6 +865,14 @@ function SubsPage() {
     const f = inviteForm
     if (!f.name.trim()) return toast(translatePortalText('Give the plan a name'), 'warn')
     if (!(f.feePerTransaction > 0)) return toast(translatePortalText('Set the fee the platform takes per transaction'), 'warn')
+    if (f.maxUses && !(Number.isInteger(Number(f.maxUses)) && Number(f.maxUses) >= 1)) {
+      return toast(translatePortalText('Max uses must be a whole number, 1 or more — or blank for unlimited'), 'warn')
+    }
+    // A link that has already expired is dead on arrival.
+    if (f.expiresAt && f.expiresAt < new Date().toISOString().slice(0, 10)) {
+      return toast(translatePortalText('The expiry date is in the past'), 'warn')
+    }
+    if (inviteBusy) return
 
     setInviteBusy(true)
     try {
@@ -593,17 +923,118 @@ function SubsPage() {
   }
 
   const handleToggleInvite = async (invite: PlanInviteData) => {
+    const id = invite._id || invite.id!
+    if (busyId === id) return
+    setBusyId(id)
     try {
-      await planInviteApi.update(invite._id || invite.id!, { isActive: !invite.isActive })
+      await planInviteApi.update(id, { isActive: !invite.isActive })
+      toast(translatePortalText(invite.isActive ? 'Invite link disabled' : 'Invite link re-enabled'))
       loadInvites()
     } catch (e: any) { toast(translatePortalText(e.message || 'Could not update the invite'), 'warn') }
+    finally { setBusyId(null) }
   }
 
-  const handleRenewSubscription = async (providerId: string, months = 1) => {
-    setBusyId(providerId)
-    try { await monetizationApi.renewSubscription(providerId, months); toast(translatePortalText(`Subscription extended by ${formatPortalNumber(months)} month(s)`)); loadData() }
-    catch (e: any) { toast(translatePortalText(e.message || 'Failed to renew subscription'), 'warn') }
-    finally { setBusyId(null) }
+  /**
+   * A manual renewal, confirmed with what it records.
+   *
+   * Revenue only when money was received: with a payment reference (bank
+   * transfer, cash receipt) the server books the plan's pro-rata price as paid
+   * subscription revenue; left blank it is a complimentary extension recorded
+   * at SAR 0 with the plan's worth kept alongside. It used to book the full
+   * price as revenue on every click.
+   */
+  const handleRenewSubscription = async (p: MonetizationProvider, months = 1) => {
+    if (busyId === p.id) return
+    const name = p.businessName || p.name
+    // What the server will record is this provider's quote — the package's
+    // introductory step and their offer applied — not the catalogue price, so
+    // it is read from their billing snapshot before anything is said.
+    setBusyId(p.id)
+    let billing: ProviderBillingSnapshot
+    try {
+      billing = (await providerBillingApi.get(p.id)).data
+    } catch (e: any) {
+      toast(translatePortalText(e?.message || 'Could not load this provider’s plan'), 'warn')
+      return
+    } finally {
+      setBusyId(null)
+    }
+
+    const sub = billing.subscription
+    const pkg = sub?.package ?? null
+    const note = sub?.renewalNote ?? null
+    const scheduled = billing.scheduledChange
+    // A renewal is refused while a plan change is queued: it would renew the
+    // package that is about to be replaced. Say so before asking for a reference.
+    if (scheduled || note?.reason === 'scheduled_change' || note?.reason === 'switching_to_commission') {
+      const toCommission = scheduled?.billingModel === 'commission' || note?.reason === 'switching_to_commission'
+      const target = scheduled?.packageName || note?.packageName || translatePortalText(toCommission ? 'Commission' : 'Subscription')
+      const go = await confirm({
+        title: translatePortalTemplate('{{name}} cannot be renewed right now', { name }),
+        body: translatePortalTemplate('A move to “{{package}}” is scheduled for {{date}}, and a renewal is refused while a plan change is scheduled. Cancel the scheduled change first (Manage plan → Cancel change), then renew.', {
+          package: target, date: fmtDate(scheduled?.effectiveAt ?? note?.effectiveAt),
+        }),
+        confirmLabel: 'Manage plan',
+        cancelLabel: 'Close',
+      })
+      if (go) setPlanFor({ id: p.id, name })
+      return
+    }
+
+    const quote = sub?.nextRenewal ?? null
+    const ratio = pkg ? months / (pkg.durationMonths || 1) : 0
+    const round2 = (n: number) => Math.round(n * 100) / 100
+    const recorded = pkg && quote ? round2(quote.amount * ratio) : null
+    const regular = pkg ? round2((pkg.price || 0) * ratio) : 0
+    const body: string[] = []
+    if (!pkg) {
+      body.push(translatePortalText('This provider has no subscription package on file, so the extension is recorded at SAR 0.'))
+    } else {
+      if (recorded !== null) {
+        body.push(translatePortalTemplate('If the provider paid off-platform, enter the transfer or receipt reference: {{amount}} is recorded as subscription revenue for “{{package}}” ({{months}}).', {
+          amount: sar(recorded), package: pkg.name, months: monthCount(months),
+        }))
+        if (Math.abs(recorded - regular) >= 0.01) {
+          body.push(translatePortalTemplate('That is their own price for this period, with their introductory step and offer applied; the regular price is {{amount}}.', { amount: sar(regular) }))
+        }
+      } else {
+        body.push(translatePortalTemplate('If the provider paid off-platform, enter the transfer or receipt reference: their own price for this period of “{{package}}”, with their introductory step and offer applied, is recorded as subscription revenue. The regular price for {{months}} is {{amount}}.', {
+          package: pkg.name, months: monthCount(months), amount: sar(regular),
+        }))
+      }
+      if (note?.reason === 'cancelling' || sub?.cancelAtPeriodEnd) {
+        body.push(translatePortalTemplate('They have cancelled: the plan is set to end on {{date}}.', { date: fmtDate(note?.effectiveAt ?? sub?.expiry) }))
+      }
+      body.push(translatePortalText('Leave the reference blank to extend at no charge — nothing is counted as revenue.'))
+    }
+
+    return confirmAndRun({
+      title: translatePortalTemplate('Extend {{name}}’s subscription by {{months}}?', { name, months: monthCount(months) }),
+      body: body.join(' '),
+      input: { label: 'Payment reference (optional)', placeholder: 'e.g. bank transfer ref — blank for a complimentary extension', maxLength: 120 },
+      confirmLabel: 'Extend subscription',
+      busyLabel: 'Extending…',
+      run: async (reference) => {
+        setBusyId(p.id)
+        try {
+          const r = await monetizationApi.renewSubscription(p.id, months, undefined, (reference || '').trim() || undefined)
+          loadData()
+          return r.data as { subscriptionExpiry?: string; complimentary?: boolean; amount?: number } | undefined
+        } finally { setBusyId(null) }
+      },
+      success: (d) => {
+        const until = d?.subscriptionExpiry ? fmtDate(d.subscriptionExpiry) : null
+        if (d?.complimentary) {
+          return until
+            ? translatePortalTemplate('Subscription extended to {{date}} — no charge recorded', { date: until })
+            : translatePortalTemplate('Subscription extended by {{months}} — no charge recorded', { months: monthCount(months) })
+        }
+        return until
+          ? translatePortalTemplate('Subscription extended to {{date}} — {{amount}} recorded as paid', { date: until, amount: sar(d?.amount ?? 0) })
+          : translatePortalTemplate('Subscription extended by {{months}} — {{amount}} recorded as paid', { months: monthCount(months), amount: sar(d?.amount ?? 0) })
+      },
+      // No fixed copy: the server's own reason ("Provider not found") is shown.
+    })
   }
 
   const handleSuspendExpired = () =>
@@ -647,6 +1078,13 @@ function SubsPage() {
       <AdminHeader title={translatePortalText('Packages & Pricing')} sub={translatePortalText('What providers pay: subscription, commission & fixed-fee packages, who is on which, and requests to switch')} icon={<Percent className="text-emerald-500" />}
         actions={<button className="btn-ghost" onClick={() => { loadData(); loadPendingChanges() }}><RefreshCw size={14} className={loading ? 'animate-spin' : ''} /> {translatePortalText('Refresh')}</button>} />
 
+      {loadError && (
+        <div className="card mb-4 flex flex-wrap items-center justify-between gap-3 !border-rose-200 !bg-rose-50 text-sm text-rose-600">
+          <span>{translatePortalText("Couldn't load packages and providers: ")}{loadError}</span>
+          <button className="btn-ghost !py-1.5 !px-3 !text-[11px]" onClick={() => loadData()}><RefreshCw size={12} /> {translatePortalText('Retry')}</button>
+        </div>
+      )}
+
       {stats && (
         <div className="mb-5 grid grid-cols-2 gap-3 md:grid-cols-6">
           {([
@@ -682,8 +1120,9 @@ function SubsPage() {
         ))}
       </div>
 
-      {/* The provider-type filter only applies to the package and model tabs. */}
-      {tab !== 'Model Change Requests' && tab !== 'Billing Settings' && (
+      {/* The provider-type filter only applies to the package and model tabs.
+          Offers & Discounts filters by type inside its own table, so it can show every offer at once. */}
+      {tab !== 'Model Change Requests' && tab !== 'Billing Settings' && tab !== 'Offers & Discounts' && (
         <div className="mb-6 flex flex-wrap items-center gap-2 border-b border-slate-100 pb-4">
           <span className="text-xs font-bold text-slate-400 uppercase tracking-wider me-2">{translatePortalText('Provider Type:')}</span>
           {Object.entries(PROVIDER_TYPE_LABELS).map(([k, label]) => (
@@ -702,13 +1141,13 @@ function SubsPage() {
             <h3 className="font-display text-lg font-extrabold text-deep-900">{translatePortalText(PROVIDER_TYPE_LABELS[providerTypeFilter])} {translatePortalText('Subscription Packages')}</h3>
             <p className="text-xs text-slate-400">{translatePortalText("Provider pays this fee to the platform. Customer payments accrue 100% to the provider's wallet — no commission is taken.")}</p>
           </div>
-          <button onClick={() => { setEditingSubPkg(null); setSubForm({ providerType: providerTypeFilter, name: '', price: 5000, duration: '1 Month', durationMonths: 1, isActive: true, isPublic: true }); setSubLimits({}); setSubModalOpen(true) }} className="btn-admin !text-xs">
+          <button onClick={() => { setEditingSubPkg(null); setSubForm({ providerType: providerTypeFilter, name: '', price: 5000, duration: '1 Month', durationMonths: 1, isActive: true, isPublic: true }); setSubLimits({}); setSubPhases([]); setSubModalOpen(true) }} className="btn-admin !text-xs">
             <Plus size={14} /> {translatePortalText('Add Package')}
           </button>
         </div>
 
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {subPkgs.length === 0 && !loading && <div className="card col-span-full py-14 text-center text-sm text-slate-400">{translatePortalText('No packages for this provider type yet.')}</div>}
+          {subPkgs.length === 0 && !loading && !loadError && <div className="card col-span-full py-14 text-center text-sm text-slate-400">{translatePortalText('No packages for this provider type yet.')}</div>}
           {subPkgs.map((pkg, i) => (
             <motion.div key={pkg._id || pkg.id || i} initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: i * 0.05 }} className={`card p-5 relative overflow-hidden ${pkg.isActive === false ? 'opacity-60' : ''}`}>
               <div className="flex items-center justify-between">
@@ -718,13 +1157,23 @@ function SubsPage() {
                     setEditingSubPkg(pkg)
                     setSubForm({ providerType: pkg.providerType || providerTypeFilter, name: pkg.name, price: pkg.price, duration: pkg.duration || '1 Month', durationMonths: pkg.durationMonths || 1, isActive: pkg.isActive !== false, isPublic: pkg.isPublic !== false })
                     setSubLimits(Object.fromEntries(Object.entries(pkg.limits || {}).map(([k, v]) => [k, v === null || v === undefined ? '' : String(v)])))
+                    setSubPhases(subscriptionDraftsForPackage(pkg))
                     setSubModalOpen(true)
                   }} className="p-1 text-slate-400 hover:text-deep-900"><Edit3 size={14} /></button>
                   <button disabled={busyId === (pkg._id || pkg.id)} onClick={() => handleDeleteSubPkg(pkg._id || pkg.id!, pkg.name)} className="p-1 text-slate-400 hover:text-rose-600 disabled:opacity-40"><Trash2 size={14} /></button>
                 </div>
               </div>
-              <p className="mt-3 font-display text-xl font-extrabold text-deep-900">{pkg.name} {pkg.isActive === false && <span className="chip !text-[10px] bg-slate-100 text-slate-500">{translatePortalText('inactive')}</span>} {pkg.isPublic === false && <span className="chip !text-[10px] bg-violet-100 text-violet-600">{translatePortalText('hidden')}</span>}</p>
-              <p className="mt-1 font-display text-3xl font-extrabold text-emerald-600">{fmt(pkg.price)}<span className="text-xs font-semibold text-slate-400"> / {translatePortalText(pkg.duration || 'month')}</span></p>
+              <p className="mt-3 font-display text-xl font-extrabold text-deep-900">{pkg.name} {pkg.isActive === false && <span className="chip !text-[10px] bg-slate-100 text-slate-500">{translatePortalText('inactive')}</span>} {pkg.isPublic === false && <span className="chip !text-[10px] bg-violet-100 text-violet-600">{translatePortalText('hidden')}</span>} {hasIntroSteps(subscriptionSchedule(pkg)) && <IntroBadge />}</p>
+              <p className="mt-1 font-display text-3xl font-extrabold text-emerald-600">{fmt(pkg.price)}<span className="text-xs font-semibold text-slate-400"> {translatePortalText('SAR')} / {packagePeriod(pkg)}</span></p>
+              {!!pkg.durationMonths && labelMonths(pkg.duration) != null && labelMonths(pkg.duration) !== pkg.durationMonths && (
+                <p className="mt-1 text-[10px] font-bold text-amber-600">{translatePortalText('Label says')} “{pkg.duration}” — {translatePortalText('billed every')} {packagePeriod(pkg)}</p>
+              )}
+              {/* The introductory schedule a new subscriber goes through before the price above. */}
+              {hasIntroSteps(subscriptionSchedule(pkg)) && (
+                <div className="mt-3 rounded-xl bg-violet-50/40 p-2.5 ring-1 ring-violet-100">
+                  <ScheduleTimeline steps={subscriptionSchedule(pkg)} bill={{ bill: 'subscription', durationMonths: pkg.durationMonths }} compact />
+                </div>
+              )}
               <div className="mt-4 border-t border-slate-100 pt-3 text-xs text-slate-500 space-y-1">
                 <p className="flex items-center gap-1.5"><Check size={12} className="text-emerald-500" /> {translatePortalText('100% of every booking accrues to the wallet')}</p>
                 <p className="flex items-center gap-1.5"><Check size={12} className="text-emerald-500" /> {translatePortalText('0% platform commission per booking')}</p>
@@ -751,13 +1200,13 @@ function SubsPage() {
             <h3 className="font-display text-lg font-extrabold text-deep-900">{translatePortalText(PROVIDER_TYPE_LABELS[providerTypeFilter])} {translatePortalText('Commission Packages')}</h3>
             <p className="text-xs text-slate-400">{translatePortalText('Customer pays the platform via HyperPay; commission is withheld and the net is paid out weekly by bank transfer.')}</p>
           </div>
-          <button onClick={() => { setEditingCommPkg(null); setCommForm({ providerType: providerTypeFilter, name: '', commissionType: 'percentage', commissionPercentage: 10, fixedAmountSar: 5, isActive: true, isPublic: true }); setCommLimits({}); setCommModalOpen(true) }} className="btn-admin !text-xs">
+          <button onClick={() => { setEditingCommPkg(null); setCommForm({ providerType: providerTypeFilter, name: '', commissionType: 'percentage', commissionPercentage: 10, fixedAmountSar: 5, isActive: true, isPublic: true }); setCommLimits({}); setCommPhases([]); setCommModalOpen(true) }} className="btn-admin !text-xs">
             <Plus size={14} /> {translatePortalText('Add Commission Tier')}
           </button>
         </div>
 
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {commPkgs.length === 0 && !loading && <div className="card col-span-full py-14 text-center text-sm text-slate-400">{translatePortalText('No commission tiers for this provider type yet.')}</div>}
+          {commPkgs.length === 0 && !loading && !loadError && <div className="card col-span-full py-14 text-center text-sm text-slate-400">{translatePortalText('No commission tiers for this provider type yet.')}</div>}
           {commPkgs.map((pkg, i) => (
             <motion.div key={pkg._id || pkg.id || i} initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: i * 0.05 }} className={`card p-5 relative overflow-hidden ${pkg.isActive === false ? 'opacity-60' : ''}`}>
               <div className="flex items-center justify-between">
@@ -767,16 +1216,23 @@ function SubsPage() {
                     setEditingCommPkg(pkg)
                     setCommForm({ providerType: pkg.providerType || providerTypeFilter, name: pkg.name, commissionType: pkg.commissionType || 'percentage', commissionPercentage: pkg.commissionPercentage ?? 10, fixedAmountSar: pkg.fixedAmountSar ?? 5, isActive: pkg.isActive !== false, isPublic: pkg.isPublic !== false })
                     setCommLimits(Object.fromEntries(Object.entries(pkg.limits || {}).map(([k, v]) => [k, v === null || v === undefined ? '' : String(v)])))
+                    setCommPhases(commissionDraftsForPackage(pkg))
                     setCommModalOpen(true)
                   }} className="p-1 text-slate-400 hover:text-deep-900"><Edit3 size={14} /></button>
                   <button disabled={busyId === (pkg._id || pkg.id)} onClick={() => handleDeleteCommPkg(pkg._id || pkg.id!, pkg.name)} className="p-1 text-slate-400 hover:text-rose-600 disabled:opacity-40"><Trash2 size={14} /></button>
                 </div>
               </div>
-              <p className="mt-3 font-display text-xl font-extrabold text-deep-900">{pkg.name} {pkg.isActive === false && <span className="chip !text-[10px] bg-slate-100 text-slate-500">{translatePortalText('inactive')}</span>} {pkg.isPublic === false && <span className="chip !text-[10px] bg-violet-100 text-violet-600">{translatePortalText('hidden')}</span>}</p>
+              <p className="mt-3 font-display text-xl font-extrabold text-deep-900">{pkg.name} {pkg.isActive === false && <span className="chip !text-[10px] bg-slate-100 text-slate-500">{translatePortalText('inactive')}</span>} {pkg.isPublic === false && <span className="chip !text-[10px] bg-violet-100 text-violet-600">{translatePortalText('hidden')}</span>} {hasIntroSteps(commissionSchedule(pkg)) && <IntroBadge />}</p>
               <p className="mt-1 font-display text-3xl font-extrabold text-deep-900">
                 {pkg.commissionType === 'fixed' ? fmt(pkg.fixedAmountSar || 0) : formatPortalPercent(pkg.commissionPercentage)}
-                <span className="text-xs font-semibold text-slate-400"> {pkg.commissionType === 'fixed' ? 'flat per transaction' : 'platform cut'}</span>
+                <span className="text-xs font-semibold text-slate-400"> {translatePortalText(pkg.commissionType === 'fixed' ? 'SAR flat per transaction' : 'platform cut')}</span>
               </p>
+              {/* The introductory steps a provider joining this tier goes through before the rate above. */}
+              {hasIntroSteps(commissionSchedule(pkg)) && (
+                <div className="mt-3 rounded-xl bg-violet-50/40 p-2.5 ring-1 ring-violet-100">
+                  <ScheduleTimeline steps={commissionSchedule(pkg)} bill={{ bill: 'commission', commissionType: pkg.commissionType }} compact />
+                </div>
+              )}
               <div className="mt-4 border-t border-slate-100 pt-3 text-xs text-slate-500 space-y-1">
                 <p className="flex items-center gap-1.5"><Check size={12} className="text-emerald-500" /> {translatePortalText('Platform holds the customer payment')}</p>
                 <p className="flex items-center gap-1.5"><Check size={12} className="text-emerald-500" /> {translatePortalText('Net accrues to the provider wallet')}</p>
@@ -812,7 +1268,13 @@ function SubsPage() {
         </div>
 
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {addOns.length === 0 && <div className="card col-span-full py-14 text-center text-sm text-slate-400">{translatePortalText('No add-ons for this provider type yet.')}</div>}
+          {addOnsError && (
+            <div className="card col-span-full flex flex-wrap items-center justify-between gap-3 !border-rose-200 !bg-rose-50 text-sm text-rose-600">
+              <span>{translatePortalText("Couldn't load: ")}{addOnsError}</span>
+              <button className="btn-ghost !py-1.5 !px-3 !text-[11px]" onClick={loadAddOns}><RefreshCw size={12} /> {translatePortalText('Retry')}</button>
+            </div>
+          )}
+          {addOns.length === 0 && !addOnsError && <div className="card col-span-full py-14 text-center text-sm text-slate-400">{translatePortalText('No add-ons for this provider type yet.')}</div>}
           {addOns.map((a, i) => (
             <motion.div key={a._id || a.id || i} initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: i * 0.05 }} className={`card p-5 relative overflow-hidden ${a.isActive === false ? 'opacity-60' : ''}`}>
               <div className="flex items-center justify-between">
@@ -849,7 +1311,13 @@ function SubsPage() {
               <div className="grid grid-cols-[1.2fr_1.7fr_1fr_1fr_0.9fr_auto] items-center gap-4 border-b border-slate-100 bg-sand px-5 py-3.5 text-[11px] font-bold uppercase tracking-wider text-slate-400">
                 <span>{translatePortalText('Code')}</span><span>{translatePortalText('Plan')}</span><span>{translatePortalText('Uses')}</span><span>{translatePortalText('Expires')}</span><span>{translatePortalText('Status')}</span><span className="text-right">{translatePortalText('Actions')}</span>
               </div>
-              {invites.length === 0 && <div className="py-14 text-center text-sm text-slate-400">{translatePortalText('No invite links yet.')}</div>}
+              {invitesError && (
+                <div className="flex flex-wrap items-center justify-between gap-3 bg-rose-50 px-5 py-4 text-sm text-rose-600">
+                  <span>{translatePortalText("Couldn't load: ")}{invitesError}</span>
+                  <button className="btn-ghost !py-1.5 !px-3 !text-[11px]" onClick={loadInvites}><RefreshCw size={12} /> {translatePortalText('Retry')}</button>
+                </div>
+              )}
+              {invites.length === 0 && !invitesError && <div className="py-14 text-center text-sm text-slate-400">{translatePortalText('No invite links yet.')}</div>}
               {invites.map((inv, i) => {
                 const expired = inv.expiresAt ? new Date(inv.expiresAt) < new Date() : false
                 const exhausted = inv.maxUses != null && inv.usedCount >= inv.maxUses
@@ -875,7 +1343,7 @@ function SubsPage() {
                       <button onClick={() => copyInviteLink(inv)} className="btn-ghost !py-1.5 !px-2.5 !text-[11px]">
                         {copiedCode === inv.code ? <><Check size={12} /> {translatePortalText('Copied')}</> : <><Copy size={12} /> {translatePortalText('Copy link')}</>}
                       </button>
-                      <button onClick={() => handleToggleInvite(inv)} className="btn-ghost !py-1.5 !px-2.5 !text-[11px]">{inv.isActive ? translatePortalText('Disable') : translatePortalText('Re-enable')}</button>
+                      <button disabled={busyId === (inv._id || inv.id)} onClick={() => handleToggleInvite(inv)} className="btn-ghost !py-1.5 !px-2.5 !text-[11px] disabled:opacity-40">{inv.isActive ? translatePortalText('Disable') : translatePortalText('Re-enable')}</button>
                     </div>
                   </motion.div>
                 )
@@ -905,12 +1373,12 @@ function SubsPage() {
 
         <div className="card overflow-hidden">
           <div className="overflow-x-auto custom-scrollbar">
-            <div className="min-w-[980px]">
+            <div className="min-w-[1120px]">
               <div className="grid grid-cols-[2fr_1.1fr_1.3fr_1.2fr_1fr_1fr_auto] items-center gap-4 border-b border-slate-100 bg-sand px-5 py-3.5 text-[11px] font-bold uppercase tracking-wider text-slate-400">
                 <span>{translatePortalText('Provider')}</span><span>{translatePortalText('Model')}</span><span>{translatePortalText('Package')}</span><span>{translatePortalText('Expiry')}</span><span>{translatePortalText('Wallet')}</span><span>{translatePortalText('Payout')}</span><span className="text-right">{translatePortalText('Actions')}</span>
               </div>
               {loading && <TableSkeleton rows={6} cols={4} />}
-              {!loading && filteredProviders.length === 0 && <div className="py-14 text-center text-sm text-slate-400">{translatePortalText("No ")}{translatePortalText(PROVIDER_TYPE_LABELS[providerTypeFilter])} {translatePortalText(" accounts yet.")}</div>}
+              {!loading && !loadError && filteredProviders.length === 0 && <div className="py-14 text-center text-sm text-slate-400">{translatePortalText("No ")}{translatePortalText(PROVIDER_TYPE_LABELS[providerTypeFilter])} {translatePortalText(" accounts yet.")}</div>}
               {modelTf.pagedRows.map((p, i) => {
                 const exp = expiryTone(p.subscriptionExpiry)
                 const isSub = p.paymentModel === 'subscription'
@@ -925,16 +1393,29 @@ function SubsPage() {
                     <div className="min-w-0">
                       <p className="truncate text-[13px] font-extrabold text-deep-900">{p.businessName}</p>
                       <p className="truncate text-[11px] text-slate-400">{p.email}</p>
+                      {/* Live and upcoming admin offers — what makes this provider's bill differ from the package. */}
+                      <OfferChips offers={p.offers} />
                     </div>
                     {/* Three models, not two — a flat per-transaction fee is
                         its own deal and gets its own chip. */}
                     <div><span className={`chip !text-[11px] font-extrabold ${planChip}`}>{translatePortalText(planModel)}</span></div>
-                    <div className="truncate text-xs font-bold text-slate-600">
-                      {isSub
-                        ? (p.subscriptionPackage?.name || '—')
-                        : isFixedFee
-                          ? (p.commissionPackage?.name || translatePortalText(`SAR ${p.commissionFixedAmount ?? 0}/txn`))
-                          : (p.commissionPackage?.name || (p.commissionRate != null ? formatPortalPercent(p.commissionRate) : '—'))}
+                    <div className="min-w-0 text-xs font-bold text-slate-600">
+                      <p className="truncate">
+                        {isSub
+                          ? (p.subscriptionPackage?.name || '—')
+                          : isFixedFee
+                            ? (p.commissionPackage?.name || translatePortalText(`SAR ${p.commissionFixedAmount ?? 0}/txn`))
+                            : (p.commissionPackage?.name || (p.commissionRate != null ? formatPortalPercent(p.commissionRate) : '—'))}
+                      </p>
+                      {/* What they are charged today, when an intro step or an offer moves it off the tier's rate. */}
+                      {!isSub && (() => {
+                        const note = effectiveCommissionNote(p.effectiveCommission)
+                        return note ? (
+                          <p className="mt-0.5 truncate text-[10px] font-extrabold text-violet-700" title={translatePortalTemplate('Regular rate: {{rate}}', { rate: note.regular })}>
+                            {translatePortalTemplate('Now {{rate}}', { rate: note.now })}{note.reason ? ` · ${note.reason}` : ''}
+                          </p>
+                        ) : null
+                      })()}
                     </div>
                     <div className="whitespace-nowrap">{isSub ? <span className={`chip !text-[11px] font-extrabold ${exp.cls}`}>{exp.label}</span> : <span className="text-xs text-slate-400">{translatePortalText('n/a')}</span>}</div>
                     <div className="text-[13px] font-extrabold text-amber-600 whitespace-nowrap">{fmt(p.walletBalance)}</div>
@@ -944,8 +1425,11 @@ function SubsPage() {
                       </span>
                     </div>
                     <div className="flex justify-end gap-1.5 whitespace-nowrap">
+                      <button onClick={() => setPlanFor({ id: p.id, name: p.businessName || p.name })} className="btn-admin !py-1.5 !px-2.5 !text-[11px]" title={translatePortalText('See and change their plan, price and offers')}>
+                        <ArrowRightLeft size={11} /> {translatePortalText('Manage plan')}
+                      </button>
                       {isSub && (
-                        <button disabled={busyId === p.id} onClick={() => handleRenewSubscription(p.id, 1)} className="btn-ghost !py-1.5 !px-2.5 !text-[11px] disabled:opacity-40">
+                        <button disabled={busyId === p.id} onClick={() => handleRenewSubscription(p, 1)} className="btn-ghost !py-1.5 !px-2.5 !text-[11px] disabled:opacity-40">
                           {busyId === p.id ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />} {translatePortalText('Renew 1m')}
                         </button>
                       )}
@@ -960,6 +1444,20 @@ function SubsPage() {
           <TablePagination state={modelTf} noun={translatePortalText('providers')} />
         </div>
       </>)}
+
+      {/* ── OFFERS & DISCOUNTS ── */}
+      {/* Giving or revoking an offer changes the Provider Models badges, so
+          the overview reloads with it. */}
+      {tab === 'Offers & Discounts' && (
+        <OffersPanel
+          providers={providersOverview}
+          providersLoading={loading}
+          providersError={loadError}
+          onChanged={() => loadData()}
+          onManagePlan={(id, name) => setPlanFor({ id, name })}
+          reloadKey={offersReload}
+        />
+      )}
 
       {/* ── MODEL CHANGE REQUESTS ── */}
       {/* An approval changes which model a provider is on, so the Provider
@@ -976,7 +1474,14 @@ function SubsPage() {
             <p className="text-xs text-slate-400">{translatePortalText("Applies platform-wide, across all four provider types.")}</p>
           </div>
           {!billingSettings ? (
-            <p className="text-sm text-slate-400">{translatePortalText("Loading…")}</p>
+            billingError ? (
+              <div className="card flex flex-wrap items-center justify-between gap-3 !border-rose-200 !bg-rose-50 text-sm text-rose-600">
+                <span>{translatePortalText("Couldn't load: ")}{billingError}</span>
+                <button className="btn-ghost !py-1.5 !px-3 !text-[11px]" onClick={loadBillingSettings}><RefreshCw size={12} /> {translatePortalText('Retry')}</button>
+              </div>
+            ) : (
+              <p className="text-sm text-slate-400">{translatePortalText("Loading…")}</p>
+            )
           ) : (
             <>
               <div className="card p-4">
@@ -1059,6 +1564,10 @@ function SubsPage() {
         </div>
       )}
 
+      {/* One provider's plan, price and offers — "Manage plan" on Provider Models and Offers & Discounts.
+          An offer given or revoked there also reloads the Offers & Discounts table. */}
+      <ProviderPlanModal provider={planFor} onClose={() => setPlanFor(null)} onChanged={() => { loadData(); setOffersReload(n => n + 1) }} />
+
       {/* Package/Billing History Modal */}
       <Modal open={!!historyFor} onClose={() => setHistoryFor(null)} title={historyFor ? `Package History — ${historyFor.businessName}` : ''} wide>
         {historyLoading ? (
@@ -1072,7 +1581,7 @@ function SubsPage() {
                 <div>
                   <p className="font-bold text-deep-900">{translatePortalText(h.changeType.replace(/_/g, ' '))}</p>
                   <p className="text-xs text-slate-400">
-                    {h.fromPackageName || h.fromBillingModel || '—'} → {h.toPackageName || h.toBillingModel || '—'}
+                    {h.fromPackageName || (h.fromBillingModel ? translatePortalText(h.fromBillingModel) : '—')} → {h.toPackageName || (h.toBillingModel ? translatePortalText(h.toBillingModel) : '—')}
                     {h.amountCharged ? ` · ${fmt(h.amountCharged)} ${h.currency || ''}` : ''}
                   </p>
                 </div>
@@ -1101,8 +1610,19 @@ function SubsPage() {
           <div><label className="label">{translatePortalText("Price")}</label><input type="number" className="input" value={subForm.price} onChange={e => setSubForm({ ...subForm, price: Number(e.target.value) })} /></div>
           <div className="grid grid-cols-2 gap-3">
             <div><label className="label">{translatePortalText("Duration Label")}</label><input className="input" value={subForm.duration} onChange={e => setSubForm({ ...subForm, duration: e.target.value })} placeholder={translatePortalText("1 Month")} /></div>
-            <div><label className="label">{translatePortalText("Duration (months)")}</label><input type="number" min={1} max={60} className="input" value={subForm.durationMonths} onChange={e => setSubForm({ ...subForm, durationMonths: Number(e.target.value) })} /></div>
+            <div><label className="label">{translatePortalText("Duration (months)")}</label><input type="number" min={1} max={60} step={1} className="input" value={subForm.durationMonths} onChange={e => {
+              // The label follows the months, which are what billing uses — the
+              // two drifting apart is how a monthly price came to read "/ 1 Year".
+              const m = Number(e.target.value)
+              setSubForm({ ...subForm, durationMonths: m, duration: Number.isInteger(m) && m >= 1 ? durationLabelFor(m) : subForm.duration })
+            }} /></div>
           </div>
+          <PricingPhasesEditor
+            mode={{ bill: 'subscription', durationMonths: subForm.durationMonths }}
+            regular={Number.isFinite(subForm.price) ? subForm.price : 0}
+            value={subPhases}
+            onChange={setSubPhases}
+          />
           <label className="flex items-center gap-2 text-sm font-bold text-slate-600">
             <input type="checkbox" checked={subForm.isActive} onChange={e => setSubForm({ ...subForm, isActive: e.target.checked })} /> {translatePortalText(" Active (visible to new providers)\n          ")}</label>
           <label className="flex items-center gap-2 text-sm font-bold text-slate-600">
@@ -1131,7 +1651,7 @@ function SubsPage() {
 
           <div className="flex justify-end gap-2 pt-2">
             <button onClick={() => setSubModalOpen(false)} className="btn-ghost">{translatePortalText("Cancel")}</button>
-            <button onClick={handleSaveSubPkg} className="btn-admin">{translatePortalText("Save Package")}</button>
+            <button onClick={handleSaveSubPkg} disabled={savingPkg} className="btn-admin disabled:opacity-50">{savingPkg && <Loader2 size={14} className="animate-spin" />} {translatePortalText("Save Package")}</button>
           </div>
         </div>
       </Modal>
@@ -1150,16 +1670,40 @@ function SubsPage() {
           <div><label className="label">{translatePortalText("Package Name")}</label><input className="input" value={commForm.name} onChange={e => setCommForm({ ...commForm, name: e.target.value })} placeholder={translatePortalText("e.g. 5%, 10%, 15%, Special Partner Plan")} /></div>
           <div>
             <label className="label">{translatePortalText("Commission Type")}</label>
-            <select className="input font-bold" value={commForm.commissionType} onChange={e => setCommForm({ ...commForm, commissionType: e.target.value as CommissionType })}>
+            <select className="input font-bold" value={commForm.commissionType} onChange={e => {
+              const next = e.target.value as CommissionType
+              if (next === commForm.commissionType) return
+              setCommForm({ ...commForm, commissionType: next })
+              // A "set rate" step's number means a percentage on one type and SAR on
+              // the other, so it is cleared for re-entry rather than silently
+              // re-read in the new unit. "% off" and "free" mean the same on both.
+              if (commPhases.some(d => d.kind === 'rate')) {
+                setCommPhases(commPhases.map(d => (d.kind === 'rate' ? { ...d, amount: '' } : d)))
+                setCommTypeStepsReset(true)
+              }
+            }}>
               <option value="percentage">{translatePortalText("Percentage — % of each booking")}</option>
               <option value="fixed">{translatePortalText("Fixed — flat amount per booking, regardless of size")}</option>
             </select>
+            {commTypeStepsReset && (
+              <p className="mt-1.5 rounded-xl bg-amber-50 px-3 py-2 text-[11px] font-semibold text-amber-700">
+                {translatePortalText(commForm.commissionType === 'fixed'
+                  ? 'The commission type changed, so the “Set fee” steps below were cleared — enter each one again in SAR per booking. “% off” and “Free” steps keep their meaning.'
+                  : 'The commission type changed, so the “Set rate” steps below were cleared — enter each one again as a percentage. “% off” and “Free” steps keep their meaning.')}
+              </p>
+            )}
           </div>
           {commForm.commissionType === 'fixed' ? (
             <div><label className="label">{translatePortalText("Fixed Amount (SAR per completed booking)")}</label><input type="number" min={0} className="input" value={commForm.fixedAmountSar} onChange={e => setCommForm({ ...commForm, fixedAmountSar: Number(e.target.value) })} /></div>
           ) : (
             <div><label className="label">{translatePortalText("Commission Percentage (%)")}</label><input type="number" min={0} max={100} className="input" value={commForm.commissionPercentage} onChange={e => setCommForm({ ...commForm, commissionPercentage: Number(e.target.value) })} /></div>
           )}
+          <PricingPhasesEditor
+            mode={{ bill: 'commission', commissionType: commForm.commissionType }}
+            regular={(commForm.commissionType === 'fixed' ? commForm.fixedAmountSar : commForm.commissionPercentage) || 0}
+            value={commPhases}
+            onChange={setCommPhases}
+          />
           {editingCommPkg && (
             <p className="rounded-xl bg-amber-50 px-3 py-2 text-[11px] font-semibold text-amber-700">
               {translatePortalText("\n              Changing this re-prices every provider currently on this tier.\n            ")}</p>
@@ -1192,7 +1736,7 @@ function SubsPage() {
 
           <div className="flex justify-end gap-2 pt-2">
             <button onClick={() => setCommModalOpen(false)} className="btn-ghost">{translatePortalText("Cancel")}</button>
-            <button onClick={handleSaveCommPkg} className="btn-admin">{translatePortalText("Save Commission Tier")}</button>
+            <button onClick={handleSaveCommPkg} disabled={savingPkg} className="btn-admin disabled:opacity-50">{savingPkg && <Loader2 size={14} className="animate-spin" />} {translatePortalText("Save Commission Tier")}</button>
           </div>
         </div>
       </Modal>
@@ -1225,7 +1769,7 @@ function SubsPage() {
             <input type="checkbox" checked={addOnForm.isActive} onChange={e => setAddOnForm({ ...addOnForm, isActive: e.target.checked })} /> {translatePortalText(" Active (purchasable by providers)\n          ")}</label>
           <div className="flex justify-end gap-2 pt-2">
             <button onClick={() => setAddOnModalOpen(false)} className="btn-ghost">{translatePortalText("Cancel")}</button>
-            <button onClick={handleSaveAddOn} className="btn-admin">{translatePortalText("Save Add-on")}</button>
+            <button onClick={handleSaveAddOn} disabled={savingPkg} className="btn-admin disabled:opacity-50">{savingPkg && <Loader2 size={14} className="animate-spin" />} {translatePortalText("Save Add-on")}</button>
           </div>
         </div>
       </Modal>
@@ -1323,6 +1867,169 @@ function SubsPage() {
   )
 }
 
+// ══════════ OFFERS & DISCOUNTS ══════════
+/**
+ * Every discount and offer an admin has given a provider, live or ended, and
+ * the "New offer" flow that gives one to one provider or many at once.
+ *
+ * The offer's own figures and dates are what the provider is charged by; the
+ * table only lists them. A provider's newer offer on the same bill supersedes
+ * the older one server-side, which is why "Replaced" is a status here.
+ */
+const OFFER_STATUS_ORDER: OfferStatus[] = ['active', 'scheduled', 'used_up', 'expired', 'superseded', 'revoked']
+
+function OffersPanel({ providers, providersLoading, providersError, onChanged, onManagePlan, reloadKey = 0 }: {
+  providers: MonetizationProvider[]
+  providersLoading: boolean
+  providersError: string
+  onChanged: () => void
+  onManagePlan: (providerId: string, name: string) => void
+  /** Changes when the plan modal opened from this table changed something — the list is read again. */
+  reloadKey?: number
+}) {
+  const [offers, setOffers] = useState<AdminOfferData[]>([])
+  const [loading, setLoading] = useState(true)
+  /** A failed read is said as one — never "No offers yet". */
+  const [error, setError] = useState('')
+  const [newOpen, setNewOpen] = useState(false)
+
+  const load = () => {
+    setLoading(true)
+    setError('')
+    providerBillingApi.listOffers({ status: 'all' })
+      .then(r => setOffers(r.data.offers || []))
+      .catch((e: any) => { setOffers([]); setError(e?.message || 'Could not load offers') })
+      .finally(() => setLoading(false))
+  }
+  useEffect(load, [reloadKey])
+
+  const candidates = useMemo(() => providers.map(candidateFromMonetization), [providers])
+
+  const cfg: TableFiltersConfig<AdminOfferData> = useMemo(() => ({
+    searchFields: (o) => [o.businessName, o.providerName, o.title, o.note, o.createdByName],
+    filters: [
+      { key: 'status', label: 'Status', options: OFFER_STATUS_ORDER.map(s => ({ value: s, label: OFFER_STATUS_LABEL[s] })), get: (o) => o.status },
+      { key: 'bill', label: 'Discount on', options: [{ value: 'subscription', label: 'Subscription' }, { value: 'commission', label: 'Commission' }], get: (o) => o.appliesTo },
+      { key: 'type', label: 'Provider type', options: Object.entries(PROVIDER_TYPE_LABELS).map(([value, label]) => ({ value, label })), get: (o) => o.providerType },
+      { key: 'created', label: 'Created', kind: 'dateRange', get: (o) => o.createdAt },
+    ],
+    sortOptions: [
+      { key: 'created', label: 'Created', get: (o) => o.createdAt, defaultDir: 'desc' },
+      { key: 'ends', label: 'Ends', get: (o) => o.endsAt || '9999', defaultDir: 'asc' },
+      { key: 'provider', label: 'Provider', get: (o) => o.businessName || o.providerName || '', defaultDir: 'asc' },
+    ],
+    defaultSort: 'created',
+    // Its own page parameters: the Provider Models table on this screen uses `page`.
+    pageParam: 'offersPage',
+    limitParam: 'offersLimit',
+  }), [])
+  const tf = useTableFilters(offers, cfg)
+
+  const counts = useMemo(() => {
+    const c = { active: 0, scheduled: 0, ended: 0 }
+    offers.forEach(o => { if (o.status === 'active') c.active++; else if (o.status === 'scheduled') c.scheduled++; else c.ended++ })
+    return c
+  }, [offers])
+
+  const revoke = async (o: AdminOfferData) => {
+    if (await revokeOfferFlow(o, o.businessName || o.providerName)) { load(); onChanged() }
+  }
+
+  return (
+    <>
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h3 className="font-display text-lg font-extrabold text-deep-900">{translatePortalText('Offers & Discounts')}</h3>
+          <p className="max-w-2xl text-xs text-slate-400">{translatePortalText('Discounts on a provider’s subscription or commission, given to one provider or many at once. A new offer replaces that provider’s previous offer on the same bill from the day it starts.')}</p>
+        </div>
+        <div className="flex gap-2">
+          <button className="btn-ghost !text-xs" onClick={load}><RefreshCw size={13} className={loading ? 'animate-spin' : ''} /> {translatePortalText('Refresh')}</button>
+          <button className="btn-admin !text-xs" disabled={providersLoading && !providers.length} onClick={() => setNewOpen(true)}><Plus size={14} /> {translatePortalText('New offer')}</button>
+        </div>
+      </div>
+      {providersError && !providers.length && (
+        <p className="mb-3 text-[11px] font-semibold text-rose-600">{translatePortalText('The provider list did not load, so there is nobody to pick for a new offer. Refresh the page to try again.')}</p>
+      )}
+
+      <div className="mb-4 grid grid-cols-3 gap-3 md:max-w-xl">
+        {([
+          ['Live now', counts.active, 'text-emerald-600'],
+          ['Scheduled', counts.scheduled, 'text-sky-600'],
+          ['Ended', counts.ended, 'text-slate-500'],
+        ] as [string, number, string][]).map(([l, v, tone]) => (
+          <div key={l} className="card p-3">
+            <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">{translatePortalText(l)}</p>
+            <p className={`mt-0.5 font-display text-xl font-extrabold ${tone}`}>{loading || error ? '—' : formatPortalNumber(v)}</p>
+          </div>
+        ))}
+      </div>
+
+      <TableToolbar state={tf} config={cfg} rows={offers} noun={translatePortalText('offers')} searchPlaceholder={translatePortalText('Search provider, title or note…')} />
+
+      <div className="card overflow-hidden">
+        <div className="overflow-x-auto custom-scrollbar">
+          <div className="min-w-[1080px]">
+            <div className="grid grid-cols-[1.5fr_1.6fr_0.8fr_1.5fr_0.8fr_1fr_auto] items-center gap-4 border-b border-slate-100 bg-sand px-5 py-3.5 text-[11px] font-bold uppercase tracking-wider text-slate-400">
+              <span>{translatePortalText('Provider')}</span><span>{translatePortalText('Offer')}</span><span>{translatePortalText('Discount on')}</span><span>{translatePortalText('Offer period')}</span><span>{translatePortalText('Status')}</span><span>{translatePortalText('Created')}</span><span className="text-right">{translatePortalText('Actions')}</span>
+            </div>
+            {error && (
+              <div className="flex flex-wrap items-center justify-between gap-3 bg-rose-50 px-5 py-4 text-sm text-rose-600">
+                <span>{translatePortalText("Couldn't load: ")}{translatePortalText(error)}</span>
+                <button className="btn-ghost !py-1.5 !px-3 !text-[11px]" onClick={load}><RefreshCw size={12} /> {translatePortalText('Retry')}</button>
+              </div>
+            )}
+            {loading && <TableSkeleton rows={5} cols={4} />}
+            {!loading && !error && offers.length === 0 && <div className="py-14 text-center text-sm text-slate-400">{translatePortalText('No offers yet. Use “New offer” to give one.')}</div>}
+            {!loading && offers.length > 0 && tf.pagedRows.length === 0 && <NoFilterMatches noun="offers" onClear={tf.clear} />}
+            {!loading && tf.pagedRows.map((o, i) => {
+              const who = o.businessName || o.providerName || '—'
+              const cycles = offerCycles(o)
+              return (
+                <motion.div key={o.id} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: Math.min(i, 12) * 0.03 }}
+                  className="grid grid-cols-[1.5fr_1.6fr_0.8fr_1.5fr_0.8fr_1fr_auto] items-center gap-4 border-b border-slate-50 px-5 py-3.5 transition hover:bg-sand/70 last:border-b-0">
+                  <div className="min-w-0">
+                    <p className="truncate text-[13px] font-extrabold text-deep-900">{o.providerType ? `${PROVIDER_TYPE_ICONS[o.providerType]} ` : ''}{who}</p>
+                    {o.providerType && <p className="truncate text-[11px] text-slate-400">{translatePortalText(PROVIDER_TYPE_LABELS[o.providerType])}</p>}
+                  </div>
+                  <div className="min-w-0">
+                    <p className="truncate text-xs font-extrabold text-deep-900" title={o.title}>{o.title}</p>
+                    <p className="truncate text-[11px] font-bold text-violet-700">{offerSummary(o)}</p>
+                    {o.note && <p className="truncate text-[10px] italic text-slate-400" title={o.note}>{o.note}</p>}
+                  </div>
+                  <div><span className={`chip !text-[10px] font-extrabold ${o.appliesTo === 'subscription' ? 'bg-ocean-50 text-ocean-700' : 'bg-teal-50 text-teal-700'}`}>{translatePortalText(BILL_LABEL[o.appliesTo])}</span></div>
+                  <div className="min-w-0 text-[11px] text-slate-500">
+                    <p className="truncate">{offerWindow(o)}</p>
+                    {cycles && <p className="truncate text-slate-400">{cycles}</p>}
+                  </div>
+                  <div title={o.status === 'revoked' && o.revokeReason ? o.revokeReason : undefined}><OfferStatusChip status={o.status} /></div>
+                  <div className="text-[11px] text-slate-500">
+                    <p>{fmtDate(o.createdAt)}</p>
+                    {o.createdByName && <p className="truncate text-slate-400">{o.createdByName}</p>}
+                  </div>
+                  <div className="flex justify-end gap-1.5 whitespace-nowrap">
+                    <button onClick={() => onManagePlan(o.providerId, who)} className="btn-ghost !py-1.5 !px-2.5 !text-[11px]">{translatePortalText('Plan')}</button>
+                    {offerIsOpen(o) && (
+                      <button onClick={() => void revoke(o)} className="btn-ghost !py-1.5 !px-2.5 !text-[11px] !text-rose-600"><Ban size={11} /> {translatePortalText('Revoke offer')}</button>
+                    )}
+                  </div>
+                </motion.div>
+              )
+            })}
+          </div>
+        </div>
+        <TablePagination state={tf} noun={translatePortalText('offers')} />
+      </div>
+
+      <GiveOfferModal
+        open={newOpen}
+        onClose={() => setNewOpen(false)}
+        candidates={candidates}
+        onDone={() => { load(); onChanged() }}
+      />
+    </>
+  )
+}
+
 // ══════════ WEEKLY PAYOUTS ══════════
 /**
  * What the platform owes providers for online bookings, sent weekly by bank
@@ -1332,8 +2039,13 @@ function SubsPage() {
  * collections. It used to be a tab on the packages screen, which is where rates
  * are configured — not where an admin goes to send money.
  */
+/** What the bank transfer is worth: net, less this week's refund card fees. */
+const payableOf = (s: Settlement) => s.payableAmount ?? s.netAmount
+
 function PayoutsPanel() {
   const [loading, setLoading] = useState(true)
+  /** A failed load used to read as "No providers earned anything to settle". */
+  const [loadError, setLoadError] = useState('')
   const [busyId, setBusyId] = useState<string | null>(null)
 
   /**
@@ -1387,7 +2099,12 @@ function PayoutsPanel() {
       setPeriodLabel(setRes.data.periodLabel || '')
       setPeriodClosed(setRes.data.periodClosed !== false)
       setAllPeriods(pRes.data.periods || [])
+      setLoadError('')
     } catch (e: any) {
+      // Cleared, so the previous week's rows are not left on screen under the
+      // newly selected week's label.
+      setSettlements([])
+      setLoadError(e?.message || 'Failed to load settlements')
       toast(translatePortalText(e?.message || 'Failed to load settlements'), 'warn')
     } finally {
       setLoading(false)
@@ -1476,11 +2193,33 @@ function PayoutsPanel() {
     setTf.setPage(1)
   }, [weekStart])
 
-  const handleApprovePayout = async (payoutId: string) => {
-    setBusyId(payoutId)
-    try { await monetizationApi.approvePayout(payoutId); toast(translatePortalText('Payout approved — ready to send')); loadData() }
-    catch (e: any) { toast(translatePortalText(e.message || 'Failed to approve payout'), 'warn') }
-    finally { setBusyId(null) }
+  /**
+   * Approval freezes the figure and snapshots the destination account, so it
+   * is confirmed with the amount — it used to fire on a single click.
+   */
+  const handleApprovePayout = (s: Settlement) => {
+    if (!s.payoutId) return
+    const payoutId = s.payoutId
+    return confirmAndRun({
+      title: s.status === 'rejected' ? 'Retry this payout?' : 'Approve this payout?',
+      body:
+        `${s.businessName} is to be sent ${fmt(payableOf(s))} ${s.currency || 'SAR'}. Approving freezes this figure and the bank account it goes to.` +
+        (!periodClosed ? ' This week is still in progress — its earnings can still grow.' : ''),
+      confirmLabel: s.status === 'rejected' ? 'Retry' : 'Approve',
+      busyLabel: 'Approving…',
+      run: async () => {
+        setBusyId(payoutId)
+        try {
+          const r = await monetizationApi.approvePayout(payoutId)
+          return r.data?.payout?.status as string | undefined
+        } finally { setBusyId(null); loadData() }
+      },
+      // The server answers a lost race with the row as it now stands — a
+      // payout somebody else already paid is not "ready to send".
+      success: (status) => status === 'paid'
+        ? `${s.businessName}: this payout was already marked paid`
+        : 'Payout approved — ready to send',
+    })
   }
 
   const handleMarkPayoutPaid = (s: Settlement) => {
@@ -1531,18 +2270,26 @@ function PayoutsPanel() {
       confirmLabel: 'Mark paid',
       busyLabel: 'Settling...',
       run: async (reference, proof) => {
-        if (!proof) return
+        // Thrown, not returned: a bare return here resolved as success and
+        // toasted "marked paid" for a payout nothing had been sent for.
+        if (!proof) throw new Error('Attach the bank transfer receipt.')
         setBusyId(payoutId)
         try {
           if (s.status === 'pending' || s.status === 'rejected') {
             await monetizationApi.approvePayout(payoutId)
           }
-          await monetizationApi.markPayoutPaid(payoutId, reference, proof)
-          loadData()
-        } finally { setBusyId(null) }
+          const r = await monetizationApi.markPayoutPaid(payoutId, reference, proof)
+          return !!(r.data as any)?.alreadyPaid
+        } finally { setBusyId(null); loadData() }
       },
-      success: `Payout to ${s.businessName} marked paid and wallet settled`,
-      error: 'Could not mark this payout paid. Please try again.',
+      // `alreadyPaid`: another admin recorded it first, so this receipt was not
+      // the one filed and the wallet was not debited again.
+      success: (alreadyPaid) => alreadyPaid
+        ? `${s.businessName}: this payout had already been marked paid — nothing was changed`
+        : `Payout to ${s.businessName} marked paid and wallet settled`,
+      // The server's reason ("must be approved", "already paid", a refused
+      // upload) instead of a fixed "try again" that hid which one it was.
+      error: (e) => `Could not mark this payout paid: ${e instanceof Error ? e.message : 'please try again'}`,
     })
   }
 
@@ -1630,9 +2377,20 @@ function PayoutsPanel() {
       error: 'Could not save the payout account. Check the IBAN and try again.',
     })
 
+  /**
+   * "Net payable" is what is still to be wired: `payableAmount` (net less the
+   * week's refund card fees) on rows not yet paid. It summed `netAmount` over
+   * every row, paid ones included — over-stating what was left to send by the
+   * fees and by every transfer already made.
+   */
   const settlementTotals = useMemo(() => settlements.reduce(
-    (a, s) => ({ gross: a.gross + s.grossAmount, commission: a.commission + s.commissionAmount, net: a.net + s.netAmount }),
-    { gross: 0, commission: 0, net: 0 }
+    (a, s) => ({
+      gross: a.gross + (s.grossAmount || 0),
+      commission: a.commission + (s.commissionAmount || 0),
+      net: a.net + (s.status === 'paid' ? 0 : Math.max(0, payableOf(s) || 0)),
+      paid: a.paid + (s.status === 'paid' ? payableOf(s) || 0 : 0),
+    }),
+    { gross: 0, commission: 0, net: 0, paid: 0 }
   ), [settlements])
 
   return (
@@ -1736,20 +2494,28 @@ function PayoutsPanel() {
           {translatePortalText("\n            HyperPay has no marketplace payout API. Send the net amount to the provider's bank account\n            yourself, then mark it paid here with a reference — that clears their wallet balance.\n          ")}</p>
       </div>
 
-      <div className="mb-4 grid grid-cols-3 gap-3">
+      {loadError && (
+        <div className="card mb-4 flex flex-wrap items-center justify-between gap-3 !border-rose-200 !bg-rose-50 text-sm text-rose-600">
+          <span>{translatePortalText("Couldn't load this week's payouts: ")}{loadError}</span>
+          <button className="btn-ghost !py-1.5 !px-3 !text-[11px]" onClick={loadData}><RefreshCw size={12} /> {translatePortalText('Retry')}</button>
+        </div>
+      )}
+
+      <div className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-4">
         {([
           [translatePortalText('Gross earnings'), settlementTotals.gross, 'text-deep-900'],
           [translatePortalText('Platform commission'), settlementTotals.commission, 'text-emerald-600'],
           [translatePortalText('Net payable'), settlementTotals.net, 'text-amber-600'],
+          [translatePortalText('Already paid'), settlementTotals.paid, 'text-slate-600'],
         ] as [string, number, string][]).map(([l, v, t]) => (
           <div key={l} className="card p-4">
             <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">{l}</p>
-            <p className={`mt-0.5 font-display text-xl font-extrabold ${t}`}>{fmt(v)}</p>
+            <p className={`mt-0.5 font-display text-xl font-extrabold ${t}`}>{loadError ? '—' : fmt(v)}</p>
           </div>
         ))}
       </div>
 
-      {settlementTotals.net === 0 && !loading && (
+      {settlementTotals.net === 0 && !loading && !loadError && (
         <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-xl bg-amber-50 border border-amber-200/80 px-4 py-3">
           <div className="flex items-center gap-2 text-xs text-amber-900 font-medium">
             <AlertTriangle size={16} className="text-amber-600 shrink-0" />
@@ -1814,7 +2580,7 @@ function PayoutsPanel() {
                   </td>
                 </tr>
               )}
-              {!loading && settlements.length === 0 && (
+              {!loading && !loadError && settlements.length === 0 && (
                 <tr>
                   <td colSpan={7} className="py-14 text-center text-sm text-slate-400">
                     {translatePortalText("\n                      No providers earned anything to settle for ")}{periodLabel || 'this week'}.
@@ -1857,8 +2623,14 @@ function PayoutsPanel() {
                   <td className="px-4 py-4 text-right text-[13px] font-extrabold text-emerald-600 whitespace-nowrap">
                     {fmt(s.commissionAmount)}
                   </td>
+                  {/* The transfer amount — what "Mark paid" asks the admin to
+                      send — not `netAmount`, which is before the week's refund
+                      card fees come off. */}
                   <td className="px-4 py-4 text-right text-[13px] font-extrabold text-amber-600 whitespace-nowrap">
-                    {fmt(s.netAmount)}
+                    {fmt(payableOf(s))}
+                    {(s.refundFeeDeduction ?? 0) > 0 && (
+                      <p className="text-[10px] font-bold text-rose-500">{fmt(s.netAmount)} − {fmt(s.refundFeeDeduction ?? 0)} {translatePortalText('refund fees')}</p>
+                    )}
                   </td>
                   <td className="px-4 py-4 text-right text-xs font-bold text-slate-500 whitespace-nowrap">
                     {fmt(s.walletBalance)}
@@ -1875,9 +2647,9 @@ function PayoutsPanel() {
                       )}
                       {s.payoutId && (s.status === 'pending' || s.status === 'rejected') && (
                         <button
-                          disabled={busyId === s.payoutId || !s.bankReady}
-                          title={s.bankReady ? undefined : translatePortalText('This provider has no payout account on file')}
-                          onClick={() => handleApprovePayout(s.payoutId!)}
+                          disabled={busyId === s.payoutId || !s.bankReady || !(payableOf(s) > 0)}
+                          title={!s.bankReady ? translatePortalText('This provider has no payout account on file') : !(payableOf(s) > 0) ? translatePortalText('Nothing to transfer — refund fees cancelled out the earnings') : undefined}
+                          onClick={() => handleApprovePayout(s)}
                           className="btn-ghost !py-1.5 !px-2.5 !text-[11px] disabled:opacity-40"
                         >
                           {busyId === s.payoutId ? <Loader2 size={11} className="animate-spin" /> : <Check size={11} />} {s.status === 'rejected' ? translatePortalText('Retry') : translatePortalText('Approve')}
@@ -1885,8 +2657,8 @@ function PayoutsPanel() {
                       )}
                       {s.payoutId && (s.status === 'approved' || s.status === 'pending') && (
                         <button
-                          disabled={busyId === s.payoutId || !s.bankReady}
-                          title={translatePortalText(s.bankReady ? 'Upload bank transfer receipt and mark paid' : 'This provider has no payout account on file')}
+                          disabled={busyId === s.payoutId || !s.bankReady || !(payableOf(s) > 0)}
+                          title={translatePortalText(!s.bankReady ? 'This provider has no payout account on file' : !(payableOf(s) > 0) ? 'Nothing to transfer — refund fees cancelled out the earnings' : 'Upload bank transfer receipt and mark paid')}
                           onClick={() => handleMarkPayoutPaid(s)}
                           className="btn-admin !py-1.5 !px-2.5 !text-[11px] disabled:opacity-40 flex items-center gap-1.5"
                         >
@@ -2027,11 +2799,21 @@ function ModelChangesPanel({ onReviewed }: { onReviewed?: () => void }) {
   // Approve and decline are the same call with different copy. Decline asks for
   // a reason in the dialog itself, because the provider is shown it -- a blocking
   // `prompt()` with no validation was the wrong instrument.
-  const review = (id: string, approve: boolean) =>
+  /*
+    The approve copy used to promise "It takes effect immediately" for every
+    request. The server does that for neither direction unconditionally: a
+    switch *to subscription* only applies once the provider pays for it, and a
+    switch *to commission* waits for the end of the paid period unless the
+    billing policy allows immediate switching. The dialog now says which, and
+    the toast reports what the server actually did.
+  */
+  const review = (id: string, approve: boolean, toModel?: string) =>
     confirmAndRun({
       title: approve ? 'Approve this billing-model change?' : 'Decline this request?',
       body: approve
-        ? 'It takes effect immediately, and the provider will be billed on the new model from now on.'
+        ? toModel === 'subscription'
+          ? 'The provider is asked to pay for the subscription; their model switches only once that payment succeeds.'
+          : 'The switch to commission applies now if the billing policy allows immediate switching, otherwise at the end of the provider’s paid subscription period.'
         : 'The provider stays on their current model and will see your reason.',
       input: approve
         ? undefined
@@ -2042,12 +2824,24 @@ function ModelChangesPanel({ onReviewed }: { onReviewed?: () => void }) {
       run: async (reason) => {
         setBusyId(id)
         try {
-          await monetizationApi.reviewModelChange(id, approve, reason || undefined)
+          const r = await monetizationApi.reviewModelChange(id, approve, reason || undefined)
+          return r.data
+        } finally {
+          // Refreshed on failure too: "already reviewed" means somebody else
+          // decided it, and the row should stop offering the buttons.
+          setBusyId(null)
           load()
           onReviewed?.()
-        } finally { setBusyId(null) }
+        }
       },
-      success: approve ? 'Payment model updated' : 'Request declined',
+      success: (d) => {
+        if (!approve) return 'Request declined'
+        if (d?.request?.toModel === 'subscription') return 'Approved — the provider switches to subscription once they pay'
+        if (d?.appliedImmediately) return 'Approved — the provider is now on the commission model'
+        return d?.effectiveAt
+          ? `${translatePortalText('Approved — the switch to commission takes effect on')} ${fmtDate(d.effectiveAt)}`
+          : 'Approved — the switch is scheduled for the end of the paid period'
+      },
       error: approve
         ? 'Could not approve the change. Please try again.'
         : 'Could not decline the request. Please try again.',
@@ -2099,8 +2893,8 @@ function ModelChangesPanel({ onReviewed }: { onReviewed?: () => void }) {
                   <div className="flex justify-end gap-1.5 whitespace-nowrap">
                     {r.status === 'pending' ? (
                       <>
-                        <button disabled={busyId === r._id} onClick={() => review(r._id, false)} className="btn-ghost !py-1.5 !px-2.5 !text-[11px] !text-rose-600 disabled:opacity-40">{translatePortalText('Decline')}</button>
-                        <button disabled={busyId === r._id} onClick={() => review(r._id, true)} className="btn-admin !py-1.5 !px-2.5 !text-[11px] disabled:opacity-40">
+                        <button disabled={busyId === r._id} onClick={() => review(r._id, false, r.toModel)} className="btn-ghost !py-1.5 !px-2.5 !text-[11px] !text-rose-600 disabled:opacity-40">{translatePortalText('Decline')}</button>
+                        <button disabled={busyId === r._id} onClick={() => review(r._id, true, r.toModel)} className="btn-admin !py-1.5 !px-2.5 !text-[11px] disabled:opacity-40">
                           {busyId === r._id ? <Loader2 size={11} className="animate-spin" /> : <Check size={11} />} {translatePortalText('Approve')}
                         </button>
                       </>
@@ -2119,7 +2913,10 @@ function ModelChangesPanel({ onReviewed }: { onReviewed?: () => void }) {
 // ══════════ FINANCIAL REPORTS ══════════
 export function AdminFinancialReports() {
   const yearStart = `${new Date().getFullYear()}-01-01`
-  const today = new Date().toISOString().slice(0, 10)
+  // The local calendar day. `toISOString()` is UTC, which in Riyadh (UTC+3)
+  // ended the default range on yesterday for the first three hours of a day.
+  const now = new Date()
+  const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
   const [from, setFrom] = useState(yearStart)
   const [to, setTo] = useState(today)
   const [report, setReport] = useState<Awaited<ReturnType<typeof monetizationApi.report>>['data'] | null>(null)
@@ -2176,19 +2973,30 @@ export function AdminFinancialReports() {
       { key: 'count', label: 'Bookings', get: (r) => r.count ?? 0, defaultDir: 'desc' },
       { key: 'name', label: 'Business', get: (r) => r.provider?.business?.businessName || r.provider?.name || '', defaultDir: 'asc' },
     ],
-    defaultSort: 'gross',
+    // The section is "Top providers by commission" — and the API ranks by
+    // commission — so the table opens in that order, not by gross.
+    defaultSort: 'commission',
   }), [providerRows])
   const provTf = useTableFilters(providerRows, provCfg)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
 
+  /** An inverted range returned an all-zero report that read as "no revenue". */
+  const rangeError = !from || !to ? 'Pick both dates' : from > to ? '"From" is after "To"' : ''
+
   const load = async () => {
+    if (rangeError) { setError(rangeError); return }
     setLoading(true)
     try {
       const res = await monetizationApi.report({ from, to })
       setReport(res.data)
       setError('')
-    } catch (e: any) { setError(e?.message || 'Failed to load report') }
+    } catch (e: any) {
+      // Cleared, so the cards do not keep showing the previous range's figures
+      // under the new dates.
+      setReport(null)
+      setError(e?.message || 'Failed to load report')
+    }
     finally { setLoading(false) }
   }
   useEffect(() => { load() }, [])
@@ -2208,15 +3016,16 @@ export function AdminFinancialReports() {
       <AdminHeader title={translatePortalText('Financial Reports')} sub={translatePortalText('Platform revenue across commission and subscription, by period')} icon={<Wallet className="text-emerald-500" />}
         actions={
           <button className="btn-admin !text-xs" onClick={async () => {
+            if (rangeError) return toast(translatePortalText(rangeError), 'warn')
             try { await monetizationApi.downloadReport({ from, to }); toast(translatePortalText('Excel report downloaded')) }
             catch (e: any) { toast(translatePortalText(e?.message || translatePortalText('Export failed')), 'warn') }
           }}><Download size={14} /> {translatePortalText('Export Excel')}</button>
         } />
 
       <div className="card mb-5 flex flex-wrap items-end gap-3 p-4">
-        <div><label className="label !mb-1">{translatePortalText('From')}</label><input type="date" className="input !py-1.5 !text-xs" value={from} onChange={e => setFrom(e.target.value)} /></div>
-        <div><label className="label !mb-1">{translatePortalText('To')}</label><input type="date" className="input !py-1.5 !text-xs" value={to} onChange={e => setTo(e.target.value)} /></div>
-        <button className="btn-admin !text-xs" onClick={load}>{loading ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />} {translatePortalText('Run report')}</button>
+        <div><label className="label !mb-1">{translatePortalText('From')}</label><input type="date" className="input !py-1.5 !text-xs" value={from} max={to || undefined} onChange={e => setFrom(e.target.value)} /></div>
+        <div><label className="label !mb-1">{translatePortalText('To')}</label><input type="date" className="input !py-1.5 !text-xs" value={to} min={from || undefined} onChange={e => setTo(e.target.value)} /></div>
+        <button className="btn-admin !text-xs disabled:opacity-50" disabled={loading || !!rangeError} title={rangeError ? translatePortalText(rangeError) : undefined} onClick={load}>{loading ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />} {translatePortalText('Run report')}</button>
         {report && <span className="ms-auto text-xs font-bold text-slate-400">{translatePortalText("Currency: ")}{report.currency}</span>}
       </div>
 
@@ -2226,15 +3035,16 @@ export function AdminFinancialReports() {
         {cards.map(([l, v, cls]) => (
           <div key={l} className="card p-4">
             <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">{l}</p>
-            <p className={`mt-0.5 font-display text-xl font-extrabold ${cls}`}>{fmt(v)}</p>
+            <p className={`mt-0.5 font-display text-xl font-extrabold ${cls}`}>{report ? fmt(v) : '—'}</p>
           </div>
         ))}
       </div>
+      {rangeError && <p className="-mt-3 mb-5 text-xs font-semibold text-rose-600">{translatePortalText(rangeError)}</p>}
 
       <div className="grid gap-5 lg:grid-cols-2">
         <Section title={translatePortalText('By booking vertical')} sub={translatePortalText('Where the volume comes from')}>
           <div className="space-y-2">
-            {(report?.byVertical || []).length === 0 && <p className="py-8 text-center text-xs text-slate-400">{translatePortalText("No settled bookings in this period.")}</p>}
+            {report && report.byVertical.length === 0 && <p className="py-8 text-center text-xs text-slate-400">{translatePortalText("No settled bookings in this period.")}</p>}
             {(report?.byVertical || []).map(v => (
               <div key={String(v._id)} className="flex items-center gap-3 rounded-xl border border-slate-100 px-3 py-2.5 text-xs">
                 <span className="w-24 font-extrabold capitalize text-deep-900">{verticalLabel(v._id)}</span>
@@ -2248,7 +3058,7 @@ export function AdminFinancialReports() {
 
         <Section title={translatePortalText('By payment model')} sub={translatePortalText('Commission vs subscription mix')}>
           <div className="space-y-2">
-            {(report?.byModel || []).length === 0 && <p className="py-8 text-center text-xs text-slate-400">{translatePortalText("Nothing to show yet.")}</p>}
+            {report && report.byModel.length === 0 && <p className="py-8 text-center text-xs text-slate-400">{translatePortalText("Nothing to show yet.")}</p>}
             {(report?.byModel || []).map(m => (
               <div key={String(m._id)} className="flex items-center gap-3 rounded-xl border border-slate-100 px-3 py-2.5 text-xs">
                 <span className="w-28 font-extrabold capitalize text-deep-900">{translatePortalText(String(m._id))}</span>
@@ -2275,7 +3085,7 @@ export function AdminFinancialReports() {
           <div className="hidden grid-cols-[2fr_1fr_0.8fr_1fr_1fr_1fr] gap-4 border-b border-slate-100 bg-sand px-4 py-3 text-[11px] font-bold uppercase tracking-wider text-slate-400 lg:grid">
             <span>{translatePortalText('Provider')}</span><span>{translatePortalText('Model')}</span><span>{translatePortalText('Bookings')}</span><span>{translatePortalText('Gross')}</span><span>{translatePortalText('Commission')}</span><span>{translatePortalText('Net')}</span>
           </div>
-          {providerRows.length === 0 && <div className="py-14 text-center text-sm text-slate-400">{translatePortalText('No provider revenue in this period.')}</div>}
+          {report && providerRows.length === 0 && <div className="py-14 text-center text-sm text-slate-400">{translatePortalText('No provider revenue in this period.')}</div>}
           {providerRows.length > 0 && provTf.filtered.length === 0 && (
             <NoFilterMatches noun="providers" onClear={provTf.clear} />
           )}

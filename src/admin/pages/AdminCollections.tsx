@@ -47,8 +47,18 @@ export function CollectionsPanel() {
   const [rows, setRows] = useState<ProviderBalanceRow[]>([])
   const [stats, setStats] = useState<{ totalOutstanding: number; currency: string; providersOwing: number; overdueStatements: number } | null>(null)
   const [loading, setLoading] = useState(true)
+  /**
+   * Why the queue did not load. A failure used to leave the list empty under
+   * "Nobody owes commission. Every cash booking is settled." — an outage that
+   * read as a clean book.
+   */
+  const [loadError, setLoadError] = useState('')
+  /** Providers owing in total — the API pages at 100, and this screen asks for one page. */
+  const [total, setTotal] = useState(0)
   const [onlyBlocked, setOnlyBlocked] = useState(false)
   const [active, setActive] = useState<string | null>(null)
+  /** The statement run and the overdue sweep, one at a time. */
+  const [runBusy, setRunBusy] = useState<'statements' | 'sweep' | null>(null)
 
   const load = async () => {
     setLoading(true)
@@ -56,7 +66,10 @@ export function CollectionsPanel() {
       const res = await commissionApi.providers({ limit: 100, cashBlocked: onlyBlocked || undefined })
       setRows(res.data.items)
       setStats(res.data.stats)
+      setTotal(res.data.pagination?.total ?? res.data.items.length)
+      setLoadError('')
     } catch (e) {
+      setLoadError(e instanceof Error ? e.message : 'Could not load collections')
       toast(translatePortalText(e instanceof Error ? e.message : 'Could not load collections'), 'warn')
     } finally {
       setLoading(false)
@@ -65,25 +78,43 @@ export function CollectionsPanel() {
 
   useEffect(() => { void load() /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [onlyBlocked])
 
-  const runStatements = async () => {
-    try {
-      const res = await commissionApi.runStatements({})
-      toast(translatePortalText(`${res.data.period}: ${res.data.issued} statement(s) issued to ${res.data.providers} provider(s)`))
-      await load()
-    } catch (e) {
-      toast(translatePortalText(e instanceof Error ? e.message : 'Statement run failed'), 'warn')
-    }
-  }
+  /*
+    Both runs bill or flag every provider at once, so they are confirmed first
+    and locked while running — a second click used to start a second run.
+  */
+  const runStatements = () =>
+    confirmAndRun({
+      title: 'Close last month?',
+      body: 'This issues last month’s commission statement to every provider with unbilled cash commission from that month, and notifies each of them by push and email.',
+      confirmLabel: 'Issue statements',
+      busyLabel: 'Issuing…',
+      run: async () => {
+        setRunBusy('statements')
+        try {
+          const res = await commissionApi.runStatements({})
+          return res.data
+        } finally { setRunBusy(null); void load() }
+      },
+      success: (d) => `${d.period}: ${d.issued} statement(s) issued to ${d.providers} provider(s)`,
+    })
 
-  const sweep = async () => {
-    try {
-      const res = await commissionApi.sweepOverdue()
-      toast(translatePortalText(`${res.data.flagged} statement(s) marked overdue`))
-      await load()
-    } catch (e) {
-      toast(translatePortalText(e instanceof Error ? e.message : 'Sweep failed'), 'warn')
-    }
-  }
+  const sweep = () =>
+    confirmAndRun({
+      title: 'Flag overdue statements?',
+      body: 'Every unpaid statement past its due date is marked overdue. Each of those providers has cash bookings blocked and is notified.',
+      confirmLabel: 'Flag overdue',
+      busyLabel: 'Flagging…',
+      run: async () => {
+        setRunBusy('sweep')
+        try {
+          const res = await commissionApi.sweepOverdue()
+          return res.data
+        } finally { setRunBusy(null); void load() }
+      },
+      success: (d) => `${d.flagged} statement(s) marked overdue`,
+    })
+
+  const currency = stats?.currency || 'SAR'
 
   /**
    * Collections is a chase list, so the filters are the ones a collector asks:
@@ -143,7 +174,9 @@ export function CollectionsPanel() {
             [translatePortalText('Outstanding'), `${formatPortalNumber(stats.totalOutstanding)} ${stats.currency}`],
             [translatePortalText('Providers owing'), stats.providersOwing],
             [translatePortalText('Overdue statements'), stats.overdueStatements],
-            [translatePortalText('Cash restricted'), rows.filter(r => r.enforcement?.cashBlocked).length],
+            // Counted over the providers this screen loaded — those who owe —
+            // so it says so; a restricted provider with nothing owed is not here.
+            [translatePortalText('Cash restricted (owing)'), rows.filter(r => r.enforcement?.cashBlocked).length],
           ] as const).map(([label, value], i) => (
             <motion.div key={label} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}
               transition={{ delay: i * 0.04 }} className="card p-4">
@@ -162,17 +195,29 @@ export function CollectionsPanel() {
           {translatePortalText('Cash restricted only')}
         </button>
         <div className="ms-auto flex gap-2">
-          <button onClick={() => void sweep()} className="btn-ghost !py-1.5 !px-3 !text-[11px]">
+          <button disabled={!!runBusy} onClick={() => void sweep()} className="btn-ghost !py-1.5 !px-3 !text-[11px] disabled:opacity-40">
             <ShieldAlert size={12} /> {translatePortalText('Flag overdue')}
           </button>
-          <button onClick={() => void runStatements()} className="btn-ghost !py-1.5 !px-3 !text-[11px]">
+          <button disabled={!!runBusy} onClick={() => void runStatements()} className="btn-ghost !py-1.5 !px-3 !text-[11px] disabled:opacity-40">
             <FileText size={12} /> {translatePortalText('Close last month')}
           </button>
           <button onClick={() => void load()} className="btn-ghost !py-1.5 !px-3 !text-[11px]">
-            <RefreshCw size={12} /> {translatePortalText('Refresh')}
+            <RefreshCw size={12} className={loading ? 'animate-spin' : ''} /> {translatePortalText('Refresh')}
           </button>
         </div>
       </div>
+
+      {loadError && (
+        <div className="card mb-4 flex flex-wrap items-center justify-between gap-3 !border-rose-200 !bg-rose-50 text-sm text-rose-600">
+          <span>{translatePortalText("Couldn't load collections: ")}{loadError}</span>
+          <button className="btn-ghost !py-1.5 !px-3 !text-[11px]" onClick={() => void load()}><RefreshCw size={12} /> {translatePortalText('Retry')}</button>
+        </div>
+      )}
+      {!loading && !loadError && rows.length < total && (
+        <p className="mb-3 text-[11px] text-slate-400">
+          {translatePortalText('Showing the')} {formatPortalNumber(rows.length)} {translatePortalText('largest balances of')} {formatPortalNumber(total)} {translatePortalText('providers owing — the totals above cover all of them.')}
+        </p>
+      )}
 
       <TableToolbar
         state={tf}
@@ -183,9 +228,11 @@ export function CollectionsPanel() {
       />
 
       {loading && rows.length === 0 && <div className="flex justify-center py-16"><Spinner /></div>}
-      {!loading && rows.length === 0 && (
+      {!loading && !loadError && rows.length === 0 && (
         <div className="rounded-2xl border border-dashed border-slate-200 py-14 text-center text-sm text-slate-400">
-          {translatePortalText('Nobody owes commission. Every cash booking is settled.')}
+          {onlyBlocked
+            ? translatePortalText('No provider who owes commission is cash-restricted.')
+            : translatePortalText('Nobody owes commission. Every cash booking is settled.')}
         </div>
       )}
       {!loading && rows.length > 0 && visible.length === 0 && (
@@ -207,14 +254,14 @@ export function CollectionsPanel() {
                 <p className="truncate text-[14px] font-extrabold text-deep-900">{nameOf(p)}</p>
                 <p className="truncate text-xs text-slate-400">
                   {p.onboarding?.providerType?.replace('_', ' ')} {translatePortalText(" · cash sales")}{' '}
-                  {formatPortalNumber((p.onboarding?.cashSalesTotal ?? 0))}
+                  {formatPortalNumber((p.onboarding?.cashSalesTotal ?? 0))} {currency}
                   {' · '}{limit != null ? translatePortalText(`limit ${formatPortalNumber(limit)}`) : translatePortalText('default limit')}
                 </p>
               </div>
 
               <div className="text-end">
-                <p className="font-display text-lg font-extrabold text-deep-900">{formatPortalNumber(due)}</p>
-                <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">{translatePortalText('owed')}</p>
+                <p className="font-display text-lg font-extrabold text-deep-900">{formatPortalNumber(due, { maximumFractionDigits: 2 })}</p>
+                <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">{currency} {translatePortalText('owed')}</p>
               </div>
 
               <span className={`rounded-full px-2 py-0.5 text-[10px] font-bold ring-1 ${meta.cls}`}>
@@ -240,7 +287,14 @@ export function CollectionsPanel() {
       </div>
       <TablePagination state={tf} noun={translatePortalText('providers')} />
 
-      <ProviderDrawer providerId={active} onClose={() => { setActive(null); void load() }} />
+      <ProviderDrawer
+        providerId={active}
+        // The account's own limit, unresolved: `null` when it follows the
+        // platform default. The drawer's balance only has the resolved figure.
+        ownLimit={rows.find(r => r._id === active)?.onboarding?.cashCreditLimit ?? null}
+        currency={currency}
+        onClose={() => { setActive(null); void load() }}
+      />
     </>
   )
 }
@@ -252,12 +306,20 @@ export function CollectionsPanel() {
  * is the number that should change somebody's mind about an emergency
  * suspension.
  */
-function ProviderDrawer({ providerId, onClose }: { providerId: string | null; onClose: () => void }) {
+function ProviderDrawer({ providerId, ownLimit, currency, onClose }: {
+  providerId: string | null
+  /** The provider's own cash limit, or `null` when they are on the platform default. */
+  ownLimit: number | null
+  currency: string
+  onClose: () => void
+}) {
   const [data, setData] = useState<{
     provider: any; balance: any; statements: any[]; entries: any[]
   } | null>(null)
   const [control, setControl] = useState<{ enforcement: any; obligations: ObligationSummary } | null>(null)
   const [busy, setBusy] = useState(false)
+  /** A failed load used to leave the drawer spinning forever. */
+  const [loadError, setLoadError] = useState('')
 
   const [entryType, setEntryType] = useState<'adjustment' | 'write_off' | 'commission_payment'>('commission_payment')
   const [amount, setAmount] = useState('')
@@ -273,16 +335,62 @@ function ProviderDrawer({ providerId, onClose }: { providerId: string | null; on
       ])
       setData(c.data)
       setControl({ enforcement: ctl.data.enforcement, obligations: ctl.data.obligations })
-      setLimit(c.data.balance?.creditLimit != null ? String(c.data.balance.creditLimit) : '')
+      setLoadError('')
     } catch (e) {
+      setLoadError(e instanceof Error ? e.message : 'Could not load provider')
       toast(translatePortalText(e instanceof Error ? e.message : 'Could not load provider'), 'warn')
     }
   }
 
   useEffect(() => {
+    // A fresh form per provider: the amount, note and reason typed for the last
+    // one used to carry over into the next drawer opened.
+    setAmount(''); setNote(''); setReason(''); setEntryType('commission_payment'); setLoadError('')
+    /*
+      The box shows the provider's *own* limit, blank when they follow the
+      platform default. It was filled from `balance.creditLimit`, which is the
+      resolved figure — default included — so a Save with nothing changed
+      pinned the current default onto the account as a custom limit.
+    */
+    setLimit(ownLimit != null ? String(ownLimit) : '')
     if (!providerId) { setData(null); setControl(null); return }
     void load(providerId)
   }, [providerId])
+
+  const owed = Number(data?.balance?.outstanding ?? 0)
+  const amountNum = Number(amount)
+
+  /** Posts a ledger entry after stating what it does to the balance. */
+  const postEntry = () => {
+    if (!providerId || busy || !(amountNum > 0) || !note.trim()) return
+    const label = entryType === 'commission_payment' ? 'Record a payment of' : entryType === 'write_off' ? 'Write off' : 'Add a debt adjustment of'
+    const after = entryType === 'adjustment' ? owed + amountNum : owed - amountNum
+    const over = entryType !== 'adjustment' && amountNum > owed
+    return confirmAndRun({
+      title: `${label} ${formatPortalNumber(amountNum, { maximumFractionDigits: 2 })} ${currency}?`,
+      body:
+        `Owed now: ${formatPortalNumber(owed, { maximumFractionDigits: 2 })} ${currency}. After this: ${formatPortalNumber(after, { maximumFractionDigits: 2 })} ${currency}.` +
+        (over ? ' This is more than the provider owes — the balance goes into credit.' : '') +
+        ' Ledger entries cannot be edited; a mistake needs a correcting entry.',
+      confirmLabel: 'Post entry',
+      busyLabel: 'Posting…',
+      danger: over,
+      run: async () => {
+        setBusy(true)
+        try {
+          await commissionApi.addEntry(providerId, { entryType, amount: amountNum, note: note.trim() })
+          setAmount(''); setNote('')
+        } finally {
+          setBusy(false)
+          await load(providerId)
+        }
+      },
+      success: 'Ledger updated',
+    })
+  }
+
+  const limitNum = limit.trim() === '' ? null : Number(limit)
+  const limitInvalid = limitNum !== null && !(Number.isFinite(limitNum) && limitNum >= 0)
 
   const act = async (fn: () => Promise<unknown>, done: string) => {
     setBusy(true)
@@ -313,9 +421,18 @@ function ProviderDrawer({ providerId, onClose }: { providerId: string | null; on
   const liveWork = obligations?.total ?? 0
 
   return (
-    <Modal open={!!providerId} onClose={onClose} title={data ? `💰 ${data.provider?.name ?? 'Provider'}` : 'Loading…'}>
+    <Modal open={!!providerId} onClose={onClose} title={data ? `💰 ${data.provider?.name ?? 'Provider'}` : loadError ? translatePortalText('Provider') : 'Loading…'}>
       {!data ? (
-        <div className="flex justify-center py-10"><Spinner /></div>
+        loadError ? (
+          <div className="space-y-3 py-6 text-center text-sm text-rose-600">
+            <p>{translatePortalText("Couldn't load: ")}{loadError}</p>
+            <button className="btn-ghost !py-1.5 !px-3 !text-[11px]" onClick={() => { if (providerId) { setLoadError(''); void load(providerId) } }}>
+              <RefreshCw size={12} /> {translatePortalText('Retry')}
+            </button>
+          </div>
+        ) : (
+          <div className="flex justify-center py-10"><Spinner /></div>
+        )
       ) : (
         <div className="space-y-4">
           {/* ── Position ─────────────────────────────────── */}
@@ -326,8 +443,8 @@ function ProviderDrawer({ providerId, onClose }: { providerId: string | null; on
               [translatePortalText('Cash sales'), data.balance.cashSalesTotal],
             ] as const).map(([l, v]) => (
               <div key={l} className="rounded-xl bg-sand p-2.5">
-                <p className="font-display text-base font-extrabold text-deep-900">{formatPortalNumber(Number(v))}</p>
-                <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">{l}</p>
+                <p className="font-display text-base font-extrabold text-deep-900">{formatPortalNumber(Number(v), { maximumFractionDigits: 2 })}</p>
+                <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">{l} · {currency}</p>
               </div>
             ))}
           </div>
@@ -352,12 +469,11 @@ function ProviderDrawer({ providerId, onClose }: { providerId: string | null; on
             </div>
             <input className="input !py-1.5 !text-[12px]" placeholder={translatePortalText("Reason (required — it goes on the ledger)")}
               value={note} onChange={e => setNote(e.target.value)} />
+            {/* Confirmed with the amount and the balance it leaves. It posted on
+                one click, and cleared the form even when the server refused. */}
             <button
-              disabled={busy || !(Number(amount) > 0) || !note.trim()}
-              onClick={() => providerId && act(
-                () => commissionApi.addEntry(providerId, { entryType, amount: Number(amount), note: note.trim() }),
-                'Ledger updated'
-              ).then(() => { setAmount(''); setNote('') })}
+              disabled={busy || !(amountNum > 0) || !note.trim()}
+              onClick={() => void postEntry()}
               className="btn-admin w-full !justify-center !py-1.5 !text-[12px] disabled:opacity-40">
               <Check size={12} /> {translatePortalText('Post entry')}
             </button>
@@ -368,14 +484,16 @@ function ProviderDrawer({ providerId, onClose }: { providerId: string | null; on
             <label className="flex-1">
               <span className="mb-1 block text-[11px] font-bold uppercase tracking-wider text-slate-400">{translatePortalText('Cash credit limit')}</span>
               <input className="input !py-1.5 !text-[12px]" type="number" min="0" value={limit}
-                onChange={e => setLimit(e.target.value)} placeholder={translatePortalText('Platform default')} />
+                onChange={e => setLimit(e.target.value)}
+                placeholder={`${translatePortalText('Platform default')}${ownLimit == null && data.balance?.creditLimit != null ? ` (${formatPortalNumber(data.balance.creditLimit)})` : ''}`} />
+              {limitInvalid && <span className="mt-1 block text-[11px] font-semibold text-rose-600">{translatePortalText('The limit must be zero or more.')}</span>}
             </label>
-            <button disabled={busy}
+            <button disabled={busy || limitInvalid}
               onClick={() => providerId && act(
-                () => commissionApi.setCashLimit(providerId, limit === '' ? null : Number(limit)),
-                'Cash limit updated'
+                () => commissionApi.setCashLimit(providerId, limitNum),
+                limitNum === null ? 'Cash limit reset to the platform default' : 'Cash limit updated'
               )}
-              className="btn-ghost !py-1.5 !px-3 !text-[11px]">{translatePortalText('Save')}</button>
+              className="btn-ghost !py-1.5 !px-3 !text-[11px] disabled:opacity-40">{translatePortalText('Save')}</button>
           </div>
 
           {/* ── Enforcement ──────────────────────────────── */}
@@ -395,6 +513,11 @@ function ProviderDrawer({ providerId, onClose }: { providerId: string | null; on
               <button
                 disabled={busy}
                 onClick={() => {
+                  // Asked before the dialog, not after the admin has confirmed it.
+                  if (!reason.trim()) {
+                    toast(translatePortalText('A reason is required — the provider is shown it.'), 'warn')
+                    return
+                  }
                   if (liveWork > 0) {
                     void confirmAndRun({
                       title: 'Emergency suspend this provider?',
@@ -410,7 +533,18 @@ function ProviderDrawer({ providerId, onClose }: { providerId: string | null; on
                     })
                     return
                   }
-                  void setState('emergency_suspended', true)
+                  // Still the most severe action on the ladder, so still
+                  // confirmed — it went through on one click when nothing was live.
+                  void confirmAndRun({
+                    title: 'Emergency suspend this provider?',
+                    body: 'No bookings are in progress right now, but the provider is stopped from all work immediately and shown your reason.',
+                    confirmLabel: 'Suspend now',
+                    busyLabel: 'Suspending…',
+                    danger: true,
+                    run: async () => {
+                      await setState('emergency_suspended', true)
+                    },
+                  })
                 }}
                 className="rounded-lg bg-rose-600 px-2.5 py-1.5 text-[11px] font-bold text-white hover:bg-rose-700 disabled:opacity-40">
                 <Ban size={12} className="inline" /> {translatePortalText('Emergency suspend')}

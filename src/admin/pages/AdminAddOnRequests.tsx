@@ -55,7 +55,11 @@ export default function AdminAddOnRequests({ defaultProviderType }: { defaultPro
 
   // Action Modals
   const [approvingReq, setApprovingReq] = useState<AddOnRequestData | null>(null)
-  const [approvePrice, setApprovePrice] = useState<number>(100)
+  // A string, empty until the catalogue answers: it used to start at 100 and
+  // fall back to an invented 10 SAR per unit, which then read as a real rate.
+  const [approvePrice, setApprovePrice] = useState<string>('')
+  const [priceHint, setPriceHint] = useState<'loading' | 'catalogue' | 'none'>('loading')
+  const [loadError, setLoadError] = useState<string | null>(null)
   const [approveAdminNote, setApproveAdminNote] = useState('')
   const [busyApprove, setBusyApprove] = useState(false)
 
@@ -73,6 +77,7 @@ export default function AdminAddOnRequests({ defaultProviderType }: { defaultPro
 
   const loadData = async () => {
     setLoading(true)
+    setLoadError(null)
     try {
       const params: { providerType?: string; status?: string } = {}
       if (selectedVertical !== 'all') params.providerType = selectedVertical
@@ -84,6 +89,9 @@ export default function AdminAddOnRequests({ defaultProviderType }: { defaultPro
         setStatusCounts(res.data.statusCounts)
       }
     } catch (e) {
+      // Kept on screen as well: after a failed load the table read "no requests",
+      // which is indistinguishable from an empty queue.
+      setLoadError(e instanceof Error ? e.message : 'Could not load add-on requests')
       toast(translatePortalText(e instanceof Error ? e.message : 'Could not load add-on requests'), 'warn')
     } finally {
       setLoading(false)
@@ -158,26 +166,33 @@ export default function AdminAddOnRequests({ defaultProviderType }: { defaultPro
   const openApproveModal = async (req: AddOnRequestData) => {
     setApprovingReq(req)
     setApproveAdminNote('')
-    // Default fallback: 10 SAR per unit
-    let suggested = (req.quantity || 1) * 10
+    setApprovePrice('')
+    setPriceHint('loading')
+    // Suggested from the add-on catalogue's own rate for this resource. With no
+    // catalogue price the field stays empty for the admin to fill — the old
+    // "10 SAR per unit" fallback was a made-up number presented as a suggestion.
     try {
       const res = await addOnApi.list({ providerType: req.providerType, resourceKey: req.resourceKey })
       const catalogItem = (res.data.addOns || [])[0]
       if (catalogItem && catalogItem.pricePerMonth > 0) {
         const unitRate = catalogItem.pricePerMonth / Math.max(1, catalogItem.incrementAmount)
-        suggested = Math.round(unitRate * (req.quantity || 1) * 100) / 100
+        setApprovePrice(String(Math.round(unitRate * (req.quantity || 1) * 100) / 100))
+        setPriceHint('catalogue')
+        return
       }
     } catch {
-      // fallback to suggested
+      // no suggestion — the admin enters the rate
     }
-    setApprovePrice(suggested)
+    setPriceHint('none')
   }
 
   const handleApprove = async () => {
-    if (!approvingReq) return
+    if (!approvingReq || busyApprove) return
     const num = Number(approvePrice)
-    if (isNaN(num) || num < 0) {
-      toast(translatePortalText('Please enter a valid monthly price (SAR)'), 'warn')
+    // Zero is refused too: the provider's checkout rejects a request without a
+    // positive price, so a 0 approval left them with nothing they could pay.
+    if (approvePrice.trim() === '' || !Number.isFinite(num) || num <= 0) {
+      toast(translatePortalText('Enter a monthly price above 0 (SAR)'), 'warn')
       return
     }
     setBusyApprove(true)
@@ -197,11 +212,17 @@ export default function AdminAddOnRequests({ defaultProviderType }: { defaultPro
   }
 
   const handleReject = async () => {
-    if (!rejectingReq) return
+    if (!rejectingReq || busyReject) return
+    // The reason is what the provider reads; "declined by administrator" told
+    // them nothing they could act on.
+    if (rejectReason.trim().length < 3) {
+      toast(translatePortalText('Give the provider a reason of at least 3 characters'), 'warn')
+      return
+    }
     setBusyReject(true)
     try {
       await addOnRequestApi.adminReject(rejectingReq._id || rejectingReq.id!, {
-        reason: rejectReason.trim() || 'Request declined by administrator',
+        reason: rejectReason.trim(),
       })
       toast(translatePortalText('Request rejected and provider notified'), 'info')
       setRejectingReq(null)
@@ -421,6 +442,13 @@ export default function AdminAddOnRequests({ defaultProviderType }: { defaultPro
             <Loader2 size={32} className="mx-auto animate-spin text-ocean-500" />
             <p className="mt-3 text-sm font-semibold text-slate-500">{translatePortalText('Loading add-on requests...')}</p>
           </div>
+        ) : loadError ? (
+          <div className="p-12 text-center">
+            <AlertCircle size={28} className="mx-auto text-rose-500" />
+            <h3 className="mt-3 font-display text-base font-bold text-deep-900 dark:text-white">{translatePortalText('Couldn’t load add-on requests')}</h3>
+            <p className="mt-1 text-xs text-rose-600 max-w-sm mx-auto">{loadError}</p>
+            <button onClick={loadData} className="btn-ghost mt-3 inline-flex items-center gap-1.5 text-xs font-bold"><RefreshCw size={13} /> {translatePortalText('Retry')}</button>
+          </div>
         ) : filteredRequests.length === 0 ? (
           <div className="p-12 text-center">
             <div className="mx-auto grid h-14 w-14 place-items-center rounded-2xl bg-slate-100 text-slate-400">
@@ -579,12 +607,13 @@ export default function AdminAddOnRequests({ defaultProviderType }: { defaultPro
                   min={0}
                   step={10}
                   value={approvePrice}
-                  onChange={(e) => setApprovePrice(Number(e.target.value))}
+                  onChange={(e) => setApprovePrice(e.target.value)}
                   placeholder={translatePortalText('e.g. 100')}
                   className="input !ps-9 w-full font-bold text-base"
                 />
               </div>
               <p className="mt-1 text-[11px] text-slate-500">
+                {translatePortalText(priceHint === 'catalogue' ? 'Suggested from the add-on catalogue rate for this resource. ' : priceHint === 'none' ? 'No catalogue price for this resource — enter the rate yourself. ' : 'Looking up the catalogue rate… ')}
                 {translatePortalText('The provider will be notified of this monthly rate. Once they pay via HyperPay, their limit expands by +')}{formatPortalNumber(approvingReq.quantity)} {translatePortalText('automatically.')}
               </p>
             </div>
@@ -613,7 +642,7 @@ export default function AdminAddOnRequests({ defaultProviderType }: { defaultPro
                 type="button"
                 className="btn-admin flex items-center gap-2"
                 onClick={handleApprove}
-                disabled={busyApprove}
+                disabled={busyApprove || priceHint === 'loading' || !(Number(approvePrice) > 0)}
               >
                 {busyApprove ? (
                   <>
@@ -648,7 +677,7 @@ export default function AdminAddOnRequests({ defaultProviderType }: { defaultPro
             </p>
 
             <div>
-              <label className="label font-bold text-xs">{translatePortalText('Reason for Rejection (Visible to Provider)')}</label>
+              <label className="label font-bold text-xs">{translatePortalText('Reason for Rejection (Visible to Provider) *')}</label>
               <textarea
                 value={rejectReason}
                 onChange={(e) => setRejectReason(e.target.value)}
@@ -671,7 +700,7 @@ export default function AdminAddOnRequests({ defaultProviderType }: { defaultPro
                 type="button"
                 className="rounded-xl bg-rose-600 px-4 py-2 text-xs font-bold text-white shadow-sm hover:bg-rose-700 flex items-center gap-2"
                 onClick={handleReject}
-                disabled={busyReject}
+                disabled={busyReject || rejectReason.trim().length < 3}
               >
                 {busyReject ? (
                   <>
